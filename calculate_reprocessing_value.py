@@ -26,7 +26,9 @@ def calculate_reprocessing_value(
     module_name=None,
     yield_percent=55.0,  # Default: 55% reprocessing yield
     broker_fee=1.38, 
-    sales_tax=0.0, # Default: 10% markup as safety cushion for market valuation and other selling costs not addressed yet
+    sales_tax=3.5, 
+    buy_buffer= 0.1,
+    average_relist = 3,
     num_modules=10000,  # Default: 1000 modules this is to avoid rounding errors when calculating the reprocessing value
     reprocessing_cost_percent=3.37,  # Default: 3.37% base reprocessing cost
     module_price_type='buy_max',  # 'buy_max', 'sell_min', or 'average'
@@ -151,9 +153,11 @@ def calculate_reprocessing_value(
             # Calculate module price based on selected type
             if module_price_type == 'buy_max':
                 module_price_before_markup = buy_max
+                module_price_post_transaction_costs = buy_max*(buy_buffer+1)*(1+broker_fee/100)^(average_relist)
                 
             elif module_price_type == 'sell_min':
                 module_price_before_markup = sell_min
+                module_price_post_transaction_costs= module_price_before_markup
                 
             elif module_price_type == 'average':
                 if buy_max > 0 and sell_min > 0:
