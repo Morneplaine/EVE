@@ -133,7 +133,7 @@ class EVELauncher:
         ttk.Label(row3, text="Module Price Type:").pack(side=tk.LEFT, padx=5)
         self.module_price_type_var = tk.StringVar(value="sell_min")
         module_price_combo = ttk.Combobox(row3, textvariable=self.module_price_type_var, 
-                                         values=["buy_max", "sell_min", "average"], 
+                                         values=["buy_max", "sell_min"], 
                                          state="readonly", width=12)
         module_price_combo.pack(side=tk.LEFT, padx=5)
         
@@ -210,7 +210,7 @@ class EVELauncher:
         ttk.Label(params_row2, text="Module Price Type:").pack(side=tk.LEFT, padx=5)
         self.single_module_price_type_var = tk.StringVar(value="buy_max")
         single_module_price_combo = ttk.Combobox(params_row2, textvariable=self.single_module_price_type_var,
-                                                 values=["buy_max", "sell_min", "average"],
+                                                 values=["buy_max", "sell_min"],
                                                  state="readonly", width=12)
         single_module_price_combo.pack(side=tk.LEFT, padx=5)
         

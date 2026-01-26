@@ -13,6 +13,17 @@ import pandas as pd
 import logging
 import sys
 from pathlib import Path
+from assumptions import (
+    BROKER_FEE,
+    SALES_TAX,
+    LISTING_RELIST,
+    REPROCESSING_COST,
+    DEFAULT_YIELD_PERCENT,
+    BUY_ORDER_MARKUP_PERCENT,
+    BUY_BUFFER,
+    RELIST_DISCOUNT
+
+)
 
 # Set up logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -20,18 +31,48 @@ logger = logging.getLogger(__name__)
 
 DATABASE_FILE = "eve_manufacturing.db"
 
+def buy_order_with_fees(buy_price, broker_fee=BROKER_FEE, sales_tax=SALES_TAX, buy_buffer=BUY_BUFFER, average_relist=LISTING_RELIST,RELIST_DISCOUNT=RELIST_DISCOUNT):
+    # we assume that at some point we will have to increse the buy order on average we will increase it by the buffer
+    buy_price_loaded = buy_price*(buy_buffer+1)
+    # since we may have to relist multiple times there is a relist fee, we do not have to take into account the price increase fee since it is embeded in the buffer but the relist fee is the amount of time we relist but there is a discount based on skills
+
+    relist_fees = buy_price_loaded*(broker_fee/100)*((1-RELIST_DISCOUNT)/100)*average_relist
+    #broker fee is broker % times total sale price
+    broker_fee= buy_price_loaded*broker_fee/100
+    #we add it all
+    total_buy_order_cost = buy_price_loaded + relist_fees + broker_fee
+    
+    return total_buy_order_cost
+
+def sell_order_with_fees(sell_price, sales_tax=SALES_TAX, average_relist=LISTING_RELIST,RELIST_DISCOUNT=RELIST_DISCOUNT):
+    # see the mechanism on buy order with fee the difference is we also have to pay the sales tax 
+    sell_price_loaded = sell_price*(1+sales_tax/100)
+    relist_fees = sell_price_loaded*(broker_fee/100)*((1-RELIST_DISCOUNT)/100)*average_relist
+    broker_fee= sell_price_loaded*broker_fee/100
+    sales_tax= sell_price_loaded*sales_tax/100
+    total_sell_order_cost = sell_price_loaded + relist_fees + broker_fee + sales_tax
+
+    return total_sell_order_cost
+
+def sell_into_buy_order(sell_price, sales_tax=SALES_TAX):
+    #when sellling into a buy order there is no s
+    return sell_price*(1+sales_tax/100)
+
+def buy_into_sell_order(buy_price):
+    #when buying into a sell order there is no sales tax
+    return buy_price
 
 def calculate_reprocessing_value(
     module_type_id=None,
     module_name=None,
-    yield_percent=55.0,  # Default: 55% reprocessing yield
-    broker_fee=1.38, 
-    sales_tax=3.5, 
-    buy_buffer= 0.1,
-    average_relist = 3,
-    num_modules=10000,  # Default: 1000 modules this is to avoid rounding errors when calculating the reprocessing value
-    reprocessing_cost_percent=3.37,  # Default: 3.37% base reprocessing cost
-    module_price_type='buy_max',  # 'buy_max', 'sell_min', or 'average'
+    yield_percent=DEFAULT_YIELD_PERCENT,  # Default: 55% reprocessing yield
+    broker_fee=BROKER_FEE, 
+    sales_tax=SALES_TAX, 
+    buy_buffer=BUY_BUFFER,
+    average_relist=LISTING_RELIST,
+    buy_order_markup_percent=BUY_ORDER_MARKUP_PERCENT,  # Markup percentage for buy_max price
+    reprocessing_cost_percent=REPROCESSING_COST,  # Default: 3.37% base reprocessing cost
+    module_price_type='buy_max',  # 'buy_max' or 'sell_min'
     mineral_price_type='buy_max',  # 'buy_max' or 'sell_min'
     db_file=DATABASE_FILE
 ):
@@ -43,7 +84,7 @@ def calculate_reprocessing_value(
     Calculate the reprocessing value of a module.
     
     The reprocessing value is calculated as:
-    - Module price = selected price type (buy_max, sell_min, or average) * (1 + markup if buy_max)
+    - Module price = selected price type (buy_max or sell_min) * (1 + markup if buy_max)
     - Mineral price = selected price type (buy_max or sell_min) for each mineral
     - Reprocessing cost = total_module_price * (reprocessing_cost_percent / 100) * (yield_percent / 100)
     - Reprocessing value = sum(mineral_quantity * yield * mineral_price) - total_module_price - reprocessing_cost
@@ -54,9 +95,8 @@ def calculate_reprocessing_value(
         yield_percent (float): Reprocessing yield percentage (default: 55.0)
         buy_order_markup_percent (float): Markup percentage to add to buy_max price (default: 10.0, only used if module_price_type='buy_max')
             This markup serves as a safety cushion for market valuation and other selling costs not addressed yet.
-        num_modules (int): Number of modules to reprocess (default: 100)
         reprocessing_cost_percent (float): Reprocessing cost as percentage of buy price (default: 3.37)
-        module_price_type (str): Price type for module - 'buy_max', 'sell_min', or 'average' (default: 'buy_max')
+        module_price_type (str): Price type for module - 'buy_max' or 'sell_min' (default: 'buy_max')
         mineral_price_type (str): Price type for minerals - 'buy_max' or 'sell_min' (default: 'buy_max')
         db_file (str): Path to the database file
         
@@ -68,7 +108,7 @@ def calculate_reprocessing_value(
             - mineral_price_type: Price type used for minerals
             - module_price_before_markup: Base module price (before markup if applicable)
             - module_price: Final module price per module
-            - num_modules: Number of modules being reprocessed
+            - output_quantity: Number of items needed to obtain reprocessing result (from blueprints table)
             - total_module_price: Total price for all modules
             - reprocessing_cost: Total reprocessing cost
             - yield_percent: Yield used in calculation
@@ -108,9 +148,6 @@ def calculate_reprocessing_value(
         module_type_id = int(module_df.iloc[0]['typeID'])
         module_name = module_df.iloc[0]['typeName']
         
-        # Ensure num_modules is an integer
-        num_modules = int(num_modules)
-        
         # ========================================================================
         # GET REPROCESSING OUTPUTS FROM DATABASE
         # ========================================================================
@@ -125,7 +162,7 @@ def calculate_reprocessing_value(
             SELECT 
                 materialTypeID,
                 materialName,
-                quantity,
+                quantity
             FROM reprocessing_outputs
             WHERE itemTypeID = ?
         """
@@ -153,28 +190,16 @@ def calculate_reprocessing_value(
             # Calculate module price based on selected type
             if module_price_type == 'buy_max':
                 module_price_before_markup = buy_max
-                module_price_post_transaction_costs = buy_max*(buy_buffer+1)*(1+broker_fee/100)^(average_relist)
+                module_price_post_transaction_costs = buy_max*(buy_buffer+1)*(1+broker_fee/100)**(average_relist)
                 
             elif module_price_type == 'sell_min':
                 module_price_before_markup = sell_min
                 module_price_post_transaction_costs= module_price_before_markup
                 
-            elif module_price_type == 'average':
-                if buy_max > 0 and sell_min > 0:
-                    module_price_before_markup = (buy_max + sell_min) / 2
-                    
-                elif buy_max > 0:
-                    module_price_before_markup = buy_max
-                    
-                elif sell_min > 0:
-                    module_price_before_markup = sell_min
-                    
-                else:
-                    module_price_before_markup = 0
-                    
             else:
                 logger.warning(f"Invalid module_price_type '{module_price_type}', using 'buy_max'")
                 module_price_before_markup = buy_max
+                module_price_post_transaction_costs = buy_max*(buy_buffer+1)*(1+broker_fee/100)**(average_relist)
                 
         
         
@@ -211,18 +236,20 @@ def calculate_reprocessing_value(
             mineral_price_lookup[type_id] = price
         
         
+        # Get outputQuantity from blueprints table using productTypeID
+        # This is the number of items needed to obtain the reprocessing result
         output_quantity_query = """
-            SELECT outputQuantity FROM blueprints WHERE productName = ?
+            SELECT outputQuantity FROM blueprints WHERE productTypeID = ?
         """
-        output_quantity_df = pd.read_sql_query(output_quantity_query, conn, params=(module_name,))
+        output_quantity_df = pd.read_sql_query(output_quantity_query, conn, params=(module_type_id,))
         
         if len(output_quantity_df) > 0:
-            minimal_reprocessing_quantity = int(output_quantity_df.iloc[0]['outputQuantity'])
+            output_quantity = int(output_quantity_df.iloc[0]['outputQuantity'])
         else:
-            minimal_reprocessing_quantity = 1
+            output_quantity = 1
 
         # Calculate total module price for all modules
-        total_module_price = module_price * minimal_reprocessing_quantity
+        total_module_price = module_price * output_quantity
         
         # Calculate reprocessing cost (base cost percentage × yield percentage)
         # Example: 3.37% × 55% = 1.8535% of buy price
@@ -241,8 +268,8 @@ def calculate_reprocessing_value(
         #   2. quantity_per_module = quantity_per_item * yield_percent / 100
         #      (e.g., 0.3 * 0.55 = 0.165 per module after 55% yield)
         #   
-        #   3. actual_quantity = quantity_per_module * num_modules (rounded down)
-        #      (e.g., 0.165 * 100 = 16.5 → rounds to 16)
+        #   3. actual_quantity = quantity_per_module * output_quantity (rounded down)
+        #      (e.g., 0.165 per item * 100 items = 16.5 → rounds to 16)
         #
         # Rounding happens ONLY at the final step to ensure accuracy.
         # ========================================================================
@@ -269,14 +296,16 @@ def calculate_reprocessing_value(
             # Example: 0.3 * 0.55 = 0.165 per module
             quantity_per_module = quantity_per_item * yield_multiplier
             
-            # Step 3: Calculate total quantity for all modules (keep as float for precision)
-            # Multiply per-module quantity by number of modules
-            # Example: 0.165 per module * 100 modules = 16.5
-            actual_quantity_float = quantity_per_module * num_modules
+            # Step 3: Calculate total quantity for output_quantity items (keep as float for precision)
+            # Multiply per-item quantity by output_quantity (number of items needed for reprocessing)
+            # Example: 0.165 per item * 100 items = 16.5
+            # Since we're using output_quantity (typically 100), there should be no rounding issues
+            actual_quantity_float = quantity_per_module * output_quantity
             
             # Step 4: Round down to integer ONLY at the final step
             # This ensures proper rounding: 16.5 rounds to 16
-            # If we rounded per-module first (0.165 → 0), we'd lose precision
+            # If we rounded per-item first (0.165 → 0), we'd lose precision
+            # Note: With output_quantity = 100, there should typically be no rounding needed
             actual_quantity = int(actual_quantity_float)
             
             # Get mineral price from price lookup
@@ -297,7 +326,7 @@ def calculate_reprocessing_value(
                 'batchSize': batch_size,                       # Batch size (e.g., 100 for charges)
                 'quantityPerItem': quantity_per_item,          # Quantity per single item (before yield)
                 'baseQuantityPerModule': quantity_per_module,  # Per module after yield (before rounding)
-                'actualQuantity': actual_quantity,              # Total for num_modules after yield and rounding
+                'actualQuantity': actual_quantity,              # Total for output_quantity after yield and rounding
                 'actualQuantityFloat': actual_quantity_float, # Total before rounding (for display/debugging)
                 'mineralPrice': mineral_price,                  # Price per unit of this mineral
                 'mineralValue': mineral_value                   # Total value (quantity * price)
@@ -317,15 +346,15 @@ def calculate_reprocessing_value(
         # reprocessing_cost = total_module_price * effective_reprocessing_cost_percent / 100
         # So: total_mineral_value = total_module_price * (1 + effective_reprocessing_cost_percent / 100)
         # Therefore: total_module_price_breakeven = total_mineral_value / (1 + effective_reprocessing_cost_percent / 100)
-        if total_mineral_value > 0 and num_modules > 0:
+        if total_mineral_value > 0 and output_quantity > 0:
             total_module_price_breakeven = total_mineral_value / (1 + effective_reprocessing_cost_percent / 100.0)
             
             # Calculate per-module price before markup
-            # If markup is applied: total_module_price = module_price_before_markup * num_modules * (1 + markup_percent / 100)
+            # If markup is applied: total_module_price = module_price_before_markup * output_quantity * (1 + markup_percent / 100)
             if module_price_type == 'buy_max' and buy_order_markup_percent > 0:
-                module_price_before_markup_breakeven = total_module_price_breakeven / (num_modules * (1 + buy_order_markup_percent / 100.0))
+                module_price_before_markup_breakeven = total_module_price_breakeven / (output_quantity * (1 + buy_order_markup_percent / 100.0))
             else:
-                module_price_before_markup_breakeven = total_module_price_breakeven / num_modules
+                module_price_before_markup_breakeven = total_module_price_breakeven / output_quantity
         else:
             total_module_price_breakeven = 0.0
             module_price_before_markup_breakeven = 0.0
@@ -338,7 +367,7 @@ def calculate_reprocessing_value(
             'module_price_before_markup': module_price_before_markup,
             'module_price': module_price,
             'buy_order_markup_percent': buy_order_markup_percent if module_price_type == 'buy_max' else 0,
-            'num_modules': num_modules,
+            'output_quantity': output_quantity,
             'total_module_price': total_module_price,
             'reprocessing_cost_percent': reprocessing_cost_percent,
             'effective_reprocessing_cost_percent': effective_reprocessing_cost_percent,
@@ -383,7 +412,7 @@ def format_reprocessing_result(result):
     output.append(f"Reprocessing Value Calculation")
     output.append("=" * 60)
     output.append(f"Module: {result['module_name']} (TypeID: {result['module_type_id']})")
-    output.append(f"Number of Modules: {result['num_modules']}")
+    output.append(f"Output Quantity: {result['output_quantity']} items (from blueprints table)")
     output.append(f"")
     output.append(f"Price Settings:")
     output.append(f"  Module Price Type: {result['module_price_type']}")
@@ -398,9 +427,6 @@ def format_reprocessing_result(result):
     elif result['module_price_type'] == 'sell_min':
         output.append(f"Module Price: {result['module_price']:,.2f} ISK per module")
         output.append(f"  (Lowest sell order)")
-    elif result['module_price_type'] == 'average':
-        output.append(f"Module Price: {result['module_price']:,.2f} ISK per module")
-        output.append(f"  (Average of buy_max and sell_min)")
     
     output.append(f"Total Module Price:                 {result['total_module_price']:,.2f} ISK")
     output.append(f"Reprocessing Cost:                  {result['reprocessing_cost']:,.2f} ISK")
@@ -411,7 +437,7 @@ def format_reprocessing_result(result):
     output.append(f"")
     output.append("Reprocessing Outputs:")
     output.append("-" * 100)
-    output.append(f"{'Mineral':<30} {'Batch':>8} {'Batch Size':>10} {'Per Item':>10} {'Per Mod':>10} {'× Mods':>6} {'Rounded':>8} {'Price':>12} {'Value':>15}")
+    output.append(f"{'Mineral':<30} {'Batch':>8} {'Batch Size':>10} {'Per Item':>10} {'Per Item':>10} {'× Qty':>6} {'Rounded':>8} {'Price':>12} {'Value':>15}")
     output.append("-" * 100)
     
     for i, output_mat in enumerate(result['reprocessing_outputs']):
@@ -419,7 +445,7 @@ def format_reprocessing_result(result):
         batch_size = output_mat.get('batchSize', 1)
         quantity_per_item = output_mat.get('quantityPerItem', batch_qty / batch_size if batch_size > 0 else 0)
         per_module = output_mat.get('baseQuantityPerModule', 0)
-        num_mods = result['num_modules']
+        output_qty = result['output_quantity']
         rounded_qty = int(output_mat['actualQuantity'])
         price = output_mat['mineralPrice']
         value = output_mat['mineralValue']
@@ -430,7 +456,7 @@ def format_reprocessing_result(result):
             f"× {batch_size:6d} "
             f"{quantity_per_item:10.4f} "
             f"{per_module:10.4f} "
-            f"× {num_mods:3d} "
+            f"× {output_qty:3d} "
             f"{rounded_qty:8d} "
             f"{price:12,.2f} "
             f"{value:15,.2f}"
@@ -438,30 +464,30 @@ def format_reprocessing_result(result):
     
     output.append("-" * 60)
     
-    # Per-module calculations
-    num_modules = result['num_modules']
-    mineral_value_per_module = result['total_mineral_value'] / num_modules if num_modules > 0 else 0
-    reprocessing_cost_per_module = result['reprocessing_cost'] / num_modules if num_modules > 0 else 0
-    profit_per_module = mineral_value_per_module - result['module_price'] - reprocessing_cost_per_module
+    # Per-item calculations
+    output_quantity = result['output_quantity']
+    mineral_value_per_item = result['total_mineral_value'] / output_quantity if output_quantity > 0 else 0
+    reprocessing_cost_per_item = result['reprocessing_cost'] / output_quantity if output_quantity > 0 else 0
+    profit_per_item = mineral_value_per_item - result['module_price'] - reprocessing_cost_per_item
     
-    output.append("PER MODULE:")
-    output.append(f"  Mineral Value (after yield): {mineral_value_per_module:,.2f} ISK")
+    output.append("PER ITEM:")
+    output.append(f"  Mineral Value (after yield): {mineral_value_per_item:,.2f} ISK")
     output.append(f"  Module Price:                {result['module_price']:,.2f} ISK")
-    output.append(f"  Reprocessing Cost:           {reprocessing_cost_per_module:,.2f} ISK")
-    output.append(f"  Profit per Module:           {profit_per_module:+,.2f} ISK")
+    output.append(f"  Reprocessing Cost:           {reprocessing_cost_per_item:,.2f} ISK")
+    output.append(f"  Profit per Item:             {profit_per_item:+,.2f} ISK")
     
-    # Calculate return percentage per module: (mineral_value - module_price) / module_price
+    # Calculate return percentage per item: (mineral_value - module_price) / module_price
     if result['module_price'] > 0:
-        net_mineral_value_per_module = mineral_value_per_module - reprocessing_cost_per_module
-        return_percent_per_module = ((net_mineral_value_per_module - result['module_price']) / result['module_price']) * 100
-        output.append(f"  Return %:                     {return_percent_per_module:+.2f}%")
+        net_mineral_value_per_item = mineral_value_per_item - reprocessing_cost_per_item
+        return_percent_per_item = ((net_mineral_value_per_item - result['module_price']) / result['module_price']) * 100
+        output.append(f"  Return %:                     {return_percent_per_item:+.2f}%")
     else:
         output.append(f"  Return %:                     N/A (module price is 0)")
     
     output.append("")
-    output.append("TOTAL (for all modules):")
+    output.append(f"TOTAL (for {output_quantity} items):")
     output.append(f"  Total Mineral Value: {result['total_mineral_value']:,.2f} ISK")
-    output.append(f"  Total Module Price:  {result['total_module_price']:,.2f} ISK ({result['module_price']:,.2f} × {num_modules})")
+    output.append(f"  Total Module Price:  {result['total_module_price']:,.2f} ISK ({result['module_price']:,.2f} × {output_quantity})")
     output.append(f"  Reprocessing Cost:   {result['reprocessing_cost']:,.2f} ISK")
     output.append(f"  Reprocessing Value:  {result['reprocessing_value']:,.2f} ISK")
     
@@ -499,19 +525,21 @@ def main():
     import sys
     
     if len(sys.argv) < 2:
-        print("Usage: python calculate_reprocessing_value.py <module_name_or_typeID> [yield_percent] [buy_markup_percent] [num_modules] [reprocessing_cost_percent] [module_price_type] [mineral_price_type]")
+        print("Usage: python calculate_reprocessing_value.py <module_name_or_typeID> [yield_percent] [buy_markup_percent] [reprocessing_cost_percent] [module_price_type] [mineral_price_type]")
+        print("")
+        print("Note: output_quantity is automatically fetched from blueprints table based on productTypeID")
         print("")
         print("Price Types:")
-        print("  module_price_type: 'buy_max' (default), 'sell_min', or 'average'")
+        print("  module_price_type: 'buy_max' (default) or 'sell_min'")
         print("  mineral_price_type: 'buy_max' (default) or 'sell_min'")
         print("")
         print("Examples:")
         print("  python calculate_reprocessing_value.py \"Medium Shield Booster II\"")
         print("  python calculate_reprocessing_value.py 11269 55 10")
-        print("  python calculate_reprocessing_value.py \"Medium Shield Booster II\" 60 15 200")
-        print("  python calculate_reprocessing_value.py \"Iron Charge S\" 55 10 100 3.37")
-        print("  python calculate_reprocessing_value.py \"Gamma L\" 55 10 9 3.37 sell_min sell_min")
-        print("  python calculate_reprocessing_value.py \"Gamma L\" 55 10 9 3.37 average buy_max")
+        print("  python calculate_reprocessing_value.py \"Medium Shield Booster II\" 60 15")
+        print("  python calculate_reprocessing_value.py \"Iron Charge S\" 55 10 3.37")
+        print("  python calculate_reprocessing_value.py \"Gamma L\" 55 10 3.37 sell_min sell_min")
+        print("  python calculate_reprocessing_value.py \"Gamma L\" 55 10 3.37 sell_min buy_max")
         sys.exit(1)
     
     # Parse arguments
@@ -525,12 +553,11 @@ def main():
         module_type_id = None
         module_name = module_arg
     
-    yield_percent = float(sys.argv[2]) if len(sys.argv) > 2 else 55.0
-    buy_markup_percent = float(sys.argv[3]) if len(sys.argv) > 3 else 10.0
-    num_modules = int(sys.argv[4]) if len(sys.argv) > 4 else 100
-    reprocessing_cost_percent = float(sys.argv[5]) if len(sys.argv) > 5 else 3.37
-    module_price_type = sys.argv[6] if len(sys.argv) > 6 else 'buy_max'
-    mineral_price_type = sys.argv[7] if len(sys.argv) > 7 else 'buy_max'
+    yield_percent = float(sys.argv[2]) if len(sys.argv) > 2 else DEFAULT_YIELD_PERCENT
+    buy_markup_percent = float(sys.argv[3]) if len(sys.argv) > 3 else BUY_ORDER_MARKUP_PERCENT
+    reprocessing_cost_percent = float(sys.argv[4]) if len(sys.argv) > 4 else REPROCESSING_COST
+    module_price_type = sys.argv[5] if len(sys.argv) > 5 else 'buy_max'
+    mineral_price_type = sys.argv[6] if len(sys.argv) > 6 else 'buy_max'
     
     # Calculate reprocessing value
     result = calculate_reprocessing_value(
@@ -538,7 +565,6 @@ def main():
         module_name=module_name,
         yield_percent=yield_percent,
         buy_order_markup_percent=buy_markup_percent,
-        num_modules=num_modules,
         reprocessing_cost_percent=reprocessing_cost_percent,
         module_price_type=module_price_type,
         mineral_price_type=mineral_price_type
@@ -552,10 +578,9 @@ def main():
 
 
 def analyze_all_modules(
-    yield_percent=55.0,
-    buy_order_markup_percent=10.0,
-    num_modules=100,
-    reprocessing_cost_percent=3.37,
+    yield_percent=DEFAULT_YIELD_PERCENT,
+    buy_order_markup_percent=BUY_ORDER_MARKUP_PERCENT,
+    reprocessing_cost_percent=REPROCESSING_COST,
     module_price_type='sell_min',  # Default: use sell_min for evaluation
     mineral_price_type='buy_max',
     min_module_price=1.0,  # Minimum module price to filter out unrealistic prices
@@ -570,7 +595,6 @@ def analyze_all_modules(
     Args:
         yield_percent (float): Reprocessing yield percentage (default: 55.0)
         buy_order_markup_percent (float): Markup percentage (default: 10.0)
-        num_modules (int): Number of modules to reprocess (default: 100)
         reprocessing_cost_percent (float): Reprocessing cost percentage (default: 3.37)
         module_price_type (str): Price type for module (default: 'buy_max')
         mineral_price_type (str): Price type for minerals (default: 'buy_max')
@@ -588,7 +612,7 @@ def analyze_all_modules(
     logger.info(f"Parameters:")
     logger.info(f"  Yield: {yield_percent}%")
     logger.info(f"  Markup: {buy_order_markup_percent}%")
-    logger.info(f"  Modules per batch: {num_modules}")
+    logger.info(f"  Note: output_quantity fetched from blueprints table")
     logger.info(f"  Min sell_min price: {min_module_price:,.0f} ISK")
     logger.info(f"  Max sell_min price: {max_module_price:,.0f} ISK")
     logger.info(f"  Module price type: {module_price_type}")
@@ -651,7 +675,6 @@ def analyze_all_modules(
                 module_type_id=module_type_id,
                 yield_percent=yield_percent,
                 buy_order_markup_percent=buy_order_markup_percent,
-                num_modules=num_modules,
                 reprocessing_cost_percent=reprocessing_cost_percent,
                 module_price_type=module_price_type,
                 mineral_price_type=mineral_price_type,
@@ -670,12 +693,13 @@ def analyze_all_modules(
             expected_buy_price = buy_max * (1 + buy_order_markup_percent / 100) if buy_max > 0 else 0
             
             # For per-item calculations:
-            # - Mineral value per item = total_mineral_value / num_modules
+            # - Mineral value per item = total_mineral_value / output_quantity
             # - Module price per item = module_price (already per item)
-            # - Reprocessing cost per item = reprocessing_cost / num_modules
+            # - Reprocessing cost per item = reprocessing_cost / output_quantity
             # - Profit per item = (mineral_value_per_item - module_price - reprocessing_cost_per_item)
-            mineral_value_per_item = result['total_mineral_value'] / num_modules if num_modules > 0 else 0
-            reprocessing_cost_per_item = result['reprocessing_cost'] / num_modules if num_modules > 0 else 0
+            output_quantity = result.get('output_quantity', 1)
+            mineral_value_per_item = result['total_mineral_value'] / output_quantity if output_quantity > 0 else 0
+            reprocessing_cost_per_item = result['reprocessing_cost'] / output_quantity if output_quantity > 0 else 0
             profit_per_item = mineral_value_per_item - result['module_price'] - reprocessing_cost_per_item
             
             # Return percentage = (mineral_sell_price - buy_price) / buy_price * 100
@@ -699,7 +723,7 @@ def analyze_all_modules(
                 'reprocessing_value': result['reprocessing_value'],
                 'profit_per_item': profit_per_item,  # Profit per single item
                 'return_percent': return_percent,  # (mineral_sell_price - buy_price) / buy_price
-                'num_modules': num_modules
+                'output_quantity': output_quantity
             })
             
             processed += 1
@@ -777,21 +801,19 @@ def analyze_all_modules_main():
     import sys
     
     # Parse arguments
-    yield_percent = float(sys.argv[1]) if len(sys.argv) > 1 else 55.0
-    buy_markup_percent = float(sys.argv[2]) if len(sys.argv) > 2 else 10.0
-    num_modules = int(sys.argv[3]) if len(sys.argv) > 3 else 100
-    reprocessing_cost_percent = float(sys.argv[4]) if len(sys.argv) > 4 else 3.37
-    module_price_type = sys.argv[5] if len(sys.argv) > 5 else 'sell_min'
-    mineral_price_type = sys.argv[6] if len(sys.argv) > 6 else 'buy_max'
-    min_module_price = float(sys.argv[7]) if len(sys.argv) > 7 else 1.0
-    max_module_price = float(sys.argv[8]) if len(sys.argv) > 8 else 100000.0
-    top_n = int(sys.argv[9]) if len(sys.argv) > 9 else 30
+    yield_percent = float(sys.argv[1]) if len(sys.argv) > 1 else DEFAULT_YIELD_PERCENT
+    buy_markup_percent = float(sys.argv[2]) if len(sys.argv) > 2 else BUY_ORDER_MARKUP_PERCENT
+    reprocessing_cost_percent = float(sys.argv[3]) if len(sys.argv) > 3 else REPROCESSING_COST
+    module_price_type = sys.argv[4] if len(sys.argv) > 4 else 'sell_min'
+    mineral_price_type = sys.argv[5] if len(sys.argv) > 5 else 'buy_max'
+    min_module_price = float(sys.argv[6]) if len(sys.argv) > 6 else 1.0
+    max_module_price = float(sys.argv[7]) if len(sys.argv) > 7 else 100000.0
+    top_n = int(sys.argv[8]) if len(sys.argv) > 8 else 30
     
     # Run analysis
     results = analyze_all_modules(
         yield_percent=yield_percent,
         buy_order_markup_percent=buy_markup_percent,
-        num_modules=num_modules,
         reprocessing_cost_percent=reprocessing_cost_percent,
         module_price_type=module_price_type,
         mineral_price_type=mineral_price_type,
