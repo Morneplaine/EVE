@@ -13,26 +13,21 @@ logger = logging.getLogger(__name__)
 
 DB_FILE = "eve_manufacturing.db"
 
-def update_prices():
-    """Update all prices in the database"""
-    logger.info("=" * 60)
-    logger.info("Updating prices in database")
-    logger.info("=" * 60)
+def update_prices_by_type_ids(type_ids, description="items"):
+    """Update prices for a specific list of typeIDs"""
+    if not type_ids:
+        logger.warning(f"No {description} to update")
+        return
     
+    logger.info(f"Found {len(type_ids)} {description} to update")
+    
+    # Fetch prices from Fuzzwork Market API
+    logger.info("Fetching prices from Fuzzwork Market API...")
+    fuzzwork_prices = get_fuzzwork_market_prices(type_ids, station_id=JITA_SYSTEM_ID)
+    
+    # Update database
     conn = sqlite3.connect(DB_FILE)
-    
     try:
-        # Get all typeIDs that need prices
-        cursor = conn.execute("SELECT typeID FROM prices")
-        type_ids = [row[0] for row in cursor.fetchall()]
-        
-        logger.info(f"Found {len(type_ids)} items to update")
-        
-        # Fetch prices from Fuzzwork Market API
-        logger.info("Fetching prices from Fuzzwork Market API...")
-        fuzzwork_prices = get_fuzzwork_market_prices(type_ids, station_id=JITA_SYSTEM_ID)
-        
-        # Update database
         logger.info("Updating database...")
         updated_count = 0
         
@@ -63,7 +58,7 @@ def update_prices():
         conn.commit()
         
         logger.info("=" * 60)
-        logger.info(f"SUCCESS! Updated prices for {updated_count} items")
+        logger.info(f"SUCCESS! Updated prices for {updated_count} {description}")
         logger.info("=" * 60)
         
     except Exception as e:
@@ -71,6 +66,30 @@ def update_prices():
         import traceback
         logger.error(traceback.format_exc())
         conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def update_prices():
+    """Update all prices in the database"""
+    logger.info("=" * 60)
+    logger.info("Updating prices in database")
+    logger.info("=" * 60)
+    
+    conn = sqlite3.connect(DB_FILE)
+    
+    try:
+        # Get all typeIDs that need prices
+        cursor = conn.execute("SELECT typeID FROM prices")
+        type_ids = [row[0] for row in cursor.fetchall()]
+        
+        update_prices_by_type_ids(type_ids, "items")
+        
+    except Exception as e:
+        logger.error(f"Error updating prices: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
         raise
     finally:
         conn.close()

@@ -94,6 +94,17 @@ CREATE TABLE IF NOT EXISTS inventory (
     FOREIGN KEY (typeID) REFERENCES items(typeID)
 );
 
+-- Input quantity cache: Cached input quantities for items based on group analysis
+CREATE TABLE IF NOT EXISTS input_quantity_cache (
+    typeID INTEGER PRIMARY KEY,
+    typeName TEXT NOT NULL,
+    input_quantity INTEGER NOT NULL,
+    source TEXT NOT NULL,  -- 'blueprint', 'group_consensus', 'group_most_frequent', 'default'
+    needs_review INTEGER DEFAULT 0,  -- 1 if needs manual review, 0 otherwise
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (typeID) REFERENCES items(typeID)
+);
+
 -- Indexes for performance
 CREATE INDEX IF NOT EXISTS idx_blueprints_product ON blueprints(productTypeID);
 CREATE INDEX IF NOT EXISTS idx_materials_blueprint ON manufacturing_materials(blueprintTypeID);
@@ -101,4 +112,5 @@ CREATE INDEX IF NOT EXISTS idx_materials_material ON manufacturing_materials(mat
 CREATE INDEX IF NOT EXISTS idx_skills_blueprint ON manufacturing_skills(blueprintTypeID);
 CREATE INDEX IF NOT EXISTS idx_reprocessing_item ON reprocessing_outputs(itemTypeID);
 CREATE INDEX IF NOT EXISTS idx_prices_updated ON prices(updated_at);
+CREATE INDEX IF NOT EXISTS idx_input_quantity_cache_review ON input_quantity_cache(needs_review);
 

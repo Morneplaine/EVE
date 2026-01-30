@@ -15,10 +15,9 @@ from pathlib import Path
 from calculate_reprocessing_value import (
     calculate_reprocessing_value,
     analyze_all_modules,
-    format_analysis_results,
     format_reprocessing_result
 )
-from update_prices_db import update_prices
+from update_prices_db import update_prices, update_prices_by_type_ids
 from update_mineral_prices import update_mineral_prices
 
 DATABASE_FILE = "eve_manufacturing.db"
@@ -35,8 +34,9 @@ class EVELauncher:
         style = ttk.Style()
         style.theme_use('clam')
         
-        # Initialize exclusion database table
+        # Initialize database tables
         self.init_exclusion_table()
+        self.init_on_offer_table()
         
         # Create notebook for tabs
         self.notebook = ttk.Notebook(root)
@@ -47,6 +47,7 @@ class EVELauncher:
         self.create_single_module_tab()
         self.create_price_update_tab()
         self.create_exclusions_tab()
+        self.create_on_offer_tab()
         
         # Store last analysis results for exclusion
         self.last_analysis_results = None
@@ -81,6 +82,26 @@ class EVELauncher:
         finally:
             conn.close()
     
+    def init_on_offer_table(self):
+        """Initialize the on_offer_items table in the database"""
+        if not Path(DATABASE_FILE).exists():
+            return
+        
+        conn = sqlite3.connect(DATABASE_FILE)
+        try:
+            cursor = conn.cursor()
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS on_offer_items (
+                    module_type_id INTEGER PRIMARY KEY,
+                    module_name TEXT NOT NULL,
+                    added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (module_type_id) REFERENCES items(typeID)
+                )
+            """)
+            conn.commit()
+        finally:
+            conn.close()
+    
     def create_analysis_tab(self):
         """Create the Top 30 Analysis tab"""
         frame = ttk.Frame(self.notebook)
@@ -101,10 +122,6 @@ class EVELauncher:
         ttk.Label(row1, text="Markup %:").pack(side=tk.LEFT, padx=5)
         self.markup_var = tk.StringVar(value="10.0")
         ttk.Entry(row1, textvariable=self.markup_var, width=10).pack(side=tk.LEFT, padx=5)
-        
-        ttk.Label(row1, text="Modules/Batch:").pack(side=tk.LEFT, padx=5)
-        self.num_modules_var = tk.StringVar(value="1")
-        ttk.Entry(row1, textvariable=self.num_modules_var, width=10).pack(side=tk.LEFT, padx=5)
         
         # Row 2
         row2 = ttk.Frame(params_frame)
@@ -131,41 +148,92 @@ class EVELauncher:
         row3.pack(fill=tk.X, pady=5)
         
         ttk.Label(row3, text="Module Price Type:").pack(side=tk.LEFT, padx=5)
-        self.module_price_type_var = tk.StringVar(value="sell_min")
+        self.module_price_type_var = tk.StringVar(value="buy_immediate")
         module_price_combo = ttk.Combobox(row3, textvariable=self.module_price_type_var, 
-                                         values=["buy_max", "sell_min"], 
-                                         state="readonly", width=12)
+                                         values=["buy_immediate", "buy_offer"], 
+                                         state="readonly", width=15)
         module_price_combo.pack(side=tk.LEFT, padx=5)
         
         ttk.Label(row3, text="Mineral Price Type:").pack(side=tk.LEFT, padx=5)
-        self.mineral_price_type_var = tk.StringVar(value="buy_max")
+        self.mineral_price_type_var = tk.StringVar(value="sell_immediate")
         mineral_price_combo = ttk.Combobox(row3, textvariable=self.mineral_price_type_var,
-                                          values=["buy_max", "sell_min"],
-                                          state="readonly", width=12)
+                                          values=["sell_immediate", "sell_offer"],
+                                          state="readonly", width=15)
         mineral_price_combo.pack(side=tk.LEFT, padx=5)
+        
+        # Row 4 - Item source filter (run on all, blueprint only, or consensus only; faster when restricted)
+        row4_filter = ttk.Frame(params_frame)
+        row4_filter.pack(fill=tk.X, pady=5)
+        ttk.Label(row4_filter, text="Run on:").pack(side=tk.LEFT, padx=5)
+        self.item_source_filter_var = tk.StringVar(value="All items")
+        item_source_combo = ttk.Combobox(row4_filter, textvariable=self.item_source_filter_var,
+                                         values=["All items", "Blueprint items only", "Group consensus items only"],
+                                         state="readonly", width=28)
+        item_source_combo.pack(side=tk.LEFT, padx=5)
+        
+        # Row 5 - Source exclusion checkboxes
+        row5 = ttk.Frame(params_frame)
+        row5.pack(fill=tk.X, pady=5)
+        
+        ttk.Label(row5, text="Exclude Sources:").pack(side=tk.LEFT, padx=5)
+        
+        self.exclude_default_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(row5, text="Default", variable=self.exclude_default_var).pack(side=tk.LEFT, padx=5)
+        
+        self.exclude_group_consensus_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(row5, text="Group Consensus", variable=self.exclude_group_consensus_var).pack(side=tk.LEFT, padx=5)
+        
+        self.exclude_group_most_frequent_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(row5, text="Group Most Frequent", variable=self.exclude_group_most_frequent_var).pack(side=tk.LEFT, padx=5)
+        
+        # Row 6 - Sort option
+        row6 = ttk.Frame(params_frame)
+        row6.pack(fill=tk.X, pady=5)
+        
+        self.sort_by_profit_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            row6,
+            text="Sort by profit (ISK) instead of % return",
+            variable=self.sort_by_profit_var
+        ).pack(side=tk.LEFT, padx=5)
         
         # Run button
         run_btn = ttk.Button(params_frame, text="Run Top 30 Analysis", command=self.run_analysis)
         run_btn.pack(pady=10)
         
-        # Results frame with scrollable text and buttons
+        # Results frame with table (like On Offer tab)
         results_frame = ttk.LabelFrame(frame, text="Results", padding=10)
         results_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
         
-        # Frame for results text and exclude buttons
-        results_content_frame = ttk.Frame(results_frame)
-        results_content_frame.pack(fill=tk.BOTH, expand=True)
+        # Hint for user
+        hint_label = ttk.Label(results_frame, text="Double-click a row to copy the module name to clipboard.", font=('', 9))
+        hint_label.pack(anchor=tk.W, pady=(0, 5))
         
-        self.analysis_results = scrolledtext.ScrolledText(results_content_frame, wrap=tk.WORD, height=20)
-        self.analysis_results.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        # Treeview for results table
+        columns = ('Rank', 'Module Name', 'Buy Price', 'Sell Min', 'Profit/Item', 'Return %', 'Breakeven Max Buy')
+        self.analysis_tree = ttk.Treeview(results_frame, columns=columns, show='headings', height=20, selectmode='browse')
         
-        # Frame for exclude buttons (will be populated dynamically)
-        self.exclude_buttons_frame = ttk.Frame(results_content_frame, width=150)
-        self.exclude_buttons_frame.pack(side=tk.RIGHT, fill=tk.Y, padx=(10, 0))
-        self.exclude_buttons_frame.pack_propagate(False)
+        for col in columns:
+            self.analysis_tree.heading(col, text=col)
+        self.analysis_tree.column('Rank', width=50, anchor=tk.E)
+        self.analysis_tree.column('Module Name', width=280, anchor=tk.W)
+        self.analysis_tree.column('Buy Price', width=100, anchor=tk.E)
+        self.analysis_tree.column('Sell Min', width=100, anchor=tk.E)
+        self.analysis_tree.column('Profit/Item', width=120, anchor=tk.E)
+        self.analysis_tree.column('Return %', width=90, anchor=tk.E)
+        self.analysis_tree.column('Breakeven Max Buy', width=130, anchor=tk.E)
         
-        # Store exclude buttons
-        self.exclude_buttons = {}
+        # Tag for rows that are on offer (highlight in blue)
+        self.analysis_tree.tag_configure('on_offer', foreground='blue')
+        
+        scrollbar = ttk.Scrollbar(results_frame, orient=tk.VERTICAL, command=self.analysis_tree.yview)
+        self.analysis_tree.configure(yscrollcommand=scrollbar.set)
+        
+        self.analysis_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        
+        # Double-click to copy module name to clipboard
+        self.analysis_tree.bind("<Double-1>", self.on_analysis_tree_double_click)
     
     def create_single_module_tab(self):
         """Create the Single Module Reprocessing tab"""
@@ -195,10 +263,6 @@ class EVELauncher:
         self.single_markup_var = tk.StringVar(value="10.0")
         ttk.Entry(params_row1, textvariable=self.single_markup_var, width=10).pack(side=tk.LEFT, padx=5)
         
-        ttk.Label(params_row1, text="Number of Modules:").pack(side=tk.LEFT, padx=5)
-        self.single_num_modules_var = tk.StringVar(value="1")
-        ttk.Entry(params_row1, textvariable=self.single_num_modules_var, width=10).pack(side=tk.LEFT, padx=5)
-        
         # Parameters row 2
         params_row2 = ttk.Frame(input_frame)
         params_row2.pack(fill=tk.X, pady=5)
@@ -208,17 +272,17 @@ class EVELauncher:
         ttk.Entry(params_row2, textvariable=self.single_reprocessing_cost_var, width=10).pack(side=tk.LEFT, padx=5)
         
         ttk.Label(params_row2, text="Module Price Type:").pack(side=tk.LEFT, padx=5)
-        self.single_module_price_type_var = tk.StringVar(value="buy_max")
+        self.single_module_price_type_var = tk.StringVar(value="buy_immediate")
         single_module_price_combo = ttk.Combobox(params_row2, textvariable=self.single_module_price_type_var,
-                                                 values=["buy_max", "sell_min"],
-                                                 state="readonly", width=12)
+                                                 values=["buy_immediate", "buy_offer"],
+                                                 state="readonly", width=15)
         single_module_price_combo.pack(side=tk.LEFT, padx=5)
         
         ttk.Label(params_row2, text="Mineral Price Type:").pack(side=tk.LEFT, padx=5)
-        self.single_mineral_price_type_var = tk.StringVar(value="buy_max")
+        self.single_mineral_price_type_var = tk.StringVar(value="sell_immediate")
         single_mineral_price_combo = ttk.Combobox(params_row2, textvariable=self.single_mineral_price_type_var,
-                                                  values=["buy_max", "sell_min"],
-                                                  state="readonly", width=12)
+                                                  values=["sell_immediate", "sell_offer"],
+                                                  state="readonly", width=15)
         single_mineral_price_combo.pack(side=tk.LEFT, padx=5)
         
         # Buttons frame
@@ -262,6 +326,12 @@ Price Update Options:
    - Other specified materials
    
    This is much faster and recommended for regular updates.
+
+3. Update Blueprint Items Only: Updates prices only for items that have
+   an identified blueprint (source='blueprint' in input_quantity_cache).
+
+4. Update Group Consensus Items Only: Updates prices only for items that
+   use group consensus for input quantity (source='group_consensus' in input_quantity_cache).
         """
         ttk.Label(info_frame, text=info_text.strip(), justify=tk.LEFT).pack(anchor=tk.W)
         
@@ -276,6 +346,18 @@ Price Update Options:
         update_minerals_btn = ttk.Button(buttons_frame, text="Update Mineral Prices Only",
                                         command=self.update_mineral_prices_only, width=30)
         update_minerals_btn.pack(side=tk.LEFT, padx=10, expand=True)
+        
+        # Second row of buttons
+        buttons_frame2 = ttk.Frame(frame)
+        buttons_frame2.pack(fill=tk.X, padx=10, pady=10)
+        
+        update_blueprint_btn = ttk.Button(buttons_frame2, text="Update Blueprint Items Only",
+                                         command=self.update_blueprint_prices, width=30)
+        update_blueprint_btn.pack(side=tk.LEFT, padx=10, expand=True)
+        
+        update_consensus_btn = ttk.Button(buttons_frame2, text="Update Group Consensus Items Only",
+                                         command=self.update_group_consensus_prices, width=30)
+        update_consensus_btn.pack(side=tk.LEFT, padx=10, expand=True)
         
         # Log frame
         log_frame = ttk.LabelFrame(frame, text="Update Log", padding=10)
@@ -351,6 +433,77 @@ for one search may still appear in searches with different parameters.
         
         # Load exclusions on startup
         self.refresh_exclusions_list()
+    
+    def create_on_offer_tab(self):
+        """Create the On Offer tab to track items with active orders"""
+        frame = ttk.Frame(self.notebook)
+        self.notebook.add(frame, text="On Offer")
+        
+        # Add item frame
+        add_frame = ttk.LabelFrame(frame, text="Add Item to Track", padding=10)
+        add_frame.pack(fill=tk.X, padx=10, pady=10)
+        
+        # Input field
+        input_row = ttk.Frame(add_frame)
+        input_row.pack(fill=tk.X, pady=5)
+        
+        ttk.Label(input_row, text="Item Name or TypeID:").pack(side=tk.LEFT, padx=5)
+        self.on_offer_item_var = tk.StringVar()
+        ttk.Entry(input_row, textvariable=self.on_offer_item_var, width=40).pack(side=tk.LEFT, padx=5, fill=tk.X, expand=True)
+        
+        # Add button
+        add_btn = ttk.Button(add_frame, text="Add Item", command=self.add_on_offer_item)
+        add_btn.pack(pady=10)
+        
+        info_label = ttk.Label(add_frame, text="Note: Buy price and sell min are fetched from current market data", 
+                              font=('', 8), foreground='gray')
+        info_label.pack(pady=5)
+        
+        # Table frame
+        table_frame = ttk.LabelFrame(frame, text="Items On Offer", padding=10)
+        table_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        
+        # Create treeview with all required columns
+        columns = ('Name', 'Buy Price', 'Sell Min', 'Profit/Item (Buy Order)', 'Profit/Item (Immediate)', 
+                   'Breakeven Max (Buy Order)', 'Breakeven Max (Immediate)')
+        self.on_offer_tree = ttk.Treeview(table_frame, columns=columns, show='headings', height=20)
+        
+        # Configure columns
+        self.on_offer_tree.heading('Name', text='Name')
+        self.on_offer_tree.heading('Buy Price', text='Buy Price (buy_max)')
+        self.on_offer_tree.heading('Sell Min', text='Sell Min')
+        self.on_offer_tree.heading('Profit/Item (Buy Order)', text='Profit/Item (Buy Order)')
+        self.on_offer_tree.heading('Profit/Item (Immediate)', text='Profit/Item (Immediate)')
+        self.on_offer_tree.heading('Breakeven Max (Buy Order)', text='Breakeven Max (Buy Order)')
+        self.on_offer_tree.heading('Breakeven Max (Immediate)', text='Breakeven Max (Immediate)')
+        
+        self.on_offer_tree.column('Name', width=250)
+        self.on_offer_tree.column('Buy Price', width=120, anchor=tk.E)
+        self.on_offer_tree.column('Sell Min', width=120, anchor=tk.E)
+        self.on_offer_tree.column('Profit/Item (Buy Order)', width=180, anchor=tk.E)
+        self.on_offer_tree.column('Profit/Item (Immediate)', width=180, anchor=tk.E)
+        self.on_offer_tree.column('Breakeven Max (Buy Order)', width=200, anchor=tk.E)
+        self.on_offer_tree.column('Breakeven Max (Immediate)', width=200, anchor=tk.E)
+        
+        # Scrollbar
+        scrollbar = ttk.Scrollbar(table_frame, orient=tk.VERTICAL, command=self.on_offer_tree.yview)
+        self.on_offer_tree.configure(yscrollcommand=scrollbar.set)
+        
+        self.on_offer_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        
+        # Action buttons frame
+        action_frame = ttk.Frame(frame, padding=10)
+        action_frame.pack(fill=tk.X, padx=10, pady=5)
+        
+        refresh_btn = ttk.Button(action_frame, text="Refresh Calculations", command=self.refresh_on_offer_list)
+        refresh_btn.pack(side=tk.LEFT, padx=5)
+        
+        remove_btn = ttk.Button(action_frame, text="Remove Selected", command=self.remove_on_offer_item)
+        remove_btn.pack(side=tk.LEFT, padx=5)
+        
+        # Load items on startup
+        self.refresh_on_offer_list()
     
     def refresh_exclusions_list(self):
         """Refresh the excluded modules list"""
@@ -461,41 +614,93 @@ for one search may still appear in searches with different parameters.
             return default
     
     def run_analysis(self):
-        """Run the top 30 analysis in a separate thread"""
-        self.status_var.set("Running analysis...")
-        self.analysis_results.delete(1.0, tk.END)
-        self.analysis_results.insert(tk.END, "Running analysis... This may take several minutes.\n\n")
+        """Run the top 30 analysis in a separate thread. Updates mineral prices first, then runs analysis."""
+        self.status_var.set("Updating mineral prices, then running analysis...")
+        # Clear results table
+        for item in self.analysis_tree.get_children():
+            self.analysis_tree.delete(item)
+        self.analysis_tree.insert('', tk.END, values=("", "Updating mineral prices first, then running analysis...", "", "", "", "", ""))
         self.root.update()
         
         def analyze():
             try:
+                # Update mineral prices first (analysis uses mineral prices)
+                self.status_var.set("Updating mineral prices...")
+                children = list(self.analysis_tree.get_children())
+                if children:
+                    self.analysis_tree.item(children[0], values=("", "Updating mineral prices...", "", "", "", "", ""))
+                update_mineral_prices()
+                
+                self.status_var.set("Running analysis...")
+                for item in self.analysis_tree.get_children():
+                    self.analysis_tree.delete(item)
+                self.analysis_tree.insert('', tk.END, values=("", "Running analysis... This may take several minutes.", "", "", "", "", ""))
+                
                 yield_percent = self.get_float(self.yield_var, 55.0)
                 markup_percent = self.get_float(self.markup_var, 10.0)
-                num_modules = self.get_int(self.num_modules_var, 100)
                 reprocessing_cost = self.get_float(self.reprocessing_cost_var, 3.37)
                 min_price = self.get_float(self.min_price_var, 1.0)
-                max_price = self.get_float(self.max_price_var, 100000.0)
+                max_price = self.get_float(self.max_price_var, 1000000.0)
                 top_n = self.get_int(self.top_n_var, 30)
                 module_price_type = self.module_price_type_var.get()
                 mineral_price_type = self.mineral_price_type_var.get()
+                sort_by_profit = self.sort_by_profit_var.get()
+                
+                # Map "Run on" UI to backend filter
+                run_on = self.item_source_filter_var.get()
+                if run_on == "Blueprint items only":
+                    item_source_filter = "blueprint"
+                elif run_on == "Group consensus items only":
+                    item_source_filter = "group_consensus"
+                else:
+                    item_source_filter = "all"
                 
                 # Get excluded modules for this search
                 excluded_modules = self.get_excluded_modules(
                     min_price, max_price, module_price_type, mineral_price_type
                 )
                 
+                # Check which sources to exclude
+                excluded_sources = []
+                if self.exclude_default_var.get():
+                    excluded_sources.append('default')
+                if self.exclude_group_consensus_var.get():
+                    excluded_sources.append('group_consensus')
+                if self.exclude_group_most_frequent_var.get():
+                    excluded_sources.append('group_most_frequent')
+                
+                # If we're excluding sources, request more results to ensure we have enough
+                # after filtering (especially to ensure blueprint items are included)
+                # Note: 'blueprint' source is NEVER excluded (most reliable source)
+                effective_top_n = top_n * 10 if excluded_sources else top_n
+                
                 results = analyze_all_modules(
                     yield_percent=yield_percent,
                     buy_order_markup_percent=markup_percent,
-                    num_modules=num_modules,
                     reprocessing_cost_percent=reprocessing_cost,
                     module_price_type=module_price_type,
                     mineral_price_type=mineral_price_type,
                     min_module_price=min_price,
                     max_module_price=max_price,
-                    top_n=top_n,
-                    excluded_module_ids=excluded_modules
+                    top_n=effective_top_n,
+                    excluded_module_ids=excluded_modules,
+                    sort_by='profit' if sort_by_profit else 'return',
+                    item_source_filter=item_source_filter
                 )
+                
+                # Filter results based on source exclusion checkboxes
+                if excluded_sources:
+                    # Keep results where source is NOT in excluded_sources
+                    # This means 'blueprint' items are always included
+                    results = [r for r in results if r.get('input_quantity_source', 'unknown') not in excluded_sources]
+                
+                # Re-sort and take top N after filtering (use same sort as backend)
+                if excluded_sources:
+                    if sort_by_profit:
+                        results.sort(key=lambda x: x.get('profit_per_item', 0), reverse=True)
+                    else:
+                        results.sort(key=lambda x: x.get('return_percent', 0), reverse=True)
+                    results = results[:top_n]
                 
                 # Store results and parameters for exclusion
                 self.last_analysis_results = results
@@ -506,19 +711,47 @@ for one search may still appear in searches with different parameters.
                     'mineral_price_type': mineral_price_type
                 }
                 
-                formatted = format_analysis_results(results)
+                # Get list of items in on_offer_items for highlighting
+                on_offer_type_ids = self.get_on_offer_type_ids()
                 
-                self.analysis_results.delete(1.0, tk.END)
-                self.analysis_results.insert(tk.END, formatted)
+                # Clear and populate results table
+                for item in self.analysis_tree.get_children():
+                    self.analysis_tree.delete(item)
                 
-                # Create exclude buttons for each result
-                self.create_exclude_buttons(results)
+                for rank, result in enumerate(results, 1):
+                    return_pct = result['return_percent']
+                    if return_pct > 999999:
+                        return_str = ">999,999%"
+                    elif return_pct == float('inf'):
+                        return_str = "N/A"
+                    else:
+                        return_str = f"{return_pct:,.2f}%"
+                    
+                    breakeven_price = result.get('breakeven_module_price', 'na')
+                    if isinstance(breakeven_price, (int, float)) and breakeven_price not in (0, float('inf')):
+                        breakeven_str = f"{breakeven_price:,.2f}"
+                    else:
+                        breakeven_str = "N/A"
+                    
+                    values = (
+                        rank,
+                        result['module_name'],
+                        f"{result['expected_buy_price']:,.2f}",
+                        f"{result['sell_min_price']:,.2f}",
+                        f"{result['profit_per_item']:,.2f}",
+                        return_str,
+                        breakeven_str
+                    )
+                    item_id = self.analysis_tree.insert('', tk.END, values=values)
+                    if result['module_type_id'] in on_offer_type_ids:
+                        self.analysis_tree.item(item_id, tags=('on_offer',))
                 
                 self.status_var.set("Analysis complete!")
                 
             except Exception as e:
-                self.analysis_results.delete(1.0, tk.END)
-                self.analysis_results.insert(tk.END, f"Error: {str(e)}\n")
+                for item in self.analysis_tree.get_children():
+                    self.analysis_tree.delete(item)
+                self.analysis_tree.insert('', tk.END, values=("", f"Error: {str(e)}", "", "", "", "", ""))
                 self.status_var.set("Error occurred")
                 messagebox.showerror("Error", f"An error occurred:\n{str(e)}")
         
@@ -543,70 +776,37 @@ for one search may still appear in searches with different parameters.
         finally:
             conn.close()
     
-    def create_exclude_buttons(self, results):
-        """Create exclude buttons for each result"""
-        # Clear existing buttons
-        for widget in self.exclude_buttons_frame.winfo_children():
-            widget.destroy()
-        self.exclude_buttons.clear()
-        
-        if not results:
-            return
-        
-        # Add label
-        ttk.Label(self.exclude_buttons_frame, text="Exclude:", font=('', 9, 'bold')).pack(pady=(0, 5))
-        
-        # Create button for each result
-        for idx, result in enumerate(results):
-            module_name = result['module_name']
-            module_type_id = result['module_type_id']
-            
-            # Truncate name if too long
-            display_name = module_name[:20] + "..." if len(module_name) > 20 else module_name
-            
-            btn = ttk.Button(
-                self.exclude_buttons_frame,
-                text=f"Exclude #{idx+1}",
-                command=lambda mid=module_type_id, mname=module_name: self.exclude_module(mid, mname),
-                width=18
-            )
-            btn.pack(pady=2)
-            self.exclude_buttons[module_type_id] = btn
-    
-    def exclude_module(self, module_type_id, module_name):
-        """Exclude a module from future searches with current parameters"""
-        if not self.last_analysis_params:
-            messagebox.showwarning("Warning", "No analysis results available")
-            return
-        
-        params = self.last_analysis_params
-        min_price = params['min_price']
-        max_price = params['max_price']
-        module_price_type = params['module_price_type']
-        mineral_price_type = params['mineral_price_type']
-        
+    def get_on_offer_type_ids(self):
+        """Get set of module type IDs that are in the on_offer_items table"""
         if not Path(DATABASE_FILE).exists():
-            messagebox.showerror("Error", "Database file not found")
-            return
+            return set()
         
         conn = sqlite3.connect(DATABASE_FILE)
         try:
             cursor = conn.cursor()
-            cursor.execute("""
-                INSERT OR REPLACE INTO excluded_modules 
-                (module_type_id, module_name, min_price, max_price, module_price_type, mineral_price_type)
-                VALUES (?, ?, ?, ?, ?, ?)
-            """, (module_type_id, module_name, min_price, max_price, module_price_type, mineral_price_type))
-            conn.commit()
-            messagebox.showinfo("Success", f"'{module_name}' excluded from future searches with these parameters")
-            
-            # Update button to show it's excluded
-            if module_type_id in self.exclude_buttons:
-                self.exclude_buttons[module_type_id].config(text="Excluded ✓", state=tk.DISABLED)
-        except Exception as e:
-            messagebox.showerror("Error", f"Failed to exclude module: {str(e)}")
+            cursor.execute("SELECT module_type_id FROM on_offer_items")
+            results = cursor.fetchall()
+            return {row[0] for row in results}
         finally:
             conn.close()
+    
+    def on_analysis_tree_double_click(self, event):
+        """On double-click, copy the selected row's module name to clipboard."""
+        selection = self.analysis_tree.selection()
+        if not selection:
+            return
+        item = selection[0]
+        values = self.analysis_tree.item(item, 'values')
+        if len(values) >= 2:
+            module_name = values[1]  # Module Name column
+            if module_name and not module_name.startswith("Running") and not module_name.startswith("Error"):
+                self.copy_module_name_to_clipboard(module_name)
+    
+    def copy_module_name_to_clipboard(self, module_name):
+        """Copy module name to clipboard"""
+        self.root.clipboard_clear()
+        self.root.clipboard_append(module_name)
+        self.status_var.set(f"Copied '{module_name}' to clipboard")
     
     def calculate_single_module(self):
         """Calculate reprocessing value for a single module"""
@@ -624,7 +824,6 @@ for one search may still appear in searches with different parameters.
             try:
                 yield_percent = self.get_float(self.single_yield_var, 55.0)
                 markup_percent = self.get_float(self.single_markup_var, 10.0)
-                num_modules = self.get_int(self.single_num_modules_var, 100)
                 reprocessing_cost = self.get_float(self.single_reprocessing_cost_var, 3.37)
                 module_price_type = self.single_module_price_type_var.get()
                 mineral_price_type = self.single_mineral_price_type_var.get()
@@ -633,7 +832,6 @@ for one search may still appear in searches with different parameters.
                     module_name=module_name,
                     yield_percent=yield_percent,
                     buy_order_markup_percent=markup_percent,
-                    num_modules=num_modules,
                     reprocessing_cost_percent=reprocessing_cost,
                     module_price_type=module_price_type,
                     mineral_price_type=mineral_price_type
@@ -698,8 +896,8 @@ for one search may still appear in searches with different parameters.
         units_input_frame.pack(fill=tk.X)
         
         ttk.Label(units_input_frame, text="Units Required to Produce These Quantities:").pack(side=tk.LEFT, padx=5)
-        # Use edited units if available, otherwise use num_modules
-        units_value = result.get('_edited_units_required', result.get('num_modules', 1))
+        # Use edited units if available, otherwise use input_quantity
+        units_value = result.get('_edited_units_required', result.get('input_quantity', 1))
         units_var = tk.StringVar(value=str(units_value))
         units_entry = ttk.Entry(units_input_frame, textvariable=units_var, width=15)
         units_entry.pack(side=tk.LEFT, padx=5)
@@ -743,10 +941,12 @@ for one search may still appear in searches with different parameters.
         
         for output_mat in result['reprocessing_outputs']:
             material_name = output_mat['materialName']
-            # Use actualQuantity which may have been edited previously
-            current_qty = int(output_mat.get('actualQuantity', 0))
-            per_module = output_mat.get('baseQuantityPerModule', 0)
-            price = output_mat['mineralPrice']
+            # Use QuantityAfterYield which may have been edited previously
+            current_qty = float(output_mat.get('QuantityAfterYield', 0))
+            # Calculate per module: quantity after yield / input_quantity
+            input_qty = result.get('input_quantity', 1)
+            per_module = current_qty / input_qty if input_qty > 0 else 0
+            price = output_mat.get('mineralPriceAfterCosts', output_mat.get('mineralPrice', 0))
             # Recalculate value based on current quantity
             current_value = current_qty * price
             
@@ -845,21 +1045,14 @@ for one search may still appear in searches with different parameters.
                 actual_modules_needed = units_required
                 
                 # Recalculate costs and values
-                # Use base price (before markup) and apply markup to total
-                module_price_before_markup = result.get('module_price_before_markup', result['module_price'])
-                buy_order_markup_percent = result.get('buy_order_markup_percent', 0)
+                # Use base price and apply costs
+                module_price_base = result.get('module_price', 0)
+                module_price_after_costs = result.get('module_price_after_costs', module_price_base)
                 
-                # Calculate: base_cost × units + markup on total
-                # This matches: cost = 332.8 × 100 + markup
-                base_total_cost = module_price_before_markup * actual_modules_needed
-                
-                # Apply markup to total if using buy_max price type
-                if result['module_price_type'] == 'buy_max' and buy_order_markup_percent > 0:
-                    total_module_price = base_total_cost * (1 + buy_order_markup_percent / 100.0)
-                    module_price = module_price_before_markup * (1 + buy_order_markup_percent / 100.0)
-                else:
-                    total_module_price = base_total_cost
-                    module_price = module_price_before_markup
+                # Calculate total cost: base price × units, then apply cost factor
+                cost_factor = module_price_after_costs / module_price_base if module_price_base > 0 else 1.0
+                base_total_cost = module_price_base * actual_modules_needed
+                total_module_price = base_total_cost * cost_factor
                 
                 # Recalculate reprocessing cost
                 effective_reprocessing_cost_percent = result['reprocessing_cost_percent'] * (result['yield_percent'] / 100.0)
@@ -869,7 +1062,7 @@ for one search may still appear in searches with different parameters.
                 total_mineral_value = 0.0
                 for item in tree.get_children():
                     values = tree.item(item, 'values')
-                    edited_qty = int(values[2].replace(',', ''))
+                    edited_qty = float(values[2].replace(',', ''))
                     price = float(values[4].replace(',', ''))
                     value = edited_qty * price
                     total_mineral_value += value
@@ -884,31 +1077,28 @@ for one search may still appear in searches with different parameters.
                 
                 # Calculate profit margin
                 if total_module_price > 0:
-                    profit_margin_percent = (reprocessing_value / total_module_price) * 100
+                    profit_margin_percent = ((reprocessing_value / total_module_price) - 1) * 100
                 else:
-                    profit_margin_percent = float('inf') if reprocessing_value > 0 else 0.0
+                    profit_margin_percent = "na"
                 
                 # Update result
                 updated_result = result.copy()
-                updated_result['num_modules'] = actual_modules_needed
-                updated_result['total_module_price'] = total_module_price
-                updated_result['reprocessing_cost'] = reprocessing_cost
-                updated_result['total_mineral_value'] = total_mineral_value
-                updated_result['reprocessing_value'] = reprocessing_value
+                updated_result['input_quantity'] = actual_modules_needed
+                updated_result['total_module_cost_per_job'] = total_module_price
+                updated_result['reprocessing_cost_per_job'] = reprocessing_cost
+                updated_result['total_mineral_value_per_job_after_costs'] = total_mineral_value
+                updated_result['reprocessing_value_per_job_after_costs'] = reprocessing_value
                 updated_result['profit_margin_percent'] = profit_margin_percent
                 
                 # Update reprocessing outputs with edited quantities
                 for output_mat in updated_result['reprocessing_outputs']:
                     material_type_id = output_mat['materialTypeID']
                     
-                    # Update batch_size to match the units_required
-                    # This ensures the Batch Size column shows the correct value
-                    output_mat['batchSize'] = actual_modules_needed
-                    
                     if material_type_id in edited_quantities:
                         edited_qty = edited_quantities[material_type_id]
-                        output_mat['actualQuantity'] = edited_qty
-                        output_mat['mineralValue'] = edited_qty * output_mat['mineralPrice']
+                        output_mat['QuantityAfterYield'] = edited_qty
+                        price_after_costs = output_mat.get('mineralPriceAfterCosts', output_mat.get('mineralPrice', 0))
+                        output_mat['mineralValue'] = edited_qty * price_after_costs
                     else:
                         # Update quantities that weren't edited but need recalculation
                         # Recalculate based on new units_required
@@ -918,9 +1108,8 @@ for one search may still appear in searches with different parameters.
                         output_mat['mineralValue'] = new_qty * output_mat['mineralPrice']
                 
                 # Also update module_price in the result to reflect the recalculated price
-                updated_result['module_price'] = module_price
-                updated_result['module_price_before_markup'] = module_price_before_markup
-                updated_result['buy_order_markup_percent'] = buy_order_markup_percent
+                updated_result['module_price'] = module_price_base
+                updated_result['module_price_after_costs'] = module_price_after_costs
                 
                 # Mark that this result has been edited so it persists
                 updated_result['_edited'] = True
@@ -942,11 +1131,11 @@ for one search may still appear in searches with different parameters.
                 # Show summary
                 summary = (
                     f"Recalculated with {actual_modules_needed} units required:\n\n"
-                    f"Total Module Cost: {total_module_price:,.2f} ISK\n"
-                    f"Reprocessing Cost: {reprocessing_cost:,.2f} ISK\n"
-                    f"Total Mineral Value: {total_mineral_value:,.2f} ISK\n"
-                    f"Net Profit: {reprocessing_value:,.2f} ISK\n"
-                    f"Profit Margin: {profit_margin_percent:+.2f}%"
+                    f"Total Module Cost per Job: {total_module_price:,.2f} ISK\n"
+                    f"Reprocessing Cost per Job: {reprocessing_cost:,.2f} ISK\n"
+                    f"Total Mineral Value per Job (after costs): {total_mineral_value:,.2f} ISK\n"
+                    f"Net Profit per Job: {reprocessing_value:,.2f} ISK\n"
+                    f"Profit Margin: {profit_margin_percent:+.2f}%" if isinstance(profit_margin_percent, (int, float)) else "Profit Margin: N/A" if profit_margin_percent != "na" else "Profit Margin: N/A"
                 )
                 messagebox.showinfo("Recalculation Complete", summary)
                 
@@ -1035,6 +1224,380 @@ for one search may still appear in searches with different parameters.
         
         thread = threading.Thread(target=update, daemon=True)
         thread.start()
+    
+    def update_blueprint_prices(self):
+        """Update prices only for items with blueprint source in a separate thread"""
+        self.status_var.set("Updating blueprint item prices...")
+        self.price_update_log.delete(1.0, tk.END)
+        self.price_update_log.insert(tk.END, "Starting update of blueprint item prices...\n")
+        self.price_update_log.insert(tk.END, "Finding items with blueprint source...\n\n")
+        self.root.update()
+        
+        def update():
+            try:
+                # Get typeIDs for items with blueprint source
+                conn = sqlite3.connect(DATABASE_FILE)
+                try:
+                    cursor = conn.execute("""
+                        SELECT DISTINCT c.typeID 
+                        FROM input_quantity_cache c
+                        INNER JOIN prices p ON c.typeID = p.typeID
+                        WHERE c.source = 'blueprint'
+                    """)
+                    type_ids = [row[0] for row in cursor.fetchall()]
+                    
+                    if not type_ids:
+                        self.price_update_log.insert(tk.END, "No items with blueprint source found in database.\n")
+                        self.status_var.set("No blueprint items found")
+                        return
+                    
+                    self.price_update_log.insert(tk.END, f"Found {len(type_ids)} items with blueprint source.\n")
+                    self.price_update_log.insert(tk.END, "Updating prices...\n\n")
+                    self.root.update()
+                    
+                finally:
+                    conn.close()
+                
+                # Redirect logging to our text widget
+                import logging
+                from io import StringIO
+                
+                log_capture = StringIO()
+                handler = logging.StreamHandler(log_capture)
+                handler.setLevel(logging.INFO)
+                logger = logging.getLogger()
+                logger.addHandler(handler)
+                
+                update_prices_by_type_ids(type_ids, f"blueprint items (source='blueprint')")
+                
+                logger.removeHandler(handler)
+                output = log_capture.getvalue()
+                
+                self.price_update_log.insert(tk.END, output)
+                self.price_update_log.insert(tk.END, "\n\nBlueprint price update complete!\n")
+                self.status_var.set("Blueprint price update complete!")
+                messagebox.showinfo("Success", f"Updated prices for {len(type_ids)} blueprint items successfully!")
+                
+            except Exception as e:
+                self.price_update_log.insert(tk.END, f"\nError: {str(e)}\n")
+                self.status_var.set("Error occurred")
+                messagebox.showerror("Error", f"An error occurred:\n{str(e)}")
+        
+        thread = threading.Thread(target=update, daemon=True)
+        thread.start()
+    
+    def update_group_consensus_prices(self):
+        """Update prices only for items with group_consensus source in a separate thread"""
+        self.status_var.set("Updating group consensus item prices...")
+        self.price_update_log.delete(1.0, tk.END)
+        self.price_update_log.insert(tk.END, "Starting update of group consensus item prices...\n")
+        self.price_update_log.insert(tk.END, "Finding items with group consensus source...\n\n")
+        self.root.update()
+        
+        def update():
+            try:
+                # Get typeIDs for items with group_consensus source
+                conn = sqlite3.connect(DATABASE_FILE)
+                try:
+                    cursor = conn.execute("""
+                        SELECT DISTINCT c.typeID 
+                        FROM input_quantity_cache c
+                        INNER JOIN prices p ON c.typeID = p.typeID
+                        WHERE c.source = 'group_consensus'
+                    """)
+                    type_ids = [row[0] for row in cursor.fetchall()]
+                    
+                    if not type_ids:
+                        self.price_update_log.insert(tk.END, "No items with group consensus source found in database.\n")
+                        self.status_var.set("No group consensus items found")
+                        return
+                    
+                    self.price_update_log.insert(tk.END, f"Found {len(type_ids)} items with group consensus source.\n")
+                    self.price_update_log.insert(tk.END, "Updating prices...\n\n")
+                    self.root.update()
+                    
+                finally:
+                    conn.close()
+                
+                # Redirect logging to our text widget
+                import logging
+                from io import StringIO
+                
+                log_capture = StringIO()
+                handler = logging.StreamHandler(log_capture)
+                handler.setLevel(logging.INFO)
+                logger = logging.getLogger()
+                logger.addHandler(handler)
+                
+                update_prices_by_type_ids(type_ids, f"group consensus items (source='group_consensus')")
+                
+                logger.removeHandler(handler)
+                output = log_capture.getvalue()
+                
+                self.price_update_log.insert(tk.END, output)
+                self.price_update_log.insert(tk.END, "\n\nGroup consensus price update complete!\n")
+                self.status_var.set("Group consensus price update complete!")
+                messagebox.showinfo("Success", f"Updated prices for {len(type_ids)} group consensus items successfully!")
+                
+            except Exception as e:
+                self.price_update_log.insert(tk.END, f"\nError: {str(e)}\n")
+                self.status_var.set("Error occurred")
+                messagebox.showerror("Error", f"An error occurred:\n{str(e)}")
+        
+        thread = threading.Thread(target=update, daemon=True)
+        thread.start()
+    
+    def add_on_offer_item(self):
+        """Add an item to the on offer list"""
+        item_input = self.on_offer_item_var.get().strip()
+        
+        if not item_input:
+            messagebox.showwarning("Warning", "Please enter an item name or TypeID")
+            return
+        
+        if not Path(DATABASE_FILE).exists():
+            messagebox.showerror("Error", "Database file not found")
+            return
+        
+        conn = sqlite3.connect(DATABASE_FILE)
+        try:
+            # Find item by name or typeID
+            try:
+                module_type_id = int(item_input)
+                query = "SELECT typeID, typeName FROM items WHERE typeID = ?"
+                params = (module_type_id,)
+            except ValueError:
+                query = "SELECT typeID, typeName FROM items WHERE typeName = ?"
+                params = (item_input,)
+            
+            cursor = conn.cursor()
+            cursor.execute(query, params)
+            result = cursor.fetchone()
+            
+            if not result:
+                messagebox.showerror("Error", f"Item not found: {item_input}")
+                return
+            
+            module_type_id, module_name = result
+            
+            # Check if price data exists
+            cursor.execute("SELECT buy_max, sell_min FROM prices WHERE typeID = ?", (module_type_id,))
+            price_result = cursor.fetchone()
+            
+            if not price_result:
+                messagebox.showerror("Error", f"No price data found for '{module_name}'. Please update prices first.")
+                return
+            
+            buy_max, sell_min = price_result
+            if not buy_max and not sell_min:
+                messagebox.showerror("Error", f"No valid price data found for '{module_name}'. Please update prices first.")
+                return
+            
+            # Check if already exists
+            cursor.execute("SELECT module_type_id FROM on_offer_items WHERE module_type_id = ?", (module_type_id,))
+            if cursor.fetchone():
+                messagebox.showwarning("Warning", f"'{module_name}' is already in the on offer list")
+                return
+            
+            # Insert into database (no price fields needed - fetched from prices table)
+            cursor.execute("""
+                INSERT INTO on_offer_items (module_type_id, module_name)
+                VALUES (?, ?)
+            """, (module_type_id, module_name))
+            conn.commit()
+            
+            messagebox.showinfo("Success", f"Added '{module_name}' to on offer list")
+            
+            # Clear input field
+            self.on_offer_item_var.set("")
+            
+            # Refresh list
+            self.refresh_on_offer_list()
+            
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to add item: {str(e)}")
+        finally:
+            conn.close()
+    
+    def remove_on_offer_item(self):
+        """Remove selected item(s) from the on offer list"""
+        selected = self.on_offer_tree.selection()
+        if not selected:
+            messagebox.showwarning("Warning", "Please select an item to remove")
+            return
+        
+        if not messagebox.askyesno("Confirm", f"Remove {len(selected)} item(s) from on offer list?"):
+            return
+        
+        if not Path(DATABASE_FILE).exists():
+            messagebox.showerror("Error", "Database file not found")
+            return
+        
+        conn = sqlite3.connect(DATABASE_FILE)
+        try:
+            cursor = conn.cursor()
+            for item_id in selected:
+                values = self.on_offer_tree.item(item_id, 'values')
+                module_name = values[0]
+                
+                # Get module_type_id from database
+                cursor.execute("SELECT module_type_id FROM on_offer_items WHERE module_name = ?", (module_name,))
+                result = cursor.fetchone()
+                if result:
+                    cursor.execute("DELETE FROM on_offer_items WHERE module_type_id = ?", (result[0],))
+            
+            conn.commit()
+            messagebox.showinfo("Success", f"Removed {len(selected)} item(s) from on offer list")
+            self.refresh_on_offer_list()
+            
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to remove item(s): {str(e)}")
+        finally:
+            conn.close()
+    
+    def refresh_on_offer_list(self):
+        """Refresh the on offer list and calculate all values"""
+        # Clear existing items
+        for item in self.on_offer_tree.get_children():
+            self.on_offer_tree.delete(item)
+        
+        if not Path(DATABASE_FILE).exists():
+            return
+        
+        conn = sqlite3.connect(DATABASE_FILE)
+        try:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT module_type_id, module_name
+                FROM on_offer_items
+                ORDER BY module_name
+            """)
+            results = cursor.fetchall()
+            
+            if not results:
+                return
+            
+            # Get default parameters from assumptions
+            from assumptions import (
+                DEFAULT_YIELD_PERCENT,
+                BUY_ORDER_MARKUP_PERCENT,
+                REPROCESSING_COST
+            )
+            
+            yield_percent = DEFAULT_YIELD_PERCENT
+            markup_percent = BUY_ORDER_MARKUP_PERCENT
+            reprocessing_cost = REPROCESSING_COST
+            
+            # Calculate values for each item
+            for module_type_id, module_name in results:
+                try:
+                    # Get current market prices from database
+                    cursor.execute("SELECT buy_max, sell_min FROM prices WHERE typeID = ?", (module_type_id,))
+                    price_result = cursor.fetchone()
+                    
+                    if not price_result:
+                        # No price data - show error
+                        self.on_offer_tree.insert('', tk.END, values=(
+                            module_name,
+                            "No price data",
+                            "No price data",
+                            "Error",
+                            "Error",
+                            "Error",
+                            "Error"
+                        ))
+                        continue
+                    
+                    buy_max, sell_min = price_result
+                    buy_max = float(buy_max) if buy_max else 0.0
+                    sell_min = float(sell_min) if sell_min else 0.0
+                    
+                    # Calculate for buy_offer scenario (module_price_type='buy_offer', mineral_price_type='sell_immediate')
+                    result_buy_order = calculate_reprocessing_value(
+                        module_type_id=module_type_id,
+                        yield_percent=yield_percent,
+                        buy_order_markup_percent=markup_percent,
+                        reprocessing_cost_percent=reprocessing_cost,
+                        module_price_type='buy_offer',
+                        mineral_price_type='sell_immediate',
+                        db_file=DATABASE_FILE
+                    )
+                    
+                    # Calculate for buy_immediate scenario (module_price_type='buy_immediate', mineral_price_type='sell_immediate')
+                    result_immediate = calculate_reprocessing_value(
+                        module_type_id=module_type_id,
+                        yield_percent=yield_percent,
+                        buy_order_markup_percent=markup_percent,
+                        reprocessing_cost_percent=reprocessing_cost,
+                        module_price_type='buy_immediate',
+                        mineral_price_type='sell_immediate',
+                        db_file=DATABASE_FILE
+                    )
+                    
+                    if 'error' in result_buy_order or 'error' in result_immediate:
+                        # Show error in display
+                        profit_buy_order = "Error"
+                        profit_immediate = "Error"
+                        breakeven_buy_order = "Error"
+                        breakeven_immediate = "Error"
+                    else:
+                        # Get profit per item from buy_order calculation
+                        input_quantity = result_buy_order.get('input_quantity', 1)
+                        total_mineral_value = result_buy_order.get('total_mineral_value_per_job_after_costs', 0)
+                        reprocessing_cost_total = result_buy_order.get('reprocessing_cost_per_job', 0)
+                        module_price_after_costs_buy = result_buy_order.get('module_price_after_costs', 0)
+                        
+                        mineral_value_per_item = total_mineral_value / input_quantity if input_quantity > 0 else 0
+                        reprocessing_cost_per_item = reprocessing_cost_total / input_quantity if input_quantity > 0 else 0
+                        
+                        # Profit per item for buy order (using buy_offer calculation)
+                        profit_buy_order = mineral_value_per_item - module_price_after_costs_buy - reprocessing_cost_per_item
+                        
+                        # Get profit per item from immediate calculation
+                        module_price_after_costs_immediate = result_immediate.get('module_price_after_costs', 0)
+                        
+                        # Profit per item for immediate (using buy_immediate calculation)
+                        profit_immediate = mineral_value_per_item - module_price_after_costs_immediate - reprocessing_cost_per_item
+                        
+                        # Breakeven for buy order (from buy_offer calculation)
+                        breakeven_buy_order = result_buy_order.get('breakeven_module_price', 'na')
+                        if isinstance(breakeven_buy_order, (int, float)) and breakeven_buy_order not in (0, float('inf')):
+                            breakeven_buy_order = f"{breakeven_buy_order:,.2f}"
+                        else:
+                            breakeven_buy_order = "N/A"
+                        
+                        # Breakeven for immediate (from buy_immediate calculation)
+                        breakeven_immediate = result_immediate.get('breakeven_module_price', 'na')
+                        if isinstance(breakeven_immediate, (int, float)) and breakeven_immediate not in (0, float('inf')):
+                            breakeven_immediate = f"{breakeven_immediate:,.2f}"
+                        else:
+                            breakeven_immediate = "N/A"
+                    
+                    # Insert into treeview
+                    self.on_offer_tree.insert('', tk.END, values=(
+                        module_name,
+                        f"{buy_max:,.2f}" if buy_max > 0 else "N/A",
+                        f"{sell_min:,.2f}" if sell_min > 0 else "N/A",
+                        f"{profit_buy_order:,.2f}" if isinstance(profit_buy_order, (int, float)) else profit_buy_order,
+                        f"{profit_immediate:,.2f}" if isinstance(profit_immediate, (int, float)) else profit_immediate,
+                        breakeven_buy_order,
+                        breakeven_immediate
+                    ))
+                    
+                except Exception as e:
+                    # Insert with error message
+                    self.on_offer_tree.insert('', tk.END, values=(
+                        module_name,
+                        "Error",
+                        "Error",
+                        "Error",
+                        "Error",
+                        "Error",
+                        "Error"
+                    ))
+                    
+        finally:
+            conn.close()
 
 
 def main():
