@@ -48,6 +48,7 @@ class EVELauncher:
         self.create_price_update_tab()
         self.create_exclusions_tab()
         self.create_on_offer_tab()
+        self.create_paste_compare_tab()
         
         # Store last analysis results for exclusion
         self.last_analysis_results = None
@@ -504,6 +505,216 @@ for one search may still appear in searches with different parameters.
         
         # Load items on startup
         self.refresh_on_offer_list()
+    
+    def create_paste_compare_tab(self):
+        """Create the Paste & Compare tab: paste in-game window (Name<Tab>Qty), compare reprocess vs sell."""
+        frame = ttk.Frame(self.notebook)
+        self.notebook.add(frame, text="Paste & Compare")
+        
+        # Instructions
+        info_frame = ttk.LabelFrame(frame, text="Instructions", padding=10)
+        info_frame.pack(fill=tk.X, padx=10, pady=10)
+        info_text = (
+            "Paste in-game window content: one line per item, 'Name<Tab>Quantity' (quantity optional, default 1). "
+            "For reprocessable items: if item value ≥ threshold we compare reprocess output to lowest sell; "
+            "if below threshold we compare to lowest buy order. Recommendation: Reprocess or Sell."
+        )
+        ttk.Label(info_frame, text=info_text, justify=tk.LEFT, wraplength=900).pack(anchor=tk.W)
+        
+        # Paste area
+        paste_frame = ttk.LabelFrame(frame, text="Paste content (Name<Tab>Quantity)", padding=10)
+        paste_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
+        self.paste_compare_text = scrolledtext.ScrolledText(paste_frame, wrap=tk.WORD, height=8, width=80)
+        self.paste_compare_text.pack(fill=tk.BOTH, expand=True)
+        
+        # Parameters
+        params_frame = ttk.Frame(frame)
+        params_frame.pack(fill=tk.X, padx=10, pady=5)
+        ttk.Label(params_frame, text="Threshold (ISK):").pack(side=tk.LEFT, padx=5)
+        self.paste_threshold_var = tk.StringVar(value="100000")
+        ttk.Entry(params_frame, textvariable=self.paste_threshold_var, width=12).pack(side=tk.LEFT, padx=5)
+        ttk.Label(params_frame, text="Yield %:").pack(side=tk.LEFT, padx=5)
+        self.paste_yield_var = tk.StringVar(value="55.0")
+        ttk.Entry(params_frame, textvariable=self.paste_yield_var, width=8).pack(side=tk.LEFT, padx=5)
+        ttk.Label(params_frame, text="Reprocessing cost %:").pack(side=tk.LEFT, padx=5)
+        self.paste_repro_cost_var = tk.StringVar(value="3.37")
+        ttk.Entry(params_frame, textvariable=self.paste_repro_cost_var, width=8).pack(side=tk.LEFT, padx=5)
+        
+        compare_btn = ttk.Button(params_frame, text="Compare", command=self.run_paste_compare)
+        compare_btn.pack(side=tk.LEFT, padx=15)
+        
+        # Results table
+        results_frame = ttk.LabelFrame(frame, text="Results", padding=10)
+        results_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        self.paste_compare_columns = ('Item Name', 'Qty', 'Sell Min', 'Buy Max', 'Reprocess Value/Item', 'Recommendation')
+        self.paste_compare_tree = ttk.Treeview(results_frame, columns=self.paste_compare_columns, show='headings', height=20, selectmode='browse')
+        self.paste_compare_sort_column = None
+        self.paste_compare_sort_reverse = False
+        for col in self.paste_compare_columns:
+            self.paste_compare_tree.heading(col, text=col, command=lambda c=col: self.sort_paste_compare_by(c))
+        self.paste_compare_tree.column('Item Name', width=320, anchor=tk.W)
+        self.paste_compare_tree.column('Qty', width=50, anchor=tk.E)
+        self.paste_compare_tree.column('Sell Min', width=100, anchor=tk.E)
+        self.paste_compare_tree.column('Buy Max', width=100, anchor=tk.E)
+        self.paste_compare_tree.column('Reprocess Value/Item', width=140, anchor=tk.E)
+        self.paste_compare_tree.column('Recommendation', width=120, anchor=tk.W)
+        scrollbar = ttk.Scrollbar(results_frame, orient=tk.VERTICAL, command=self.paste_compare_tree.yview)
+        self.paste_compare_tree.configure(yscrollcommand=scrollbar.set)
+        self.paste_compare_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+    
+    def _paste_compare_sort_key(self, values, col_index):
+        """Return a sort key for a row (tuple of values) for the given column index."""
+        if col_index >= len(values):
+            return (0, "")
+        val = values[col_index]
+        s = str(val).strip()
+        if col_index == 0:  # Item Name - alphabetical, case-insensitive
+            return (0, (s or "").lower())
+        if col_index == 5:  # Recommendation - group by type
+            return (0, s or "")
+        if col_index == 1:  # Qty - numeric
+            try:
+                return (0, int(s))
+            except ValueError:
+                return (1, s)
+        if col_index in (2, 3, 4):  # Sell Min, Buy Max, Reprocess Value/Item - numeric
+            try:
+                return (0, float(s.replace(",", "")))
+            except ValueError:
+                return (1, s)
+        return (0, s)
+    
+    def sort_paste_compare_by(self, column):
+        """Sort Paste & Compare table by the clicked column. Toggle asc/desc on same column."""
+        tree = self.paste_compare_tree
+        children = list(tree.get_children(""))
+        if not children:
+            return
+        # Don't sort when the only row is a placeholder ("Comparing...", "Error:...")
+        if len(children) == 1:
+            first_vals = tree.item(children[0])["values"]
+            if len(first_vals) >= 2:
+                second = str(first_vals[1] or "")
+                if second == "Comparing..." or second.startswith("Error:"):
+                    return
+        if self.paste_compare_sort_column == column:
+            self.paste_compare_sort_reverse = not self.paste_compare_sort_reverse
+        else:
+            self.paste_compare_sort_reverse = False
+            self.paste_compare_sort_column = column
+        col_index = self.paste_compare_columns.index(column) if column in self.paste_compare_columns else 0
+        # (sort_key, item_id)
+        pairs = []
+        for item_id in children:
+            vals = tree.item(item_id)["values"]
+            key = self._paste_compare_sort_key(vals, col_index)
+            pairs.append((key, item_id))
+        pairs.sort(key=lambda p: p[0], reverse=self.paste_compare_sort_reverse)
+        for index, (_, item_id) in enumerate(pairs):
+            tree.move(item_id, "", index)
+    
+    def run_paste_compare(self):
+        """Parse pasted lines, look up items, compare reprocess value vs sell/buy; run in background thread."""
+        text = self.paste_compare_text.get(1.0, tk.END)
+        lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+        if not lines:
+            messagebox.showinfo("Paste & Compare", "Paste some lines (Name<Tab>Quantity) first.")
+            return
+        
+        self.status_var.set("Comparing items...")
+        for item in self.paste_compare_tree.get_children():
+            self.paste_compare_tree.delete(item)
+        self.paste_compare_tree.insert('', tk.END, values=("", "Comparing...", "", "", "", ""))
+        self.root.update()
+        
+        def do_compare():
+            try:
+                threshold = self.get_float(self.paste_threshold_var, 100000.0)
+                yield_pct = self.get_float(self.paste_yield_var, 55.0)
+                repro_cost_pct = self.get_float(self.paste_repro_cost_var, 3.37)
+                
+                rows = []
+                for line in lines:
+                    parts = line.split('\t')
+                    name = parts[0].strip() if parts else ""
+                    if not name:
+                        continue
+                    try:
+                        qty_str = parts[1].strip() if len(parts) > 1 else "1"
+                        qty = int(qty_str) if qty_str else 1
+                    except (ValueError, IndexError):
+                        qty = 1
+                    
+                    conn = sqlite3.connect(DATABASE_FILE)
+                    try:
+                        cursor = conn.execute("SELECT typeID FROM items WHERE typeName = ?", (name,))
+                        row_item = cursor.fetchone()
+                        if not row_item:
+                            rows.append((name, str(qty), "N/A", "N/A", "N/A", "Not in DB"))
+                            continue
+                        type_id = row_item[0]
+                        
+                        cursor = conn.execute("SELECT buy_max, sell_min FROM prices WHERE typeID = ?", (type_id,))
+                        price_row = cursor.fetchone()
+                        buy_max = float(price_row[0]) if price_row and price_row[0] is not None else 0.0
+                        sell_min = float(price_row[1]) if price_row and price_row[1] is not None else 0.0
+                    finally:
+                        conn.close()
+                    
+                    result = calculate_reprocessing_value(
+                        module_type_id=type_id,
+                        yield_percent=yield_pct,
+                        buy_order_markup_percent=0,
+                        reprocessing_cost_percent=repro_cost_pct,
+                        module_price_type='sell_min',
+                        mineral_price_type='sell_immediate',
+                        db_file=DATABASE_FILE
+                    )
+                    
+                    if 'error' in result:
+                        rows.append((name, str(qty), f"{sell_min:,.2f}" if sell_min else "N/A", f"{buy_max:,.2f}" if buy_max else "N/A", "N/A", "Not reprocessable"))
+                        continue
+                    
+                    total_mineral = result['total_mineral_value_per_job_after_costs']
+                    repro_cost_job = result['reprocessing_cost_per_job']
+                    input_qty = result['input_quantity']
+                    if input_qty and input_qty > 0:
+                        reprocess_value_per_item = (total_mineral - repro_cost_job) / input_qty
+                    else:
+                        reprocess_value_per_item = 0.0
+                    
+                    if sell_min >= threshold:
+                        compare_price = sell_min
+                    else:
+                        compare_price = buy_max
+                    
+                    if compare_price <= 0:
+                        rec = "N/A (no price)"
+                    elif reprocess_value_per_item > compare_price:
+                        rec = "Reprocess"
+                    else:
+                        rec = "Sell"
+                    
+                    sell_str = f"{sell_min:,.2f}" if sell_min else "N/A"
+                    buy_str = f"{buy_max:,.2f}" if buy_max else "N/A"
+                    repro_str = f"{reprocess_value_per_item:,.2f}"
+                    rows.append((name, str(qty), sell_str, buy_str, repro_str, rec))
+                
+                for item in self.paste_compare_tree.get_children():
+                    self.paste_compare_tree.delete(item)
+                for r in rows:
+                    self.paste_compare_tree.insert('', tk.END, values=r)
+                self.status_var.set("Compare complete.")
+            except Exception as e:
+                for item in self.paste_compare_tree.get_children():
+                    self.paste_compare_tree.delete(item)
+                self.paste_compare_tree.insert('', tk.END, values=("", f"Error: {str(e)}", "", "", "", ""))
+                self.status_var.set("Error occurred")
+                messagebox.showerror("Error", f"An error occurred:\n{str(e)}")
+        
+        thread = threading.Thread(target=do_compare, daemon=True)
+        thread.start()
     
     def refresh_exclusions_list(self):
         """Refresh the excluded modules list"""
