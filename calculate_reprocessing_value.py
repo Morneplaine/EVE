@@ -31,6 +31,11 @@ logger = logging.getLogger(__name__)
 
 DATABASE_FILE = "eve_manufacturing.db"
 
+# Type IDs always excluded from Top 30 / reprocessing analysis (e.g. structures)
+ALWAYS_EXCLUDED_TYPE_IDS = {
+    47515,  # 'Marginis' Fortizar (citadel structure)
+}
+
 
 def ensure_input_quantity_cache_table(conn):
     """Ensure the input_quantity_cache table exists"""
@@ -789,9 +794,10 @@ def analyze_all_modules(
         logger.error(f"Database file not found: {db_file}")
         return []
     
-    # Initialize excluded_module_ids if None
+    # Initialize excluded_module_ids if None and merge with always-excluded types
     if excluded_module_ids is None:
         excluded_module_ids = set()
+    excluded_module_ids = excluded_module_ids | ALWAYS_EXCLUDED_TYPE_IDS
     
     conn = sqlite3.connect(db_file)
     

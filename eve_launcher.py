@@ -4,7 +4,7 @@ A GUI interface for managing and analyzing EVE Online manufacturing and reproces
 """
 
 import tkinter as tk
-from tkinter import ttk, scrolledtext, messagebox
+from tkinter import ttk, scrolledtext, messagebox, simpledialog
 import threading
 import sys
 import math
@@ -99,6 +99,25 @@ class EVELauncher:
                     FOREIGN KEY (module_type_id) REFERENCES items(typeID)
                 )
             """)
+            # Add reset/sold tracking columns if missing
+            cursor.execute("PRAGMA table_info(on_offer_items)")
+            cols = {row[1] for row in cursor.fetchall()}
+            added_columns = False
+            if 'last_reset_date' not in cols:
+                cursor.execute("ALTER TABLE on_offer_items ADD COLUMN last_reset_date TEXT")
+                added_columns = True
+            if 'quantity_sold_at_last_reset' not in cols:
+                cursor.execute("ALTER TABLE on_offer_items ADD COLUMN quantity_sold_at_last_reset INTEGER")
+                added_columns = True
+            if 'previous_reset_date' not in cols:
+                cursor.execute("ALTER TABLE on_offer_items ADD COLUMN previous_reset_date TEXT")
+                added_columns = True
+            conn.commit()
+            # For existing rows: use today as date added when we just added the new columns; else only fill NULL
+            if added_columns:
+                cursor.execute("UPDATE on_offer_items SET added_at = datetime('now')")
+            else:
+                cursor.execute("UPDATE on_offer_items SET added_at = datetime('now') WHERE added_at IS NULL")
             conn.commit()
         finally:
             conn.close()
@@ -465,26 +484,30 @@ for one search may still appear in searches with different parameters.
         table_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
         
         # Create treeview with all required columns
-        columns = ('Name', 'Buy Price', 'Sell Min', 'Profit/Item (Buy Order)', 'Profit/Item (Immediate)', 
-                   'Breakeven Max (Buy Order)', 'Breakeven Max (Immediate)')
+        columns = ('Name', 'Date Added', 'Buy Price', 'Sell Min', 'Profit/Item (Buy Order)', 'Profit/Item (Immediate)', 
+                   'Breakeven Max (Buy Order)', 'Breakeven Max (Immediate)', 'Sold Per Day')
         self.on_offer_tree = ttk.Treeview(table_frame, columns=columns, show='headings', height=20)
         
         # Configure columns
         self.on_offer_tree.heading('Name', text='Name')
+        self.on_offer_tree.heading('Date Added', text='Date Added')
         self.on_offer_tree.heading('Buy Price', text='Buy Price (buy_max)')
         self.on_offer_tree.heading('Sell Min', text='Sell Min')
         self.on_offer_tree.heading('Profit/Item (Buy Order)', text='Profit/Item (Buy Order)')
         self.on_offer_tree.heading('Profit/Item (Immediate)', text='Profit/Item (Immediate)')
         self.on_offer_tree.heading('Breakeven Max (Buy Order)', text='Breakeven Max (Buy Order)')
         self.on_offer_tree.heading('Breakeven Max (Immediate)', text='Breakeven Max (Immediate)')
+        self.on_offer_tree.heading('Sold Per Day', text='Sold Per Day')
         
-        self.on_offer_tree.column('Name', width=250)
-        self.on_offer_tree.column('Buy Price', width=120, anchor=tk.E)
-        self.on_offer_tree.column('Sell Min', width=120, anchor=tk.E)
-        self.on_offer_tree.column('Profit/Item (Buy Order)', width=180, anchor=tk.E)
-        self.on_offer_tree.column('Profit/Item (Immediate)', width=180, anchor=tk.E)
-        self.on_offer_tree.column('Breakeven Max (Buy Order)', width=200, anchor=tk.E)
-        self.on_offer_tree.column('Breakeven Max (Immediate)', width=200, anchor=tk.E)
+        self.on_offer_tree.column('Name', width=220)
+        self.on_offer_tree.column('Date Added', width=100, anchor=tk.CENTER)
+        self.on_offer_tree.column('Buy Price', width=100, anchor=tk.E)
+        self.on_offer_tree.column('Sell Min', width=100, anchor=tk.E)
+        self.on_offer_tree.column('Profit/Item (Buy Order)', width=150, anchor=tk.E)
+        self.on_offer_tree.column('Profit/Item (Immediate)', width=150, anchor=tk.E)
+        self.on_offer_tree.column('Breakeven Max (Buy Order)', width=170, anchor=tk.E)
+        self.on_offer_tree.column('Breakeven Max (Immediate)', width=170, anchor=tk.E)
+        self.on_offer_tree.column('Sold Per Day', width=90, anchor=tk.E)
         
         # Scrollbar
         scrollbar = ttk.Scrollbar(table_frame, orient=tk.VERTICAL, command=self.on_offer_tree.yview)
@@ -499,6 +522,9 @@ for one search may still appear in searches with different parameters.
         
         refresh_btn = ttk.Button(action_frame, text="Refresh Calculations", command=self.refresh_on_offer_list)
         refresh_btn.pack(side=tk.LEFT, padx=5)
+        
+        reset_date_btn = ttk.Button(action_frame, text="Reset date (enter quantity sold)", command=self.reset_on_offer_date)
+        reset_date_btn.pack(side=tk.LEFT, padx=5)
         
         remove_btn = ttk.Button(action_frame, text="Remove Selected", command=self.remove_on_offer_item)
         remove_btn.pack(side=tk.LEFT, padx=5)
@@ -526,6 +552,8 @@ for one search may still appear in searches with different parameters.
         paste_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
         self.paste_compare_text = scrolledtext.ScrolledText(paste_frame, wrap=tk.WORD, height=8, width=80)
         self.paste_compare_text.pack(fill=tk.BOTH, expand=True)
+        clear_paste_btn = ttk.Button(paste_frame, text="Clear paste content", command=self.clear_paste_compare_text)
+        clear_paste_btn.pack(pady=(5, 0))
         
         # Parameters
         params_frame = ttk.Frame(frame)
@@ -571,8 +599,9 @@ for one search may still appear in searches with different parameters.
         s = str(val).strip()
         if col_index == 0:  # Item Name - alphabetical, case-insensitive
             return (0, (s or "").lower())
-        if col_index == 5:  # Recommendation - group by type
-            return (0, s or "")
+        if col_index == 5:  # Recommendation - group by type, then alphabetically by name
+            name = (values[0] or "").lower() if len(values) > 0 else ""
+            return (0, s or "", name)
         if col_index == 1:  # Qty - numeric
             try:
                 return (0, int(s))
@@ -716,6 +745,10 @@ for one search may still appear in searches with different parameters.
         thread = threading.Thread(target=do_compare, daemon=True)
         thread.start()
     
+    def clear_paste_compare_text(self):
+        """Clear the paste content text area so you can paste new content."""
+        self.paste_compare_text.delete(1.0, tk.END)
+    
     def refresh_exclusions_list(self):
         """Refresh the excluded modules list"""
         # Clear existing items
@@ -738,6 +771,15 @@ for one search may still appear in searches with different parameters.
             
             for row in results:
                 module_type_id, module_name, min_price, max_price, module_price_type, mineral_price_type, excluded_at = row
+                # Format date as dd/mm
+                excluded_at_str = excluded_at
+                if excluded_at:
+                    try:
+                        from datetime import datetime as _dt
+                        d = _dt.strptime(str(excluded_at)[:10], "%Y-%m-%d")
+                        excluded_at_str = f"{d.day:02d}/{d.month:02d}"
+                    except Exception:
+                        excluded_at_str = str(excluded_at)
                 self.exclusions_tree.insert('', tk.END, values=(
                     module_name,
                     module_type_id,
@@ -745,7 +787,7 @@ for one search may still appear in searches with different parameters.
                     f"{max_price:,.2f}",
                     module_price_type,
                     mineral_price_type,
-                    excluded_at
+                    excluded_at_str
                 ))
         finally:
             conn.close()
@@ -1610,11 +1652,13 @@ for one search may still appear in searches with different parameters.
                 messagebox.showwarning("Warning", f"'{module_name}' is already in the on offer list")
                 return
             
-            # Insert into database (no price fields needed - fetched from prices table)
+            # Insert into database; first add counts as first reset (last_reset_date = today, qty sold = 0)
+            from datetime import date
+            today_str = date.today().isoformat()
             cursor.execute("""
-                INSERT INTO on_offer_items (module_type_id, module_name)
-                VALUES (?, ?)
-            """, (module_type_id, module_name))
+                INSERT INTO on_offer_items (module_type_id, module_name, last_reset_date, quantity_sold_at_last_reset)
+                VALUES (?, ?, ?, 0)
+            """, (module_type_id, module_name, today_str))
             conn.commit()
             
             messagebox.showinfo("Success", f"Added '{module_name}' to on offer list")
@@ -1660,14 +1704,64 @@ for one search may still appear in searches with different parameters.
             conn.commit()
             messagebox.showinfo("Success", f"Removed {len(selected)} item(s) from on offer list")
             self.refresh_on_offer_list()
-            
+        
         except Exception as e:
             messagebox.showerror("Error", f"Failed to remove item(s): {str(e)}")
         finally:
             conn.close()
     
+    def reset_on_offer_date(self):
+        """Reset date for selected item: ask quantity sold, then set last_reset_date = today and compute sold per day."""
+        selected = self.on_offer_tree.selection()
+        if not selected:
+            messagebox.showwarning("Warning", "Please select one item to reset date.")
+            return
+        if len(selected) > 1:
+            messagebox.showwarning("Warning", "Please select only one item to reset date.")
+            return
+        item_id = selected[0]
+        try:
+            module_type_id = int(item_id)
+        except ValueError:
+            messagebox.showerror("Error", "Could not identify item.")
+            return
+        values = self.on_offer_tree.item(item_id, "values")
+        module_name = values[0] if values else "this item"
+        qty = simpledialog.askinteger("Quantity sold", f"Quantity sold for '{module_name}' since last reset?", minvalue=0, initialvalue=0)
+        if qty is None:
+            return
+        if not Path(DATABASE_FILE).exists():
+            messagebox.showerror("Error", "Database file not found")
+            return
+        from datetime import date
+        conn = sqlite3.connect(DATABASE_FILE)
+        try:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT last_reset_date FROM on_offer_items WHERE module_type_id = ?",
+                (module_type_id,)
+            )
+            row = cursor.fetchone()
+            prev_date = row[0] if row and row[0] else None
+            today_str = date.today().isoformat()
+            cursor.execute("""
+                UPDATE on_offer_items
+                SET previous_reset_date = last_reset_date,
+                    last_reset_date = ?,
+                    quantity_sold_at_last_reset = ?
+                WHERE module_type_id = ?
+            """, (today_str, qty, module_type_id))
+            conn.commit()
+            messagebox.showinfo("Success", f"Reset date for '{module_name}'. Quantity sold: {qty}. Sold per day will update after next refresh.")
+            self.refresh_on_offer_list()
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to reset date: {str(e)}")
+        finally:
+            conn.close()
+    
     def refresh_on_offer_list(self):
         """Refresh the on offer list and calculate all values"""
+        from datetime import datetime as dt_module, date as date_type
         # Clear existing items
         for item in self.on_offer_tree.get_children():
             self.on_offer_tree.delete(item)
@@ -1679,7 +1773,8 @@ for one search may still appear in searches with different parameters.
         try:
             cursor = conn.cursor()
             cursor.execute("""
-                SELECT module_type_id, module_name
+                SELECT module_type_id, module_name, added_at, last_reset_date,
+                       quantity_sold_at_last_reset, previous_reset_date
                 FROM on_offer_items
                 ORDER BY module_name
             """)
@@ -1700,7 +1795,35 @@ for one search may still appear in searches with different parameters.
             reprocessing_cost = REPROCESSING_COST
             
             # Calculate values for each item
-            for module_type_id, module_name in results:
+            for row in results:
+                module_type_id, module_name = row[0], row[1]
+                added_at = row[2] if len(row) > 2 else None
+                last_reset_date = row[3] if len(row) > 3 else None
+                quantity_sold_at_last_reset = row[4] if len(row) > 4 else None
+                previous_reset_date = row[5] if len(row) > 5 else None
+                
+                # Date Added: show as dd/mm
+                if added_at:
+                    try:
+                        d = dt_module.strptime(str(added_at)[:10], "%Y-%m-%d")
+                        date_added_str = f"{d.day:02d}/{d.month:02d}"
+                    except Exception:
+                        date_added_str = ""
+                else:
+                    t = date_type.today()
+                    date_added_str = f"{t.day:02d}/{t.month:02d}"
+                
+                # Sold per day = quantity_sold / (last_reset_date - previous_reset_date) in days
+                sold_per_day_str = "N/A"
+                if last_reset_date and previous_reset_date and quantity_sold_at_last_reset is not None:
+                    try:
+                        last = dt_module.strptime(str(last_reset_date)[:10], "%Y-%m-%d")
+                        prev = dt_module.strptime(str(previous_reset_date)[:10], "%Y-%m-%d")
+                        days = (last - prev).days
+                        if days > 0:
+                            sold_per_day_str = f"{quantity_sold_at_last_reset / days:,.2f}"
+                    except Exception:
+                        pass
                 try:
                     # Get current market prices from database
                     cursor.execute("SELECT buy_max, sell_min FROM prices WHERE typeID = ?", (module_type_id,))
@@ -1708,14 +1831,16 @@ for one search may still appear in searches with different parameters.
                     
                     if not price_result:
                         # No price data - show error
-                        self.on_offer_tree.insert('', tk.END, values=(
+                        self.on_offer_tree.insert('', tk.END, iid=str(module_type_id), values=(
                             module_name,
+                            date_added_str,
                             "No price data",
                             "No price data",
                             "Error",
                             "Error",
                             "Error",
-                            "Error"
+                            "Error",
+                            sold_per_day_str
                         ))
                         continue
                     
@@ -1784,27 +1909,31 @@ for one search may still appear in searches with different parameters.
                         else:
                             breakeven_immediate = "N/A"
                     
-                    # Insert into treeview
-                    self.on_offer_tree.insert('', tk.END, values=(
+                    # Insert into treeview (iid = module_type_id for reset)
+                    self.on_offer_tree.insert('', tk.END, iid=str(module_type_id), values=(
                         module_name,
+                        date_added_str,
                         f"{buy_max:,.2f}" if buy_max > 0 else "N/A",
                         f"{sell_min:,.2f}" if sell_min > 0 else "N/A",
                         f"{profit_buy_order:,.2f}" if isinstance(profit_buy_order, (int, float)) else profit_buy_order,
                         f"{profit_immediate:,.2f}" if isinstance(profit_immediate, (int, float)) else profit_immediate,
                         breakeven_buy_order,
-                        breakeven_immediate
+                        breakeven_immediate,
+                        sold_per_day_str
                     ))
                     
                 except Exception as e:
                     # Insert with error message
-                    self.on_offer_tree.insert('', tk.END, values=(
+                    self.on_offer_tree.insert('', tk.END, iid=str(module_type_id), values=(
                         module_name,
+                        date_added_str,
                         "Error",
                         "Error",
                         "Error",
                         "Error",
                         "Error",
-                        "Error"
+                        "Error",
+                        sold_per_day_str
                     ))
                     
         finally:
