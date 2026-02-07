@@ -108,16 +108,17 @@ CREATE TABLE IF NOT EXISTS input_quantity_cache (
 -- Market history (EVE Tycoon): daily trade stats per region/type for Jita (The Forge)
 -- API: https://evetycoon.com/api/v1/market/history/{regionId}/{typeId}
 -- One request per typeId; API returns full history (no accumulation needed).
+-- transaction_skew is not stored; recalculate as 1 - ((average - lowest) / (highest - lowest)) when needed.
 CREATE TABLE IF NOT EXISTS market_history_daily (
     region_id INTEGER NOT NULL,
     type_id INTEGER NOT NULL,
+    type_name TEXT,
     date_utc TEXT NOT NULL,
     average REAL NOT NULL,
     highest REAL NOT NULL,
     lowest REAL NOT NULL,
     order_count INTEGER,
     volume INTEGER,
-    transaction_skew REAL,
     PRIMARY KEY (region_id, type_id, date_utc),
     FOREIGN KEY (type_id) REFERENCES items(typeID)
 );

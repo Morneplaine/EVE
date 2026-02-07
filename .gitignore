@@ -39,6 +39,10 @@ eve_data/
 *.xlsx
 *.xls
 *.db
+!eve_manufacturing.db
+!eve_manufacturing_v1.db
+!eve_manufacturing_v2.db
+!eve_manufacturing_v3.db
 *.db-journal
 fuzzwork_prices_*.csv
 fuzzwork_prices_*.json

@@ -1767,6 +1767,7 @@ for one search may still appear in searches with different parameters.
             self.on_offer_tree.delete(item)
         
         if not Path(DATABASE_FILE).exists():
+            messagebox.showinfo("Refresh", "Database not found. Nothing to refresh.")
             return
         
         conn = sqlite3.connect(DATABASE_FILE)
@@ -1781,6 +1782,7 @@ for one search may still appear in searches with different parameters.
             results = cursor.fetchall()
             
             if not results:
+                messagebox.showinfo("Refresh", "On Offer list is empty. Nothing to refresh.")
                 return
             
             # Get default parameters from assumptions
@@ -1921,7 +1923,7 @@ for one search may still appear in searches with different parameters.
                         breakeven_immediate,
                         sold_per_day_str
                     ))
-                    
+                
                 except Exception as e:
                     # Insert with error message
                     self.on_offer_tree.insert('', tk.END, iid=str(module_type_id), values=(
@@ -1935,6 +1937,8 @@ for one search may still appear in searches with different parameters.
                         "Error",
                         sold_per_day_str
                     ))
+            
+            messagebox.showinfo("Refresh", f"Refresh complete. Calculations updated for {len(results)} item(s).")
                     
         finally:
             conn.close()
