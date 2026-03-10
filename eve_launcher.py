@@ -17,10 +17,23 @@ from calculate_reprocessing_value import (
     analyze_all_modules,
     format_reprocessing_result
 )
+from calculate_blueprint_profitability import calculate_blueprint_profitability
 from update_prices_db import update_prices, update_prices_by_type_ids
 from update_mineral_prices import update_mineral_prices
+from fetch_market_history import (
+    get_expected_buy_order_volume_7d_avg,
+    get_expected_buy_order_volume_30d_avg,
+    get_market_history_raw,
+    refresh_market_history_for_type,
+    get_type_ids_with_no_or_zero_volume,
+    run_fetch,
+)
 
 DATABASE_FILE = "eve_manufacturing.db"
+# Region ID for market_history_daily (The Forge); must match data fetched by fetch_market_history.py
+MARKET_HISTORY_REGION_ID = 10000002
+
+from regions_data import REGIONS_BY_NAME, DEFAULT_REGION_NAME, get_region_id_by_name
 
 
 class EVELauncher:
@@ -45,10 +58,16 @@ class EVELauncher:
         # Create tabs
         self.create_analysis_tab()
         self.create_single_module_tab()
+        self.create_single_blueprint_tab()
         self.create_price_update_tab()
         self.create_exclusions_tab()
         self.create_on_offer_tab()
         self.create_paste_compare_tab()
+        self.create_sso_sync_tab()
+        
+        # So analysis tab fields are editable immediately (focus first entry when that tab is shown)
+        self.root.after(150, self._focus_analysis_first_entry_if_visible)
+        self.notebook.bind("<<NotebookTabChanged>>", self._on_tab_changed)
         
         # Store last analysis results for exclusion
         self.last_analysis_results = None
@@ -122,6 +141,22 @@ class EVELauncher:
         finally:
             conn.close()
     
+    def _focus_analysis_first_entry_if_visible(self):
+        """Set focus to the first analysis parameter entry so fields are editable without clicking Run first."""
+        try:
+            if self.notebook.index(self.notebook.select()) == 0:
+                self.analysis_first_entry.focus_set()
+        except Exception:
+            pass
+    
+    def _on_tab_changed(self, event):
+        """When user switches to Top 30 Analysis tab, focus first entry so fields are editable."""
+        try:
+            if self.notebook.index(self.notebook.select()) == 0:
+                self.analysis_first_entry.focus_set()
+        except Exception:
+            pass
+    
     def create_analysis_tab(self):
         """Create the Top 30 Analysis tab"""
         frame = ttk.Frame(self.notebook)
@@ -137,7 +172,8 @@ class EVELauncher:
         
         ttk.Label(row1, text="Yield %:").pack(side=tk.LEFT, padx=5)
         self.yield_var = tk.StringVar(value="55.0")
-        ttk.Entry(row1, textvariable=self.yield_var, width=10).pack(side=tk.LEFT, padx=5)
+        self.analysis_first_entry = ttk.Entry(row1, textvariable=self.yield_var, width=10)
+        self.analysis_first_entry.pack(side=tk.LEFT, padx=5)
         
         ttk.Label(row1, text="Markup %:").pack(side=tk.LEFT, padx=5)
         self.markup_var = tk.StringVar(value="10.0")
@@ -209,16 +245,22 @@ class EVELauncher:
         # Row 6 - Sort option
         row6 = ttk.Frame(params_frame)
         row6.pack(fill=tk.X, pady=5)
+        ttk.Label(row6, text="Sort by:").pack(side=tk.LEFT, padx=(0, 5))
+        self.sort_by_var = tk.StringVar(value="return")
+        ttk.Radiobutton(row6, text="% return", variable=self.sort_by_var, value="return").pack(side=tk.LEFT, padx=5)
+        ttk.Radiobutton(row6, text="Profit (ISK)", variable=self.sort_by_var, value="profit").pack(side=tk.LEFT, padx=5)
+        ttk.Radiobutton(row6, text="Expected profit", variable=self.sort_by_var, value="expected_profit").pack(side=tk.LEFT, padx=5)
         
-        self.sort_by_profit_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(
-            row6,
-            text="Sort by profit (ISK) instead of % return",
-            variable=self.sort_by_profit_var
-        ).pack(side=tk.LEFT, padx=5)
+        # Row 7 - Min expected volume filter
+        row7 = ttk.Frame(params_frame)
+        row7.pack(fill=tk.X, pady=5)
+        ttk.Label(row7, text="Min expected volume:").pack(side=tk.LEFT, padx=5)
+        self.min_expected_volume_var = tk.StringVar(value="0")
+        ttk.Entry(row7, textvariable=self.min_expected_volume_var, width=10).pack(side=tk.LEFT, padx=5)
+        ttk.Label(row7, text="(0 = no filter; only items with expected vol ≥ this are shown)", font=('', 8)).pack(side=tk.LEFT, padx=5)
         
         # Run button
-        run_btn = ttk.Button(params_frame, text="Run Top 30 Analysis", command=self.run_analysis)
+        run_btn = ttk.Button(params_frame, text="Run Top N Analysis", command=self.run_analysis)
         run_btn.pack(pady=10)
         
         # Results frame with table (like On Offer tab)
@@ -230,18 +272,20 @@ class EVELauncher:
         hint_label.pack(anchor=tk.W, pady=(0, 5))
         
         # Treeview for results table
-        columns = ('Rank', 'Module Name', 'Buy Price', 'Sell Min', 'Profit/Item', 'Return %', 'Breakeven Max Buy')
+        columns = ('Rank', 'Module Name', 'Buy Price', 'Sell Min', 'Profit/Item', 'Return %', 'Breakeven Max Buy', 'Expected Vol', 'Expected Profit')
         self.analysis_tree = ttk.Treeview(results_frame, columns=columns, show='headings', height=20, selectmode='browse')
         
         for col in columns:
             self.analysis_tree.heading(col, text=col)
         self.analysis_tree.column('Rank', width=50, anchor=tk.E)
-        self.analysis_tree.column('Module Name', width=280, anchor=tk.W)
-        self.analysis_tree.column('Buy Price', width=100, anchor=tk.E)
-        self.analysis_tree.column('Sell Min', width=100, anchor=tk.E)
-        self.analysis_tree.column('Profit/Item', width=120, anchor=tk.E)
-        self.analysis_tree.column('Return %', width=90, anchor=tk.E)
-        self.analysis_tree.column('Breakeven Max Buy', width=130, anchor=tk.E)
+        self.analysis_tree.column('Module Name', width=260, anchor=tk.W)
+        self.analysis_tree.column('Buy Price', width=90, anchor=tk.E)
+        self.analysis_tree.column('Sell Min', width=90, anchor=tk.E)
+        self.analysis_tree.column('Profit/Item', width=100, anchor=tk.E)
+        self.analysis_tree.column('Return %', width=80, anchor=tk.E)
+        self.analysis_tree.column('Breakeven Max Buy', width=120, anchor=tk.E)
+        self.analysis_tree.column('Expected Vol', width=90, anchor=tk.E)
+        self.analysis_tree.column('Expected Profit', width=110, anchor=tk.E)
         
         # Tag for rows that are on offer (highlight in blue)
         self.analysis_tree.tag_configure('on_offer', foreground='blue')
@@ -312,6 +356,9 @@ class EVELauncher:
         calc_btn = ttk.Button(buttons_frame, text="Calculate Reprocessing Value", command=self.calculate_single_module)
         calc_btn.pack(side=tk.LEFT, padx=5)
         
+        ttk.Button(buttons_frame, text="Expected volume", command=self.show_single_expected_volume).pack(side=tk.LEFT, padx=5)
+        ttk.Button(buttons_frame, text="Raw market data", command=self.show_single_raw_market_data).pack(side=tk.LEFT, padx=5)
+        
         self.edit_quantities_btn = ttk.Button(buttons_frame, text="Edit Quantities", command=self.edit_quantities, state=tk.DISABLED)
         self.edit_quantities_btn.pack(side=tk.LEFT, padx=5)
         
@@ -324,6 +371,184 @@ class EVELauncher:
         
         self.single_module_results = scrolledtext.ScrolledText(results_frame, wrap=tk.WORD, height=25)
         self.single_module_results.pack(fill=tk.BOTH, expand=True)
+    
+    def create_single_blueprint_tab(self):
+        """Create the Single Blueprint tab: profitability of manufacturing one blueprint run."""
+        frame = ttk.Frame(self.notebook)
+        self.notebook.add(frame, text="Single Blueprint")
+        
+        input_frame = ttk.LabelFrame(frame, text="Blueprint / Product", padding=10)
+        input_frame.pack(fill=tk.X, padx=10, pady=10)
+        
+        name_row = ttk.Frame(input_frame)
+        name_row.pack(fill=tk.X, pady=5)
+        ttk.Label(name_row, text="Blueprint or product name:").pack(side=tk.LEFT, padx=5)
+        self.blueprint_name_var = tk.StringVar()
+        ttk.Entry(name_row, textvariable=self.blueprint_name_var, width=50).pack(side=tk.LEFT, padx=5, fill=tk.X, expand=True)
+        
+        params_row = ttk.Frame(input_frame)
+        params_row.pack(fill=tk.X, pady=5)
+        ttk.Label(params_row, text="Input price (materials):").pack(side=tk.LEFT, padx=5)
+        self.blueprint_input_price_var = tk.StringVar(value="buy_immediate")
+        ttk.Combobox(params_row, textvariable=self.blueprint_input_price_var,
+                     values=["buy_immediate", "buy_offer"], state="readonly", width=14).pack(side=tk.LEFT, padx=5)
+        ttk.Label(params_row, text="Output price (product):").pack(side=tk.LEFT, padx=5)
+        self.blueprint_output_price_var = tk.StringVar(value="sell_immediate")
+        ttk.Combobox(params_row, textvariable=self.blueprint_output_price_var,
+                     values=["sell_immediate", "sell_offer"], state="readonly", width=14).pack(side=tk.LEFT, padx=5)
+        ttk.Label(params_row, text="System cost %:").pack(side=tk.LEFT, padx=5)
+        self.blueprint_system_cost_var = tk.StringVar(value="8.61")
+        ttk.Entry(params_row, textvariable=self.blueprint_system_cost_var, width=8).pack(side=tk.LEFT, padx=5)
+        
+        region_row = ttk.Frame(input_frame)
+        region_row.pack(fill=tk.X, pady=5)
+        ttk.Label(region_row, text="Region (for manufacturing tax):").pack(side=tk.LEFT, padx=5)
+        self.blueprint_region_var = tk.StringVar(value=DEFAULT_REGION_NAME)
+        region_names = [name for _, name in REGIONS_BY_NAME]
+        region_cb = ttk.Combobox(region_row, textvariable=self.blueprint_region_var, values=region_names, state="readonly", width=28)
+        region_cb.pack(side=tk.LEFT, padx=5)
+        
+        me_runs_row = ttk.Frame(input_frame)
+        me_runs_row.pack(fill=tk.X, pady=5)
+        ttk.Label(me_runs_row, text="Material efficiency:").pack(side=tk.LEFT, padx=5)
+        self.blueprint_me_var = tk.StringVar(value="0")
+        ttk.Entry(me_runs_row, textvariable=self.blueprint_me_var, width=6).pack(side=tk.LEFT, padx=2)
+        ttk.Label(me_runs_row, text="%").pack(side=tk.LEFT, padx=0)
+        ttk.Label(me_runs_row, text="Number of runs:").pack(side=tk.LEFT, padx=5)
+        self.blueprint_runs_var = tk.StringVar(value="1")
+        ttk.Entry(me_runs_row, textvariable=self.blueprint_runs_var, width=8).pack(side=tk.LEFT, padx=5)
+        
+        btn_row = ttk.Frame(input_frame)
+        btn_row.pack(pady=10)
+        ttk.Button(btn_row, text="Calculate profitability", command=self.calculate_single_blueprint).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_row, text="Fetch blueprint data (SDE)", command=self.fetch_blueprint_data).pack(side=tk.LEFT, padx=5)
+        
+        results_frame = ttk.LabelFrame(frame, text="Results", padding=10)
+        results_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        self.single_blueprint_results = scrolledtext.ScrolledText(results_frame, wrap=tk.WORD, height=28)
+        self.single_blueprint_results_default_bg = self.single_blueprint_results.cget("bg")
+        self.single_blueprint_results.tag_configure("profit_positive", foreground="green")
+        self.single_blueprint_results.tag_configure("profit_negative", foreground="red")
+        self.single_blueprint_results.pack(fill=tk.BOTH, expand=True)
+    
+    def calculate_single_blueprint(self):
+        """Run blueprint profitability calculation and show results."""
+        name = self.blueprint_name_var.get().strip()
+        if not name:
+            messagebox.showwarning("Warning", "Enter a blueprint or product name.")
+            return
+        self.single_blueprint_results.delete(1.0, tk.END)
+        self.single_blueprint_results.insert(tk.END, "Calculating...\n")
+        self.single_blueprint_results.configure(bg=self.single_blueprint_results_default_bg)
+        self.root.update()
+        
+        def run():
+            try:
+                system_pct = self.get_float(self.blueprint_system_cost_var, 8.61)
+                if system_pct < 0:
+                    system_pct = 0.0
+                me_pct = self.get_float(self.blueprint_me_var, 0.0)
+                # Pass % directly: calculator uses me_fraction = material_efficiency/100 (10% → 10)
+                material_efficiency = max(0.0, min(10.0, me_pct))
+                runs = self.get_float(self.blueprint_runs_var, 1.0)
+                runs = max(1, int(runs))
+                region_id = get_region_id_by_name(self.blueprint_region_var.get())
+                result = calculate_blueprint_profitability(
+                    blueprint_name_or_product=name,
+                    input_price_type=self.blueprint_input_price_var.get(),
+                    output_price_type=self.blueprint_output_price_var.get(),
+                    system_cost_percent=system_pct,
+                    material_efficiency=material_efficiency,
+                    number_of_runs=runs,
+                    region_id=region_id,
+                    db_file=DATABASE_FILE,
+                )
+                def append(text, tag=None):
+                    start = self.single_blueprint_results.index(tk.END)
+                    self.single_blueprint_results.insert(tk.END, text)
+                    if tag:
+                        self.single_blueprint_results.tag_add(tag, start, self.single_blueprint_results.index(tk.END))
+
+                self.single_blueprint_results.delete(1.0, tk.END)
+                if "error" in result:
+                    self.single_blueprint_results.configure(bg=self.single_blueprint_results_default_bg)
+                    append(result["error"] + "\n")
+                else:
+                    me_pct = result['material_efficiency']  # calculator stores 0–10 as percent
+                    append(f"Blueprint / Product: {result['productName']}\n")
+                    append(f"Output: {result['output_total_quantity']:,} × {result['productName']}  ({result['number_of_runs']} run(s), ME {me_pct:.0f}%)\n\n")
+                    append("Input materials (total for all runs; per run in parentheses):\n")
+                    for m in result["input_materials"]:
+                        pr = m['quantity_per_run']
+                        pr_fmt = f"{pr:,.2f}" if pr != int(pr) else f"{int(pr):,}"
+                        append(f"  {m['materialName']}: {m['quantity']:,} total ({pr_fmt} per run) × {m['unit_price']:,.2f} = {m['total_cost']:,.2f} ISK\n")
+                    if result.get("materials_priced_at_zero"):
+                        append("Warning: the following materials were priced at 0 (missing or zero price data): " + ", ".join(result["materials_priced_at_zero"]) + "\n\n")
+                    append("\n")
+                    append("——— For all runs ———\n")
+                    append(f"Total input cost:     {result['total_input_cost']:,.2f} ISK\n")
+                    append(f"System cost ({result['system_cost_percent']}%): {result['system_cost']:,.2f} ISK\n")
+                    append(f"Manufacturing tax ({result.get('manufacturing_tax_rate', 0):.1f}%): {result.get('manufacturing_tax', 0):,.2f} ISK\n")
+                    if result.get("tax_details"):
+                        for t in result["tax_details"]:
+                            append(f"  Tax {t['materialName']}: avg {t['average']:,.2f} × {t['quantity']:,} × {result.get('manufacturing_tax_rate', 0):.1f}% = {t['tax']:,.2f} ISK (per run)\n")
+                    append(f"Output revenue:       {result['output_revenue']:,.2f} ISK  ({result['output_total_quantity']:,} × {result['output_unit_price']:,.2f})\n")
+                    profit_tag = "profit_positive" if result['profit'] >= 0 else "profit_negative"
+                    append(f"Profit:               {result['profit']:,.2f} ISK\n", profit_tag)
+                    append(f"Return:               {result['return_percent']:,.2f}%\n\n")
+                    append("——— Per item ———\n")
+                    append(f"Items produced:       {result['items_produced']:,}\n")
+                    append(f"Cost per item:        {result['cost_per_item']:,.2f} ISK\n")
+                    append(f"Revenue per item:     {result['revenue_per_item']:,.2f} ISK\n")
+                    profit_per_item_tag = "profit_positive" if result['profit_per_item'] >= 0 else "profit_negative"
+                    append(f"Profit per item:      {result['profit_per_item']:,.2f} ISK\n", profit_per_item_tag)
+                    # Color results area: green if profit >= 0, red if loss
+                    if result["profit"] >= 0:
+                        self.single_blueprint_results.configure(bg="#dcf8dc")  # light green
+                    else:
+                        self.single_blueprint_results.configure(bg="#ffd4d4")  # light red
+                self.status_var.set("Blueprint calculation complete.")
+            except Exception as e:
+                self.single_blueprint_results.delete(1.0, tk.END)
+                self.single_blueprint_results.insert(tk.END, f"Error: {str(e)}\n")
+                self.single_blueprint_results.configure(bg=self.single_blueprint_results_default_bg)
+                self.status_var.set("Error occurred")
+        threading.Thread(target=run, daemon=True).start()
+    
+    def fetch_blueprint_data(self):
+        """Run build_database to fetch SDE and populate blueprints (full DB rebuild)."""
+        if not messagebox.askyesno("Fetch blueprint data", "This will run build_database.py: download SDE and rebuild blueprints (and other tables). Continue?"):
+            return
+        self.status_var.set("Fetching blueprint data (build_database)...")
+        self.single_blueprint_results.delete(1.0, tk.END)
+        self.single_blueprint_results.insert(tk.END, "Running build_database.py... This may take several minutes.\n\n")
+        self.single_blueprint_results.configure(bg=self.single_blueprint_results_default_bg)
+        self.root.update()
+        
+        def run():
+            try:
+                import logging
+                from io import StringIO
+                log_capture = StringIO()
+                handler = logging.StreamHandler(log_capture)
+                handler.setLevel(logging.INFO)
+                root_logger = logging.getLogger()
+                root_logger.addHandler(handler)
+                try:
+                    import build_database
+                    build_database.main()
+                except Exception as e:
+                    self.single_blueprint_results.insert(tk.END, f"\nError: {str(e)}\n")
+                finally:
+                    root_logger.removeHandler(handler)
+                output = log_capture.getvalue()
+                self.single_blueprint_results.insert(tk.END, output)
+                self.single_blueprint_results.insert(tk.END, "\nDone. You can now run 'Calculate profitability' or update prices.")
+                self.status_var.set("Blueprint data fetch complete.")
+            except Exception as e:
+                self.single_blueprint_results.insert(tk.END, f"\nError: {str(e)}\n")
+                self.status_var.set("Error occurred")
+        threading.Thread(target=run, daemon=True).start()
     
     def create_price_update_tab(self):
         """Create the Price Update tab"""
@@ -378,6 +603,14 @@ Price Update Options:
         update_consensus_btn = ttk.Button(buttons_frame2, text="Update Group Consensus Items Only",
                                          command=self.update_group_consensus_prices, width=30)
         update_consensus_btn.pack(side=tk.LEFT, padx=10, expand=True)
+        
+        # Third row - Market history (volume) fetch
+        buttons_frame3 = ttk.Frame(frame)
+        buttons_frame3.pack(fill=tk.X, padx=10, pady=10)
+        ttk.Button(buttons_frame3, text="Fetch market history (same set as Update All Prices)",
+                   command=self.run_fetch_market_history_prices, width=42).pack(side=tk.LEFT, padx=10, expand=True)
+        ttk.Button(buttons_frame3, text="Refresh volume for items with no/zero data",
+                  command=self.refresh_volume_no_or_zero_data, width=35).pack(side=tk.LEFT, padx=10, expand=True)
         
         # Log frame
         log_frame = ttk.LabelFrame(frame, text="Update Log", padding=10)
@@ -509,6 +742,9 @@ for one search may still appear in searches with different parameters.
         self.on_offer_tree.column('Breakeven Max (Immediate)', width=170, anchor=tk.E)
         self.on_offer_tree.column('Sold Per Day', width=90, anchor=tk.E)
         
+        # Tag for rows where buy price >= 85% of breakeven max (light red background)
+        self.on_offer_tree.tag_configure('high_buy_near_breakeven', background='#ffcccc')
+        
         # Scrollbar
         scrollbar = ttk.Scrollbar(table_frame, orient=tk.VERTICAL, command=self.on_offer_tree.yview)
         self.on_offer_tree.configure(yscrollcommand=scrollbar.set)
@@ -542,10 +778,24 @@ for one search may still appear in searches with different parameters.
         info_frame.pack(fill=tk.X, padx=10, pady=10)
         info_text = (
             "Paste in-game window content: one line per item, 'Name<Tab>Quantity' (quantity optional, default 1). "
-            "For reprocessable items: if item value ≥ threshold we compare reprocess output to lowest sell; "
-            "if below threshold we compare to lowest buy order. Recommendation: Reprocess or Sell."
+            "For reprocessable items: if item value ≥ threshold we compare to lowest sell; else to lowest buy. "
+            "Recommend Sell only when (sell value − reprocess value) × Qty ≥ 'Min ISK above reprocess to recommend Sell'. "
+            "For manufacturing: paste one blueprint or product name per line; system will compute profit for 1/10/100 runs at 0% and 10% ME."
         )
         ttk.Label(info_frame, text=info_text, justify=tk.LEFT, wraplength=900).pack(anchor=tk.W)
+        
+        # Mode: Reprocessing vs Manufacturing
+        mode_frame = ttk.Frame(frame)
+        mode_frame.pack(fill=tk.X, padx=10, pady=5)
+        ttk.Label(mode_frame, text="Mode:").pack(side=tk.LEFT, padx=5)
+        self.paste_compare_mode_var = tk.StringVar(value="reprocessing")
+        ttk.Radiobutton(mode_frame, text="Reprocessing", variable=self.paste_compare_mode_var, value="reprocessing", command=self._paste_compare_switch_mode).pack(side=tk.LEFT, padx=5)
+        ttk.Radiobutton(mode_frame, text="Manufacturing (blueprints)", variable=self.paste_compare_mode_var, value="manufacturing", command=self._paste_compare_switch_mode).pack(side=tk.LEFT, padx=5)
+        self.paste_compare_mfg_params_frame = ttk.Frame(mode_frame)
+        self.paste_compare_mfg_params_frame.pack(side=tk.LEFT, padx=15)
+        ttk.Label(self.paste_compare_mfg_params_frame, text="System cost %:").pack(side=tk.LEFT, padx=5)
+        self.paste_compare_system_cost_var = tk.StringVar(value="8.61")
+        ttk.Entry(self.paste_compare_mfg_params_frame, textvariable=self.paste_compare_system_cost_var, width=8).pack(side=tk.LEFT, padx=2)
         
         # Paste area
         paste_frame = ttk.LabelFrame(frame, text="Paste content (Name<Tab>Quantity)", padding=10)
@@ -555,25 +805,31 @@ for one search may still appear in searches with different parameters.
         clear_paste_btn = ttk.Button(paste_frame, text="Clear paste content", command=self.clear_paste_compare_text)
         clear_paste_btn.pack(pady=(5, 0))
         
-        # Parameters
+        # Parameters (repro-only and shared)
         params_frame = ttk.Frame(frame)
         params_frame.pack(fill=tk.X, padx=10, pady=5)
-        ttk.Label(params_frame, text="Threshold (ISK):").pack(side=tk.LEFT, padx=5)
+        self.paste_compare_repro_params_frame = ttk.Frame(params_frame)
+        self.paste_compare_repro_params_frame.pack(side=tk.LEFT)
+        ttk.Label(self.paste_compare_repro_params_frame, text="Threshold (ISK):").pack(side=tk.LEFT, padx=5)
         self.paste_threshold_var = tk.StringVar(value="100000")
-        ttk.Entry(params_frame, textvariable=self.paste_threshold_var, width=12).pack(side=tk.LEFT, padx=5)
-        ttk.Label(params_frame, text="Yield %:").pack(side=tk.LEFT, padx=5)
+        ttk.Entry(self.paste_compare_repro_params_frame, textvariable=self.paste_threshold_var, width=12).pack(side=tk.LEFT, padx=5)
+        ttk.Label(self.paste_compare_repro_params_frame, text="Min ISK above reprocess to recommend Sell:").pack(side=tk.LEFT, padx=5)
+        self.paste_sell_buffer_var = tk.StringVar(value="0")
+        ttk.Entry(self.paste_compare_repro_params_frame, textvariable=self.paste_sell_buffer_var, width=12).pack(side=tk.LEFT, padx=5)
+        ttk.Label(self.paste_compare_repro_params_frame, text="Yield %:").pack(side=tk.LEFT, padx=5)
         self.paste_yield_var = tk.StringVar(value="55.0")
-        ttk.Entry(params_frame, textvariable=self.paste_yield_var, width=8).pack(side=tk.LEFT, padx=5)
-        ttk.Label(params_frame, text="Reprocessing cost %:").pack(side=tk.LEFT, padx=5)
+        ttk.Entry(self.paste_compare_repro_params_frame, textvariable=self.paste_yield_var, width=8).pack(side=tk.LEFT, padx=5)
+        ttk.Label(self.paste_compare_repro_params_frame, text="Reprocessing cost %:").pack(side=tk.LEFT, padx=5)
         self.paste_repro_cost_var = tk.StringVar(value="3.37")
-        ttk.Entry(params_frame, textvariable=self.paste_repro_cost_var, width=8).pack(side=tk.LEFT, padx=5)
+        ttk.Entry(self.paste_compare_repro_params_frame, textvariable=self.paste_repro_cost_var, width=8).pack(side=tk.LEFT, padx=5)
         
         compare_btn = ttk.Button(params_frame, text="Compare", command=self.run_paste_compare)
         compare_btn.pack(side=tk.LEFT, padx=15)
         
-        # Results table
+        # Results table (two trees: reprocessing and manufacturing)
         results_frame = ttk.LabelFrame(frame, text="Results", padding=10)
         results_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        # Reprocessing tree
         self.paste_compare_columns = ('Item Name', 'Qty', 'Sell Min', 'Buy Max', 'Reprocess Value/Item', 'Recommendation')
         self.paste_compare_tree = ttk.Treeview(results_frame, columns=self.paste_compare_columns, show='headings', height=20, selectmode='browse')
         self.paste_compare_sort_column = None
@@ -586,10 +842,42 @@ for one search may still appear in searches with different parameters.
         self.paste_compare_tree.column('Buy Max', width=100, anchor=tk.E)
         self.paste_compare_tree.column('Reprocess Value/Item', width=140, anchor=tk.E)
         self.paste_compare_tree.column('Recommendation', width=120, anchor=tk.W)
-        scrollbar = ttk.Scrollbar(results_frame, orient=tk.VERTICAL, command=self.paste_compare_tree.yview)
-        self.paste_compare_tree.configure(yscrollcommand=scrollbar.set)
+        self.paste_compare_scrollbar_repro = ttk.Scrollbar(results_frame, orient=tk.VERTICAL, command=self.paste_compare_tree.yview)
+        self.paste_compare_tree.configure(yscrollcommand=self.paste_compare_scrollbar_repro.set)
         self.paste_compare_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        self.paste_compare_scrollbar_repro.pack(side=tk.RIGHT, fill=tk.Y)
+        # Manufacturing tree (same frame, shown when mode=manufacturing)
+        self.paste_compare_columns_mfg = ('Blueprint', 'Profit 1r ME0', 'Profit 1r ME10', 'Profit 10r ME0', 'Profit 10r ME10', 'Profit 100r ME0', 'Profit 100r ME10')
+        self.paste_compare_tree_mfg = ttk.Treeview(results_frame, columns=self.paste_compare_columns_mfg, show='headings', height=20, selectmode='browse')
+        for col in self.paste_compare_columns_mfg:
+            self.paste_compare_tree_mfg.heading(col, text=col)
+        self.paste_compare_tree_mfg.column('Blueprint', width=280, anchor=tk.W)
+        for c in self.paste_compare_columns_mfg[1:]:
+            self.paste_compare_tree_mfg.column(c, width=100, anchor=tk.E)
+        self.paste_compare_scrollbar_mfg = ttk.Scrollbar(results_frame, orient=tk.VERTICAL, command=self.paste_compare_tree_mfg.yview)
+        self.paste_compare_tree_mfg.configure(yscrollcommand=self.paste_compare_scrollbar_mfg.set)
+        # Initially hide mfg tree (repro is visible)
+        self.paste_compare_tree_mfg.pack_forget()
+        self.paste_compare_scrollbar_mfg.pack_forget()
+        # Sync visibility with mode (hide mfg params initially since default is reprocessing)
+        self._paste_compare_switch_mode()
+    
+    def _paste_compare_switch_mode(self):
+        """Show/hide params and result tree based on Reprocessing vs Manufacturing mode."""
+        if self.paste_compare_mode_var.get() == "manufacturing":
+            self.paste_compare_mfg_params_frame.pack(side=tk.LEFT, padx=15)
+            self.paste_compare_repro_params_frame.pack_forget()
+            self.paste_compare_tree.pack_forget()
+            self.paste_compare_scrollbar_repro.pack_forget()
+            self.paste_compare_tree_mfg.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+            self.paste_compare_scrollbar_mfg.pack(side=tk.RIGHT, fill=tk.Y)
+        else:
+            self.paste_compare_mfg_params_frame.pack_forget()
+            self.paste_compare_repro_params_frame.pack(side=tk.LEFT)
+            self.paste_compare_tree_mfg.pack_forget()
+            self.paste_compare_scrollbar_mfg.pack_forget()
+            self.paste_compare_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+            self.paste_compare_scrollbar_repro.pack(side=tk.RIGHT, fill=tk.Y)
     
     def _paste_compare_sort_key(self, values, col_index):
         """Return a sort key for a row (tuple of values) for the given column index."""
@@ -644,22 +932,42 @@ for one search may still appear in searches with different parameters.
             tree.move(item_id, "", index)
     
     def run_paste_compare(self):
-        """Parse pasted lines, look up items, compare reprocess value vs sell/buy; run in background thread."""
+        """Parse pasted lines; Reprocessing: compare reprocess vs sell; Manufacturing: profit for 1/10/100 runs at ME 0 and 10%."""
         text = self.paste_compare_text.get(1.0, tk.END)
         lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
         if not lines:
-            messagebox.showinfo("Paste & Compare", "Paste some lines (Name<Tab>Quantity) first.")
+            messagebox.showinfo("Paste & Compare", "Paste some lines (Name<Tab>Quantity or blueprint names) first.")
             return
         
-        self.status_var.set("Comparing items...")
-        for item in self.paste_compare_tree.get_children():
-            self.paste_compare_tree.delete(item)
-        self.paste_compare_tree.insert('', tk.END, values=("", "Comparing...", "", "", "", ""))
+        is_mfg = self.paste_compare_mode_var.get() == "manufacturing"
+        if is_mfg:
+            self.status_var.set("Calculating manufacturing profit...")
+            for item in self.paste_compare_tree_mfg.get_children():
+                self.paste_compare_tree_mfg.delete(item)
+            self.paste_compare_tree_mfg.insert('', tk.END, values=("", "Calculating...", "", "", "", "", ""))
+        else:
+            self.status_var.set("Comparing items...")
+            for item in self.paste_compare_tree.get_children():
+                self.paste_compare_tree.delete(item)
+            self.paste_compare_tree.insert('', tk.END, values=("", "Comparing...", "", "", "", ""))
         self.root.update()
         
         def do_compare():
             try:
+                if self.paste_compare_mode_var.get() == "manufacturing":
+                    try:
+                        self._run_paste_compare_manufacturing(lines)
+                    except Exception as e:
+                        for item in self.paste_compare_tree_mfg.get_children():
+                            self.paste_compare_tree_mfg.delete(item)
+                        self.paste_compare_tree_mfg.insert('', tk.END, values=("", f"Error: {str(e)}", "", "", "", "", ""))
+                        self.status_var.set("Error occurred")
+                        messagebox.showerror("Error", f"An error occurred:\n{str(e)}")
+                    return
                 threshold = self.get_float(self.paste_threshold_var, 100000.0)
+                sell_buffer_isk = self.get_float(self.paste_sell_buffer_var, 0.0)
+                if sell_buffer_isk < 0:
+                    sell_buffer_isk = 0.0
                 yield_pct = self.get_float(self.paste_yield_var, 55.0)
                 repro_cost_pct = self.get_float(self.paste_repro_cost_var, 3.37)
                 
@@ -713,14 +1021,20 @@ for one search may still appear in searches with different parameters.
                     else:
                         reprocess_value_per_item = 0.0
                     
+                    # Sell value for comparison: sell_min if above threshold, else buy_max
                     if sell_min >= threshold:
                         compare_price = sell_min
                     else:
                         compare_price = buy_max
                     
+                    # (sell value - reprocess value) * Qty = total ISK advantage of selling; only recommend Sell if >= sell_buffer_isk
+                    advantage_isk = (compare_price - reprocess_value_per_item) * qty if compare_price > 0 else 0.0
+                    
                     if compare_price <= 0:
                         rec = "N/A (no price)"
                     elif reprocess_value_per_item > compare_price:
+                        rec = "Reprocess"
+                    elif advantage_isk < sell_buffer_isk:
                         rec = "Reprocess"
                     else:
                         rec = "Sell"
@@ -745,9 +1059,152 @@ for one search may still appear in searches with different parameters.
         thread = threading.Thread(target=do_compare, daemon=True)
         thread.start()
     
+    def _run_paste_compare_manufacturing(self, lines):
+        """Run manufacturing profitability for each pasted blueprint; 1/10/100 runs at ME 0 and 10%. Runs in caller's thread (do_compare)."""
+        system_cost_pct = self.get_float(self.paste_compare_system_cost_var, 8.61)
+        if system_cost_pct < 0:
+            system_cost_pct = 0.0
+        region_id = MARKET_HISTORY_REGION_ID
+        scenarios = [(1, 0), (1, 10), (10, 0), (10, 10), (100, 0), (100, 10)]  # (runs, me_percent)
+        rows = []
+        for line in lines:
+            name = line.split('\t')[0].strip() if line else ""
+            if not name:
+                continue
+            profits = []
+            for runs, me in scenarios:
+                result = calculate_blueprint_profitability(
+                    blueprint_name_or_product=name,
+                    input_price_type="buy_immediate",
+                    output_price_type="sell_immediate",
+                    system_cost_percent=system_cost_pct,
+                    material_efficiency=me,
+                    number_of_runs=runs,
+                    region_id=region_id,
+                    db_file=DATABASE_FILE,
+                )
+                if "error" in result:
+                    profits.append("N/A")
+                else:
+                    profits.append(f"{result['profit']:,.0f}")
+            rows.append((name,) + tuple(profits))
+        for item in self.paste_compare_tree_mfg.get_children():
+            self.paste_compare_tree_mfg.delete(item)
+        for r in rows:
+            self.paste_compare_tree_mfg.insert('', tk.END, values=r)
+        self.status_var.set("Manufacturing compare complete.")
+    
     def clear_paste_compare_text(self):
         """Clear the paste content text area so you can paste new content."""
         self.paste_compare_text.delete(1.0, tk.END)
+    
+    def create_sso_sync_tab(self):
+        """EVE SSO sync tab: login and sync wallet transactions, journal, industry jobs for profitability tracking."""
+        import os
+        frame = ttk.Frame(self.notebook)
+        self.notebook.add(frame, text="EVE SSO Sync")
+        info = ttk.LabelFrame(frame, text="Instructions", padding=10)
+        info.pack(fill=tk.X, padx=10, pady=10)
+        ttk.Label(
+            info,
+            text="Create an SSO application at https://developers.eveonline.com/ with callback URL: http://localhost:8765/callback/\n"
+                 "Request scopes: esi-wallet.read_character_wallet.v1 and esi-industry.read_character_jobs.v1",
+            justify=tk.LEFT, wraplength=900
+        ).pack(anchor=tk.W)
+        creds = ttk.LabelFrame(frame, text="SSO credentials", padding=10)
+        creds.pack(fill=tk.X, padx=10, pady=5)
+        ttk.Label(creds, text="Client ID:").pack(side=tk.LEFT, padx=5)
+        self.sso_client_id_var = tk.StringVar(value=os.environ.get("EVE_SSO_CLIENT_ID", ""))
+        ttk.Entry(creds, textvariable=self.sso_client_id_var, width=24).pack(side=tk.LEFT, padx=5)
+        ttk.Label(creds, text="Client Secret:").pack(side=tk.LEFT, padx=5)
+        self.sso_client_secret_var = tk.StringVar(value=os.environ.get("EVE_SSO_CLIENT_SECRET", ""))
+        ttk.Entry(creds, textvariable=self.sso_client_secret_var, width=32, show="*").pack(side=tk.LEFT, padx=5)
+        btn_row = ttk.Frame(frame)
+        btn_row.pack(fill=tk.X, padx=10, pady=5)
+        ttk.Button(btn_row, text="Login with EVE SSO", command=self.sso_login).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_row, text="Sync wallet & industry jobs", command=self.sso_sync).pack(side=tk.LEFT, padx=5)
+        self.sso_status_var = tk.StringVar(value="Not logged in.")
+        ttk.Label(frame, textvariable=self.sso_status_var).pack(anchor=tk.W, padx=10, pady=2)
+        log_frame = ttk.LabelFrame(frame, text="Log", padding=10)
+        log_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        self.sso_log_text = scrolledtext.ScrolledText(log_frame, wrap=tk.WORD, height=12, width=80)
+        self.sso_log_text.pack(fill=tk.BOTH, expand=True)
+    
+    def _sso_log(self, msg: str):
+        self.sso_log_text.insert(tk.END, msg + "\n")
+        self.sso_log_text.see(tk.END)
+        self.root.update_idletasks()
+    
+    def sso_login(self):
+        """Run EVE SSO login flow (open browser, callback server, store tokens)."""
+        from eve_sso_sync import login_flow
+        cid = self.sso_client_id_var.get().strip()
+        secret = self.sso_client_secret_var.get().strip()
+        if not cid or not secret:
+            messagebox.showwarning("SSO", "Enter Client ID and Client Secret (or set EVE_SSO_CLIENT_ID and EVE_SSO_CLIENT_SECRET).")
+            return
+        self.sso_status_var.set("Opening browser for EVE login...")
+        self._sso_log("Starting SSO login...")
+        def run():
+            try:
+                result = login_flow(cid, secret, DATABASE_FILE)
+                if "error" in result:
+                    self.sso_status_var.set("Login failed.")
+                    self._sso_log("Error: " + result["error"])
+                    messagebox.showerror("SSO Login", result["error"])
+                else:
+                    name = result.get("character_name") or f"Character {result.get('character_id')}"
+                    self.sso_status_var.set(f"Logged in: {name}")
+                    self._sso_log(f"Logged in: {name} (character_id={result.get('character_id')})")
+            except Exception as e:
+                self.sso_status_var.set("Login failed.")
+                self._sso_log("Error: " + str(e))
+                messagebox.showerror("SSO Login", str(e))
+        threading.Thread(target=run, daemon=True).start()
+    
+    def sso_sync(self):
+        """Sync wallet transactions, journal, and industry jobs for the stored character."""
+        from eve_sso_sync import run_full_sync, ensure_sso_tables
+        cid = self.sso_client_id_var.get().strip()
+        secret = self.sso_client_secret_var.get().strip()
+        if not cid or not secret:
+            messagebox.showwarning("SSO", "Enter Client ID and Client Secret first.")
+            return
+        if not Path(DATABASE_FILE).exists():
+            messagebox.showwarning("SSO", "Database not found. Create it first (e.g. build_database).")
+            return
+        self.sso_status_var.set("Syncing...")
+        self._sso_log("Starting sync...")
+        def run():
+            try:
+                conn = sqlite3.connect(DATABASE_FILE)
+                try:
+                    ensure_sso_tables(conn)
+                    row = conn.execute("SELECT character_id FROM sso_character LIMIT 1").fetchone()
+                    if not row:
+                        self.sso_status_var.set("Not logged in.")
+                        self._sso_log("No character found. Log in with EVE SSO first.")
+                        return
+                    character_id = row[0]
+                    result = run_full_sync(conn, character_id, cid, secret)
+                    conn.close()
+                except Exception:
+                    conn.close()
+                    raise
+                if "error" in result and result.get("tx", 0) == 0 and result.get("journal", 0) == 0 and result.get("jobs", 0) == 0:
+                    self.sso_status_var.set("Sync failed.")
+                    self._sso_log("Error: " + result["error"])
+                    messagebox.showerror("SSO Sync", result["error"])
+                else:
+                    self.sso_status_var.set("Sync complete.")
+                    self._sso_log(f"Synced: {result.get('tx', 0)} transactions, {result.get('journal', 0)} journal entries, {result.get('jobs', 0)} industry jobs.")
+                    if result.get("error"):
+                        self._sso_log("Note: " + result["error"])
+            except Exception as e:
+                self.sso_status_var.set("Sync failed.")
+                self._sso_log("Error: " + str(e))
+                messagebox.showerror("SSO Sync", str(e))
+        threading.Thread(target=run, daemon=True).start()
     
     def refresh_exclusions_list(self):
         """Refresh the excluded modules list"""
@@ -872,7 +1329,7 @@ for one search may still appear in searches with different parameters.
         # Clear results table
         for item in self.analysis_tree.get_children():
             self.analysis_tree.delete(item)
-        self.analysis_tree.insert('', tk.END, values=("", "Updating mineral prices first, then running analysis...", "", "", "", "", ""))
+        self.analysis_tree.insert('', tk.END, values=("", "Updating mineral prices first, then running analysis...", "", "", "", "", "", "", ""))
         self.root.update()
         
         def analyze():
@@ -881,13 +1338,13 @@ for one search may still appear in searches with different parameters.
                 self.status_var.set("Updating mineral prices...")
                 children = list(self.analysis_tree.get_children())
                 if children:
-                    self.analysis_tree.item(children[0], values=("", "Updating mineral prices...", "", "", "", "", ""))
+                    self.analysis_tree.item(children[0], values=("", "Updating mineral prices...", "", "", "", "", "", "", ""))
                 update_mineral_prices()
                 
                 self.status_var.set("Running analysis...")
                 for item in self.analysis_tree.get_children():
                     self.analysis_tree.delete(item)
-                self.analysis_tree.insert('', tk.END, values=("", "Running analysis... This may take several minutes.", "", "", "", "", ""))
+                self.analysis_tree.insert('', tk.END, values=("", "Running analysis... This may take several minutes.", "", "", "", "", "", "", ""))
                 
                 yield_percent = self.get_float(self.yield_var, 55.0)
                 markup_percent = self.get_float(self.markup_var, 10.0)
@@ -895,9 +1352,13 @@ for one search may still appear in searches with different parameters.
                 min_price = self.get_float(self.min_price_var, 1.0)
                 max_price = self.get_float(self.max_price_var, 1000000.0)
                 top_n = self.get_int(self.top_n_var, 30)
+                min_expected_volume = self.get_float(self.min_expected_volume_var, 0.0)
+                if min_expected_volume < 0:
+                    min_expected_volume = 0.0
                 module_price_type = self.module_price_type_var.get()
                 mineral_price_type = self.mineral_price_type_var.get()
-                sort_by_profit = self.sort_by_profit_var.get()
+                sort_by = self.sort_by_var.get()
+                sort_by_profit = sort_by in ("profit", "expected_profit")
                 
                 # Map "Run on" UI to backend filter
                 run_on = self.item_source_filter_var.get()
@@ -922,10 +1383,8 @@ for one search may still appear in searches with different parameters.
                 if self.exclude_group_most_frequent_var.get():
                     excluded_sources.append('group_most_frequent')
                 
-                # If we're excluding sources, request more results to ensure we have enough
-                # after filtering (especially to ensure blueprint items are included)
-                # Note: 'blueprint' source is NEVER excluded (most reliable source)
-                effective_top_n = top_n * 10 if excluded_sources else top_n
+                # Request more results when we'll filter (by source, expected profit, or min expected volume)
+                effective_top_n = top_n * 10 if (excluded_sources or sort_by == "expected_profit" or min_expected_volume > 0) else top_n
                 
                 results = analyze_all_modules(
                     yield_percent=yield_percent,
@@ -944,16 +1403,70 @@ for one search may still appear in searches with different parameters.
                 # Filter results based on source exclusion checkboxes
                 if excluded_sources:
                     # Keep results where source is NOT in excluded_sources
-                    # This means 'blueprint' items are always included
                     results = [r for r in results if r.get('input_quantity_source', 'unknown') not in excluded_sources]
                 
-                # Re-sort and take top N after filtering (use same sort as backend)
-                if excluded_sources:
+                # Enrich with expected volume when sorting by expected profit OR when filtering by min expected volume
+                need_expected_volume = (sort_by == "expected_profit" or min_expected_volume > 0) and Path(DATABASE_FILE).exists()
+                if need_expected_volume:
+                    conn = sqlite3.connect(DATABASE_FILE)
+                    try:
+                        for r in results:
+                            avg_7, as_of_7 = get_expected_buy_order_volume_7d_avg(
+                                conn, MARKET_HISTORY_REGION_ID, r["module_type_id"]
+                            )
+                            avg_30, as_of_30 = get_expected_buy_order_volume_30d_avg(
+                                conn, MARKET_HISTORY_REGION_ID, r["module_type_id"]
+                            )
+                            r["expected_volume_7d"] = avg_7
+                            r["expected_volume_30d"] = avg_30
+                            r["expected_volume_as_of"] = as_of_7 or as_of_30
+                            effective_vol = None
+                            if avg_7 is not None and avg_7 > 0:
+                                effective_vol = avg_7
+                            elif avg_30 is not None and avg_30 > 0:
+                                effective_vol = avg_30 / 2.0
+                            r["expected_volume_effective"] = effective_vol
+                            r["expected_profit"] = (effective_vol * r["profit_per_item"]) if effective_vol is not None else 0
+                    finally:
+                        conn.close()
+                
+                # Filter by minimum expected volume (only items with expected_volume_effective >= min_expected_volume)
+                if min_expected_volume > 0:
+                    results = [r for r in results if r.get("expected_volume_effective") is not None and r["expected_volume_effective"] >= min_expected_volume]
+                
+                # Sort and take top N
+                if sort_by == "expected_profit":
+                    results.sort(key=lambda x: (x.get("expected_profit") is None, -(x.get("expected_profit") or 0)))
+                    results = results[:top_n]
+                elif excluded_sources or min_expected_volume > 0:
                     if sort_by_profit:
                         results.sort(key=lambda x: x.get('profit_per_item', 0), reverse=True)
                     else:
                         results.sort(key=lambda x: x.get('return_percent', 0), reverse=True)
                     results = results[:top_n]
+                else:
+                    results = results[:top_n]
+                
+                # Enrich all results with expected volume for display (if not already set)
+                if results and Path(DATABASE_FILE).exists() and results[0].get("expected_volume_effective") is None:
+                    conn = sqlite3.connect(DATABASE_FILE)
+                    try:
+                        for r in results:
+                            avg_7, as_of_7 = get_expected_buy_order_volume_7d_avg(
+                                conn, MARKET_HISTORY_REGION_ID, r["module_type_id"]
+                            )
+                            avg_30, as_of_30 = get_expected_buy_order_volume_30d_avg(
+                                conn, MARKET_HISTORY_REGION_ID, r["module_type_id"]
+                            )
+                            r["expected_volume_7d"] = avg_7
+                            r["expected_volume_30d"] = avg_30
+                            r["expected_volume_as_of"] = as_of_7 or as_of_30
+                            effective_vol = (avg_7 if (avg_7 is not None and avg_7 > 0) else
+                                            (avg_30 / 2.0 if (avg_30 is not None and avg_30 > 0) else None))
+                            r["expected_volume_effective"] = effective_vol
+                            r["expected_profit"] = (effective_vol * r["profit_per_item"]) if effective_vol is not None else 0
+                    finally:
+                        conn.close()
                 
                 # Store results and parameters for exclusion
                 self.last_analysis_results = results
@@ -961,7 +1474,8 @@ for one search may still appear in searches with different parameters.
                     'min_price': min_price,
                     'max_price': max_price,
                     'module_price_type': module_price_type,
-                    'mineral_price_type': mineral_price_type
+                    'mineral_price_type': mineral_price_type,
+                    'min_expected_volume': min_expected_volume
                 }
                 
                 # Get list of items in on_offer_items for highlighting
@@ -986,6 +1500,11 @@ for one search may still appear in searches with different parameters.
                     else:
                         breakeven_str = "N/A"
                     
+                    ev = result.get("expected_volume_effective") or result.get("expected_volume_7d")
+                    expected_vol_str = f"{ev:,.0f}" if ev is not None else "N/A"
+                    ep = result.get("expected_profit")
+                    expected_profit_str = f"{ep:,.0f}" if ep is not None else "N/A"
+                    
                     values = (
                         rank,
                         result['module_name'],
@@ -993,7 +1512,9 @@ for one search may still appear in searches with different parameters.
                         f"{result['sell_min_price']:,.2f}",
                         f"{result['profit_per_item']:,.2f}",
                         return_str,
-                        breakeven_str
+                        breakeven_str,
+                        expected_vol_str,
+                        expected_profit_str
                     )
                     item_id = self.analysis_tree.insert('', tk.END, values=values)
                     if result['module_type_id'] in on_offer_type_ids:
@@ -1004,7 +1525,7 @@ for one search may still appear in searches with different parameters.
             except Exception as e:
                 for item in self.analysis_tree.get_children():
                     self.analysis_tree.delete(item)
-                self.analysis_tree.insert('', tk.END, values=("", f"Error: {str(e)}", "", "", "", "", ""))
+                self.analysis_tree.insert('', tk.END, values=("", f"Error: {str(e)}", "", "", "", "", "", "", ""))
                 self.status_var.set("Error occurred")
                 messagebox.showerror("Error", f"An error occurred:\n{str(e)}")
         
@@ -1114,6 +1635,124 @@ for one search may still appear in searches with different parameters.
                 messagebox.showerror("Error", f"An error occurred:\n{str(e)}")
         
         thread = threading.Thread(target=calculate, daemon=True)
+        thread.start()
+    
+    def _resolve_module_name_to_type_id(self, module_name):
+        """Return (type_id, type_name) for exact typeName match, or (None, None) if not found."""
+        if not module_name or not Path(DATABASE_FILE).exists():
+            return (None, None)
+        conn = sqlite3.connect(DATABASE_FILE)
+        try:
+            cur = conn.execute("SELECT typeID, typeName FROM items WHERE typeName = ?", (module_name.strip(),))
+            row = cur.fetchone()
+            return (row[0], row[1]) if row else (None, None)
+        finally:
+            conn.close()
+    
+    def show_single_expected_volume(self):
+        """Show 7d and 30d expected buy order volume for the module in the Single Module tab."""
+        module_name = self.module_name_var.get().strip()
+        if not module_name:
+            messagebox.showwarning("Warning", "Please enter a module name")
+            return
+        type_id, resolved_name = self._resolve_module_name_to_type_id(module_name)
+        if type_id is None:
+            self.single_module_results.delete(1.0, tk.END)
+            self.single_module_results.insert(tk.END, f"Module not found: {module_name!r}\n")
+            return
+        self.status_var.set("Refreshing from API, then loading expected volume...")
+        self.single_module_results.delete(1.0, tk.END)
+        self.single_module_results.insert(tk.END, f"Expected volume for: {resolved_name} (type_id={type_id})\n\nRefreshing from API...\n")
+        self.root.update()
+        
+        def run():
+            try:
+                conn = sqlite3.connect(DATABASE_FILE)
+                try:
+                    n = refresh_market_history_for_type(conn, MARKET_HISTORY_REGION_ID, type_id)
+                    avg_7, as_of_7 = get_expected_buy_order_volume_7d_avg(
+                        conn, MARKET_HISTORY_REGION_ID, type_id
+                    )
+                    avg_30, as_of_30 = get_expected_buy_order_volume_30d_avg(
+                        conn, MARKET_HISTORY_REGION_ID, type_id
+                    )
+                finally:
+                    conn.close()
+                lines = [
+                    f"Expected volume for: {resolved_name} (type_id={type_id})",
+                    f"Region: {MARKET_HISTORY_REGION_ID} (The Forge)",
+                    f"Refreshed from API: {n} days of data.",
+                    "",
+                    "7-day average expected buy order volume:",
+                    f"  {avg_7:,.0f}" if avg_7 is not None else "  N/A (no market history data)",
+                    f"  Data as of: {as_of_7}" if as_of_7 else "",
+                    "",
+                    "30-day average expected buy order volume:",
+                    f"  {avg_30:,.0f}" if avg_30 is not None else "  N/A (no market history data)",
+                    f"  Data as of: {as_of_30}" if as_of_30 else "",
+                ]
+                self.single_module_results.delete(1.0, tk.END)
+                self.single_module_results.insert(tk.END, "\n".join(lines))
+                self.status_var.set("Expected volume loaded")
+            except Exception as e:
+                self.single_module_results.delete(1.0, tk.END)
+                self.single_module_results.insert(tk.END, f"Error: {str(e)}\n")
+                self.status_var.set("Error occurred")
+        thread = threading.Thread(target=run, daemon=True)
+        thread.start()
+    
+    def show_single_raw_market_data(self):
+        """Show raw market_history_daily rows for the module in the Single Module tab."""
+        module_name = self.module_name_var.get().strip()
+        if not module_name:
+            messagebox.showwarning("Warning", "Please enter a module name")
+            return
+        type_id, resolved_name = self._resolve_module_name_to_type_id(module_name)
+        if type_id is None:
+            self.single_module_results.delete(1.0, tk.END)
+            self.single_module_results.insert(tk.END, f"Module not found: {module_name!r}\n")
+            return
+        self.status_var.set("Loading raw market data...")
+        self.single_module_results.delete(1.0, tk.END)
+        self.single_module_results.insert(tk.END, f"Raw market data for: {resolved_name} (type_id={type_id})\n\nLoading...\n")
+        self.root.update()
+        
+        def run():
+            try:
+                conn = sqlite3.connect(DATABASE_FILE)
+                try:
+                    rows = get_market_history_raw(conn, MARKET_HISTORY_REGION_ID, type_id, limit=60)
+                finally:
+                    conn.close()
+                if not rows:
+                    self.single_module_results.delete(1.0, tk.END)
+                    self.single_module_results.insert(
+                        tk.END,
+                        f"Raw market data for: {resolved_name} (type_id={type_id})\n\nNo market history data for region {MARKET_HISTORY_REGION_ID}.\n"
+                    )
+                    self.status_var.set("No data")
+                    return
+                header = f"{'date_utc':<12} {'lowest':>12} {'highest':>12} {'average':>12} {'volume':>12} {'exp_buy_vol':>12}"
+                lines = [
+                    f"Raw market data for: {resolved_name} (type_id={type_id})",
+                    f"Region: {MARKET_HISTORY_REGION_ID} (most recent 60 days)",
+                    "",
+                    header,
+                    "-" * 76,
+                ]
+                for r in rows:
+                    lines.append(
+                        f"{r['date_utc']:<12} {r['lowest'] or 0:>12,.2f} {r['highest'] or 0:>12,.2f} "
+                        f"{r['average'] or 0:>12,.2f} {r['volume'] or 0:>12,.0f} {r['expected_buy_order_vol']:>12,.0f}"
+                    )
+                self.single_module_results.delete(1.0, tk.END)
+                self.single_module_results.insert(tk.END, "\n".join(lines))
+                self.status_var.set("Raw market data loaded")
+            except Exception as e:
+                self.single_module_results.delete(1.0, tk.END)
+                self.single_module_results.insert(tk.END, f"Error: {str(e)}\n")
+                self.status_var.set("Error occurred")
+        thread = threading.Thread(target=run, daemon=True)
         thread.start()
     
     def edit_quantities(self):
@@ -1600,6 +2239,93 @@ for one search may still appear in searches with different parameters.
         thread = threading.Thread(target=update, daemon=True)
         thread.start()
     
+    def run_fetch_market_history_prices(self):
+        """Fetch market history for the same type set as Update All Prices (long run)."""
+        if not Path(DATABASE_FILE).exists():
+            messagebox.showerror("Error", "Database not found")
+            return
+        self.status_var.set("Fetching market history (same set as Update All Prices)...")
+        self.price_update_log.delete(1.0, tk.END)
+        self.price_update_log.insert(tk.END, "Starting market history fetch (same types as Update All Prices).\n")
+        self.price_update_log.insert(tk.END, "This can take a long time (~50k types with 1s delay).\n\n")
+        self.root.update()
+        
+        def run():
+            try:
+                import logging
+                from io import StringIO
+                log_capture = StringIO()
+                handler = logging.StreamHandler(log_capture)
+                handler.setLevel(logging.INFO)
+                root_logger = logging.getLogger()
+                root_logger.addHandler(handler)
+                try:
+                    run_fetch(
+                        region_id=MARKET_HISTORY_REGION_ID,
+                        all_items=True,
+                        scope="prices",
+                        delay_seconds=1.0,
+                        progress_interval=50,
+                    )
+                finally:
+                    root_logger.removeHandler(handler)
+                output = log_capture.getvalue()
+                self.price_update_log.insert(tk.END, output)
+                self.price_update_log.insert(tk.END, "\n\nMarket history fetch complete!\n")
+                self.status_var.set("Market history fetch complete!")
+                messagebox.showinfo("Success", "Market history fetch complete!")
+            except Exception as e:
+                self.price_update_log.insert(tk.END, f"\nError: {str(e)}\n")
+                self.status_var.set("Error occurred")
+                messagebox.showerror("Error", f"An error occurred:\n{str(e)}")
+        threading.Thread(target=run, daemon=True).start()
+    
+    def refresh_volume_no_or_zero_data(self):
+        """Refresh market history from API for types that have no data or zero expected volume."""
+        if not Path(DATABASE_FILE).exists():
+            messagebox.showerror("Error", "Database not found")
+            return
+        self.status_var.set("Finding items with no/zero volume data...")
+        self.price_update_log.delete(1.0, tk.END)
+        self.price_update_log.insert(tk.END, "Finding items with no or zero expected volume (prices set)...\n")
+        self.root.update()
+        
+        def run():
+            try:
+                conn = sqlite3.connect(DATABASE_FILE)
+                try:
+                    to_refresh = get_type_ids_with_no_or_zero_volume(
+                        conn, MARKET_HISTORY_REGION_ID, scope="prices", limit=2000
+                    )
+                finally:
+                    conn.close()
+                if not to_refresh:
+                    self.price_update_log.insert(tk.END, "No items need refresh (all have volume data).\n")
+                    self.status_var.set("No items to refresh")
+                    messagebox.showinfo("Info", "No items with missing/zero volume data found.")
+                    return
+                self.price_update_log.insert(tk.END, f"Found {len(to_refresh)} items to refresh. Calling API...\n\n")
+                self.root.update()
+                conn = sqlite3.connect(DATABASE_FILE)
+                try:
+                    done = 0
+                    for i, type_id in enumerate(to_refresh):
+                        n = refresh_market_history_for_type(conn, MARKET_HISTORY_REGION_ID, type_id)
+                        done += 1
+                        if (i + 1) % 50 == 0:
+                            self.price_update_log.insert(tk.END, f"  Refreshed {i + 1}/{len(to_refresh)} (last: type_id={type_id}, {n} days)\n")
+                            self.root.update()
+                    self.price_update_log.insert(tk.END, f"\nRefreshed {done} items.\n")
+                    self.status_var.set("Volume refresh complete!")
+                    messagebox.showinfo("Success", f"Refreshed market history for {done} items.")
+                finally:
+                    conn.close()
+            except Exception as e:
+                self.price_update_log.insert(tk.END, f"\nError: {str(e)}\n")
+                self.status_var.set("Error occurred")
+                messagebox.showerror("Error", f"An error occurred:\n{str(e)}")
+        threading.Thread(target=run, daemon=True).start()
+    
     def add_on_offer_item(self):
         """Add an item to the on offer list"""
         item_input = self.on_offer_item_var.get().strip()
@@ -1872,6 +2598,7 @@ for one search may still appear in searches with different parameters.
                         db_file=DATABASE_FILE
                     )
                     
+                    breakeven_raw_buy = None
                     if 'error' in result_buy_order or 'error' in result_immediate:
                         # Show error in display
                         profit_buy_order = "Error"
@@ -1898,11 +2625,12 @@ for one search may still appear in searches with different parameters.
                         profit_immediate = mineral_value_per_item - module_price_after_costs_immediate - reprocessing_cost_per_item
                         
                         # Breakeven for buy order (from buy_offer calculation)
-                        breakeven_buy_order = result_buy_order.get('breakeven_module_price', 'na')
-                        if isinstance(breakeven_buy_order, (int, float)) and breakeven_buy_order not in (0, float('inf')):
-                            breakeven_buy_order = f"{breakeven_buy_order:,.2f}"
+                        breakeven_raw_buy = result_buy_order.get('breakeven_module_price', 'na')
+                        if isinstance(breakeven_raw_buy, (int, float)) and breakeven_raw_buy not in (0, float('inf')):
+                            breakeven_buy_order = f"{breakeven_raw_buy:,.2f}"
                         else:
                             breakeven_buy_order = "N/A"
+                            breakeven_raw_buy = None
                         
                         # Breakeven for immediate (from buy_immediate calculation)
                         breakeven_immediate = result_immediate.get('breakeven_module_price', 'na')
@@ -1910,6 +2638,12 @@ for one search may still appear in searches with different parameters.
                             breakeven_immediate = f"{breakeven_immediate:,.2f}"
                         else:
                             breakeven_immediate = "N/A"
+                    
+                    # Light red row if buy price >= 85% of breakeven max (Buy Order)
+                    row_tags = ()
+                    if buy_max > 0 and breakeven_raw_buy is not None and breakeven_raw_buy > 0:
+                        if buy_max >= 0.85 * breakeven_raw_buy:
+                            row_tags = ('high_buy_near_breakeven',)
                     
                     # Insert into treeview (iid = module_type_id for reset)
                     self.on_offer_tree.insert('', tk.END, iid=str(module_type_id), values=(
@@ -1922,7 +2656,7 @@ for one search may still appear in searches with different parameters.
                         breakeven_buy_order,
                         breakeven_immediate,
                         sold_per_day_str
-                    ))
+                    ), tags=row_tags)
                 
                 except Exception as e:
                     # Insert with error message

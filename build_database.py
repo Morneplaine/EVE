@@ -32,6 +32,8 @@ def create_database():
     
     conn.commit()
     logger.info("Database schema created")
+    from regions_data import ensure_regions_table
+    ensure_regions_table(conn)
     return conn
 
 def populate_items_and_groups(conn, sde_data):

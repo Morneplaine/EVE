@@ -114,6 +114,230 @@ def get_type_name(conn, type_id):
     return row[0] if row else None
 
 
+def expected_buy_order_volume_for_day(lowest, highest, average, volume):
+    """
+    Expected buy order volume for one day (distinct from total volume).
+    Formula: total_volume * ((high - average) / (high - low)).
+    Returns 0.0 when high == low (no spread) or any input is None; otherwise returns a float.
+    """
+    if volume is None or lowest is None or highest is None or average is None:
+        return 0.0
+    if highest <= lowest:
+        return 0.0
+    try:
+        vol = float(volume)
+        ratio = (float(highest) - float(average)) / (float(highest) - float(lowest))
+        return vol * ratio
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def get_expected_buy_order_volume_7d_avg(conn, region_id, type_id, as_of_date_utc=None):
+    """
+    Average of daily expected buy order volumes over the last 7 days with data.
+    Uses the most recent date present in the DB (not today), so missing updates don't skew the result.
+    as_of_date_utc: 'YYYY-MM-DD' or None to use the latest date we have for this item.
+    Returns (avg, date_utc): average value and the date of the most recent row used, so callers
+    can check if data is too stale. (None, None) when there is no data.
+    """
+    return _get_expected_buy_order_volume_nd_avg(conn, region_id, type_id, 7, as_of_date_utc)
+
+
+def get_expected_buy_order_volume_30d_avg(conn, region_id, type_id, as_of_date_utc=None):
+    """
+    Average of daily expected buy order volumes over the last 30 days with data.
+    Uses the most recent date present in the DB (not today).
+    Returns (avg, date_utc): average and the most recent date used; (None, None) when no data.
+    """
+    return _get_expected_buy_order_volume_nd_avg(conn, region_id, type_id, 30, as_of_date_utc)
+
+
+def _get_expected_buy_order_volume_nd_avg(conn, region_id, type_id, n_days, as_of_date_utc=None):
+    """
+    Loop through the last n_days of data (by date in DB; never use current date).
+    When as_of_date_utc is None, use the latest date we have for this (region_id, type_id).
+    Compute expected buy order volume per day; return (average, most_recent_date_utc).
+    Returns (None, None) when there is no data.
+    """
+    if as_of_date_utc:
+        cur = conn.execute(
+            """
+            SELECT date_utc, lowest, highest, average, volume
+            FROM market_history_daily
+            WHERE region_id = ? AND type_id = ? AND date_utc <= ?
+            ORDER BY date_utc DESC
+            LIMIT ?
+            """,
+            (region_id, type_id, as_of_date_utc, n_days),
+        )
+    else:
+        # Use only dates we have in DB (most recent first); do not use current date
+        cur = conn.execute(
+            """
+            SELECT date_utc, lowest, highest, average, volume
+            FROM market_history_daily
+            WHERE region_id = ? AND type_id = ?
+            ORDER BY date_utc DESC
+            LIMIT ?
+            """,
+            (region_id, type_id, n_days),
+        )
+    rows = cur.fetchall()
+    if not rows:
+        return (None, None)
+    values = []
+    for ( dte_utc,lowest, highest, average, volume) in rows:
+        v = expected_buy_order_volume_for_day(lowest, highest, average, volume)
+        values.append(v)
+    # First row is the most recent date we have
+    most_recent_date_utc = rows[0][0]
+    avg = sum(values) / n_days
+    return (avg, most_recent_date_utc)
+
+
+def get_type_ids_with_no_or_zero_volume(conn, region_id, scope="prices", limit=None):
+    """
+    Return type_ids from the given scope that have no market_history_daily data for region_id,
+    or have 7d and 30d expected volume both 0 or None. Used to refresh only those from the API.
+    scope: 'prices' or 'blueprint_consensus_mineral'. limit: max to return (None = all).
+    """
+    if scope == "blueprint_consensus_mineral":
+        type_ids = get_type_ids_blueprint_consensus_mineral(conn)
+    else:
+        type_ids = get_type_ids_from_prices(conn)
+    out = []
+    for tid in type_ids:
+        avg_7, _ = get_expected_buy_order_volume_7d_avg(conn, region_id, tid)
+        avg_30, _ = get_expected_buy_order_volume_30d_avg(conn, region_id, tid)
+        has_vol = (avg_7 is not None and avg_7 > 0) or (avg_30 is not None and avg_30 > 0)
+        if not has_vol:
+            out.append(tid)
+            if limit and len(out) >= limit:
+                break
+    return out
+
+
+def get_market_history_raw(conn, region_id, type_id, limit=60):
+    """
+    Return raw daily rows from market_history_daily for (region_id, type_id), most recent first.
+    Each dict has: date_utc, lowest, highest, average, volume, expected_buy_order_vol (computed).
+    """
+    cur = conn.execute(
+        """
+        SELECT date_utc, lowest, highest, average, volume
+        FROM market_history_daily
+        WHERE region_id = ? AND type_id = ?
+        ORDER BY date_utc DESC
+        LIMIT ?
+        """,
+        (region_id, type_id, limit),
+    )
+    rows = cur.fetchall()
+    out = []
+    for (date_utc, lowest, highest, average, volume) in rows:
+        ev = expected_buy_order_volume_for_day(lowest, highest, average, volume)
+        out.append({
+            "date_utc": date_utc,
+            "lowest": lowest,
+            "highest": highest,
+            "average": average,
+            "volume": volume,
+            "expected_buy_order_vol": ev,
+        })
+    return out
+
+
+def get_latest_average_and_date(conn, region_id, type_id):
+    """
+    Return (average, date_utc) for the most recent row in market_history_daily, or (None, None) if no data.
+    """
+    ensure_table(conn)
+    cur = conn.execute(
+        """
+        SELECT average, date_utc
+        FROM market_history_daily
+        WHERE region_id = ? AND type_id = ?
+        ORDER BY date_utc DESC
+        LIMIT 1
+        """,
+        (region_id, type_id),
+    )
+    row = cur.fetchone()
+    if not row:
+        return (None, None)
+    return (float(row[0]), row[1])
+
+
+def get_average_for_tax_if_fresh(conn, region_id, type_id, max_age_hours=48):
+    """
+    Return average price from market_history_daily for (region_id, type_id).
+    If the latest date_utc is older than max_age_hours, refresh from API then return the new average.
+    Returns (average, date_utc) or (None, None) if no data after optional refresh.
+    """
+    ensure_table(conn)
+    average, date_utc = get_latest_average_and_date(conn, region_id, type_id)
+    if average is None:
+        refresh_market_history_for_type(conn, region_id, type_id)
+        average, date_utc = get_latest_average_and_date(conn, region_id, type_id)
+        return (average, date_utc)
+    try:
+        latest = datetime.strptime(date_utc, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+        now = datetime.now(timezone.utc)
+        if (now - latest).total_seconds() > max_age_hours * 3600:
+            refresh_market_history_for_type(conn, region_id, type_id)
+            average, date_utc = get_latest_average_and_date(conn, region_id, type_id)
+    except Exception:
+        pass
+    return (average, date_utc)
+
+
+# Session cache: (region_id, type_id) already refreshed this run — avoid fetching the same item twice (data updates once a day).
+_refreshed_this_session = set()
+
+
+def refresh_market_history_for_type(conn, region_id, type_id):
+    """
+    Fetch market history for one type from the API and write to market_history_daily.
+    Skips the API call if this (region_id, type_id) was already refreshed in this session
+    (data is only updated online once per day).
+    Returns number of rows written, or 0 on API/parse failure.
+    """
+    ensure_table(conn)
+    key = (region_id, type_id)
+    if key in _refreshed_this_session:
+        cur = conn.execute(
+            "SELECT COUNT(*) FROM market_history_daily WHERE region_id = ? AND type_id = ?",
+            (region_id, type_id),
+        )
+        return cur.fetchone()[0]
+    rows = fetch_history_for_type(region_id, type_id)
+    if not rows:
+        return 0
+    type_name = get_type_name(conn, type_id)
+    for row in rows:
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO market_history_daily
+            (region_id, type_id, type_name, date_utc, average, highest, lowest, order_count, volume)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                region_id,
+                type_id,
+                type_name,
+                row["date_utc"],
+                row["average"],
+                row["highest"],
+                row["lowest"],
+                row.get("order_count"),
+                row.get("volume"),
+            ),
+        )
+    conn.commit()
+    _refreshed_this_session.add(key)
+    return len(rows)
+
+
 def fetch_history_for_type(region_id, type_id):
     """GET one type's history. Returns list of dicts with date_utc, average, highest, lowest, order_count, volume."""
     url = f"{EVETYCOON_BASE}/{region_id}/{type_id}"

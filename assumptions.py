@@ -10,7 +10,7 @@ All percentages are in their decimal form (e.g., 1.37 means 1.37%)
 # Transaction Costs
 BROKER_FEE = 1.37  # Broker fee percentage when placing buy orders
 SALES_TAX = 3.5    # Sales tax percentage when selling items
-LISTING_RELIST = 3  # Average number of times an order needs to be relisted
+LISTING_RELIST = 6  # Average number of times an order needs to be relisted
 
 # Reprocessing Costs
 REPROCESSING_COST = 3.37  # Base reprocessing cost percentage

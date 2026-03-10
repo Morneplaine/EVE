@@ -125,6 +125,89 @@ CREATE TABLE IF NOT EXISTS market_history_daily (
 
 CREATE INDEX IF NOT EXISTS idx_market_history_type_date ON market_history_daily(type_id, date_utc);
 
+-- Static region list (for market / manufacturing tax region selection)
+CREATE TABLE IF NOT EXISTS regions (
+    region_id INTEGER PRIMARY KEY,
+    region_name TEXT NOT NULL
+);
+
+-- Index for name lookup
+CREATE INDEX IF NOT EXISTS idx_regions_name ON regions(region_name);
+
+-- EVE SSO / ESI sync: tokens and synced data for profitability tracking
+CREATE TABLE IF NOT EXISTS sso_character (
+    character_id INTEGER PRIMARY KEY,
+    character_name TEXT,
+    refresh_token TEXT,
+    access_token TEXT,
+    access_token_expires_at REAL,
+    updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS esi_wallet_transactions (
+    character_id INTEGER NOT NULL,
+    transaction_id BIGINT NOT NULL,
+    date_utc TEXT NOT NULL,
+    type_id INTEGER,
+    quantity INTEGER,
+    unit_price REAL,
+    client_id INTEGER,
+    location_id INTEGER,
+    is_buy INTEGER,
+    is_personal INTEGER,
+    journal_ref_id BIGINT,
+    synced_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (character_id, transaction_id),
+    FOREIGN KEY (character_id) REFERENCES sso_character(character_id)
+);
+
+CREATE TABLE IF NOT EXISTS esi_wallet_journal (
+    character_id INTEGER NOT NULL,
+    ref_id BIGINT NOT NULL,
+    date_utc TEXT NOT NULL,
+    ref_type TEXT,
+    amount REAL,
+    balance REAL,
+    context_id_type TEXT,
+    context_id BIGINT,
+    description TEXT,
+    first_party_id INTEGER,
+    second_party_id INTEGER,
+    reason TEXT,
+    synced_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (character_id, ref_id),
+    FOREIGN KEY (character_id) REFERENCES sso_character(character_id)
+);
+
+CREATE TABLE IF NOT EXISTS esi_industry_jobs (
+    character_id INTEGER NOT NULL,
+    job_id INTEGER NOT NULL,
+    activity_id INTEGER,
+    blueprint_id BIGINT,
+    blueprint_type_id INTEGER,
+    blueprint_location_id BIGINT,
+    output_location_id BIGINT,
+    runs INTEGER,
+    cost REAL,
+    licensed_runs INTEGER,
+    probability REAL,
+    product_type_id INTEGER,
+    status TEXT,
+    duration INTEGER,
+    start_date_utc TEXT,
+    end_date_utc TEXT,
+    completed_date_utc TEXT,
+    facility_id BIGINT,
+    installer_id INTEGER,
+    synced_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (character_id, job_id),
+    FOREIGN KEY (character_id) REFERENCES sso_character(character_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_esi_tx_character_date ON esi_wallet_transactions(character_id, date_utc);
+CREATE INDEX IF NOT EXISTS idx_esi_journal_character_date ON esi_wallet_journal(character_id, date_utc);
+CREATE INDEX IF NOT EXISTS idx_esi_jobs_character_status ON esi_industry_jobs(character_id, status);
+
 -- Indexes for performance
 CREATE INDEX IF NOT EXISTS idx_blueprints_product ON blueprints(productTypeID);
 CREATE INDEX IF NOT EXISTS idx_materials_blueprint ON manufacturing_materials(blueprintTypeID);
