@@ -8,6 +8,7 @@ from tkinter import ttk, scrolledtext, messagebox, simpledialog
 import threading
 import sys
 import math
+import json
 import sqlite3
 from pathlib import Path
 
@@ -18,6 +19,7 @@ from calculate_reprocessing_value import (
     format_reprocessing_result
 )
 from calculate_blueprint_profitability import calculate_blueprint_profitability
+from decryptor_profitability import compare_decryptor_profitability, DATACORE_NAMES
 from update_prices_db import update_prices, update_prices_by_type_ids
 from update_mineral_prices import update_mineral_prices
 from fetch_market_history import (
@@ -32,6 +34,8 @@ from fetch_market_history import (
 DATABASE_FILE = "eve_manufacturing.db"
 # Region ID for market_history_daily (The Forge); must match data fetched by fetch_market_history.py
 MARKET_HISTORY_REGION_ID = 10000002
+# Preferences file for decryptor comparison and other persisted settings
+LAUNCHER_PREFS_FILE = Path(__file__).resolve().parent / "eve_launcher_prefs.json"
 
 from regions_data import REGIONS_BY_NAME, DEFAULT_REGION_NAME, get_region_id_by_name
 
@@ -59,6 +63,7 @@ class EVELauncher:
         self.create_analysis_tab()
         self.create_single_module_tab()
         self.create_single_blueprint_tab()
+        self.create_decryptor_comparison_tab()
         self.create_price_update_tab()
         self.create_exclusions_tab()
         self.create_on_offer_tab()
@@ -487,11 +492,17 @@ class EVELauncher:
                     append("\n")
                     append("——— For all runs ———\n")
                     append(f"Total input cost:     {result['total_input_cost']:,.2f} ISK\n")
-                    append(f"System cost ({result['system_cost_percent']}%): {result['system_cost']:,.2f} ISK\n")
-                    append(f"Manufacturing tax ({result.get('manufacturing_tax_rate', 0):.1f}%): {result.get('manufacturing_tax', 0):,.2f} ISK\n")
-                    if result.get("tax_details"):
-                        for t in result["tax_details"]:
-                            append(f"  Tax {t['materialName']}: avg {t['average']:,.2f} × {t['quantity']:,} × {result.get('manufacturing_tax_rate', 0):.1f}% = {t['tax']:,.2f} ISK (per run)\n")
+                    eiv = result.get('eiv')
+                    eiv_src = result.get('eiv_source', '')
+                    eiv_per = result.get('eiv_price_per_unit')
+                    if eiv is not None and eiv >= 0:
+                        if eiv_src == "adjusted_price" and eiv_per is not None:
+                            append(f"EIV (CCP adjusted × output qty): {result['eiv']:,.2f} ISK  (adjusted_price/unit: {eiv_per:,.2f})\n")
+                        elif eiv_per and eiv_per > 0:
+                            append(f"EIV (market price × output qty): {result['eiv']:,.2f} ISK  (market/unit: {eiv_per:,.2f})\n")
+                        else:
+                            append(f"EIV: {result['eiv']:,.2f} ISK\n")
+                    append(f"System cost ({result['system_cost_percent']}% of EIV): {result['system_cost']:,.2f} ISK\n")
                     append(f"Output revenue:       {result['output_revenue']:,.2f} ISK  ({result['output_total_quantity']:,} × {result['output_unit_price']:,.2f})\n")
                     profit_tag = "profit_positive" if result['profit'] >= 0 else "profit_negative"
                     append(f"Profit:               {result['profit']:,.2f} ISK\n", profit_tag)
@@ -549,7 +560,219 @@ class EVELauncher:
                 self.single_blueprint_results.insert(tk.END, f"\nError: {str(e)}\n")
                 self.status_var.set("Error occurred")
         threading.Thread(target=run, daemon=True).start()
-    
+
+    def create_decryptor_comparison_tab(self):
+        """Create the Decryptor comparison tab: which decryptor is most profitable for T2 invention."""
+        frame = ttk.Frame(self.notebook)
+        self.notebook.add(frame, text="Decryptor comparison")
+        info = ttk.LabelFrame(frame, text="T2 invention: compare decryptors", padding=10)
+        info.pack(fill=tk.X, padx=10, pady=10)
+        ttk.Label(
+            info,
+            text="Research/invention produces a T2 BPC from a T1 copy. Decryptors (consumed per attempt) change success chance and the resulting BPC's ME and runs. "
+                 "Expected cost per successful BPC = (attempt cost including decryptor) ÷ success probability. Profit per BPC = manufacturing profit from that BPC − expected invention cost.",
+            justify=tk.LEFT, wraplength=900
+        ).pack(anchor=tk.W)
+        input_frame = ttk.LabelFrame(frame, text="Parameters", padding=10)
+        input_frame.pack(fill=tk.X, padx=10, pady=5)
+        row1 = ttk.Frame(input_frame)
+        row1.pack(fill=tk.X, pady=3)
+        ttk.Label(row1, text="T2 blueprint / product name:").pack(side=tk.LEFT, padx=5)
+        self.decryptor_product_var = tk.StringVar()
+        ttk.Entry(row1, textvariable=self.decryptor_product_var, width=45).pack(side=tk.LEFT, padx=5, fill=tk.X, expand=True)
+        row2 = ttk.Frame(input_frame)
+        row2.pack(fill=tk.X, pady=3)
+        ttk.Label(row2, text="Base invention chance %:").pack(side=tk.LEFT, padx=5)
+        self.decryptor_base_chance_var = tk.StringVar(value="40")
+        ttk.Entry(row2, textvariable=self.decryptor_base_chance_var, width=8).pack(side=tk.LEFT, padx=5)
+        ttk.Label(row2, text="Invention cost per attempt (ISK, without decryptor):").pack(side=tk.LEFT, padx=10)
+        self.decryptor_inv_cost_var = tk.StringVar(value="0")
+        ttk.Entry(row2, textvariable=self.decryptor_inv_cost_var, width=14).pack(side=tk.LEFT, padx=5)
+        row3 = ttk.Frame(input_frame)
+        row3.pack(fill=tk.X, pady=3)
+        ttk.Label(row3, text="Base BPC runs (10 = modules/ammo, 1 = ships/rigs):").pack(side=tk.LEFT, padx=5)
+        self.decryptor_base_runs_var = tk.StringVar(value="10")
+        ttk.Combobox(row3, textvariable=self.decryptor_base_runs_var, values=["10", "1"], state="readonly", width=6).pack(side=tk.LEFT, padx=5)
+        ttk.Label(row3, text="System cost %:").pack(side=tk.LEFT, padx=10)
+        self.decryptor_system_cost_var = tk.StringVar(value="8.61")
+        ttk.Entry(row3, textvariable=self.decryptor_system_cost_var, width=8).pack(side=tk.LEFT, padx=5)
+        ttk.Label(row3, text="Region:").pack(side=tk.LEFT, padx=10)
+        self.decryptor_region_var = tk.StringVar(value=DEFAULT_REGION_NAME)
+        region_names = [n for _, n in REGIONS_BY_NAME]
+        ttk.Combobox(row3, textvariable=self.decryptor_region_var, values=region_names, state="readonly", width=22).pack(side=tk.LEFT, padx=5)
+        row_price = ttk.Frame(input_frame)
+        row_price.pack(fill=tk.X, pady=3)
+        ttk.Label(row_price, text="Input price (materials):").pack(side=tk.LEFT, padx=5)
+        self.decryptor_input_price_var = tk.StringVar(value="buy_immediate")
+        ttk.Combobox(row_price, textvariable=self.decryptor_input_price_var,
+                     values=["buy_immediate", "buy_offer"], state="readonly", width=14).pack(side=tk.LEFT, padx=5)
+        ttk.Label(row_price, text="Output price (product):").pack(side=tk.LEFT, padx=10)
+        self.decryptor_output_price_var = tk.StringVar(value="sell_offer")
+        ttk.Combobox(row_price, textvariable=self.decryptor_output_price_var,
+                     values=["sell_immediate", "sell_offer"], state="readonly", width=14).pack(side=tk.LEFT, padx=5)
+        row4 = ttk.Frame(input_frame)
+        row4.pack(fill=tk.X, pady=3)
+        ttk.Label(row4, text="Datacore 1:").pack(side=tk.LEFT, padx=5)
+        self.decryptor_dc1_name_var = tk.StringVar()
+        ttk.Combobox(row4, textvariable=self.decryptor_dc1_name_var, values=DATACORE_NAMES, state="readonly", width=40).pack(side=tk.LEFT, padx=5)
+        ttk.Label(row4, text="Qty:").pack(side=tk.LEFT, padx=5)
+        self.decryptor_dc1_qty_var = tk.StringVar(value="0")
+        ttk.Entry(row4, textvariable=self.decryptor_dc1_qty_var, width=6).pack(side=tk.LEFT, padx=5)
+        row5 = ttk.Frame(input_frame)
+        row5.pack(fill=tk.X, pady=3)
+        ttk.Label(row5, text="Datacore 2:").pack(side=tk.LEFT, padx=5)
+        self.decryptor_dc2_name_var = tk.StringVar()
+        ttk.Combobox(row5, textvariable=self.decryptor_dc2_name_var, values=DATACORE_NAMES, state="readonly", width=40).pack(side=tk.LEFT, padx=5)
+        ttk.Label(row5, text="Qty:").pack(side=tk.LEFT, padx=5)
+        self.decryptor_dc2_qty_var = tk.StringVar(value="0")
+        ttk.Entry(row5, textvariable=self.decryptor_dc2_qty_var, width=6).pack(side=tk.LEFT, padx=5)
+        btn_row = ttk.Frame(frame)
+        btn_row.pack(fill=tk.X, padx=10, pady=5)
+        ttk.Button(btn_row, text="Compare decryptors", command=self.run_decryptor_comparison).pack(side=tk.LEFT, padx=5)
+        results_frame = ttk.LabelFrame(frame, text="Results (profit per successful BPC)", padding=10)
+        results_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        cols = ("Decryptor", "Success %", "Expected inv. cost", "Decryptor price", "BPC ME", "BPC runs", "Mfg profit", "Profit/BPC")
+        self.decryptor_tree = ttk.Treeview(results_frame, columns=cols, show="headings", height=12)
+        for c in cols:
+            self.decryptor_tree.heading(c, text=c)
+            self.decryptor_tree.column(c, width=100, stretch=True)
+        scroll = ttk.Scrollbar(results_frame, orient=tk.VERTICAL, command=self.decryptor_tree.yview)
+        self.decryptor_tree.configure(yscrollcommand=scroll.set)
+        self.decryptor_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        self.decryptor_tree.tag_configure("best", background="#c8e6c9")
+        self.decryptor_tree.tag_configure("loss", background="#ffcdd2")
+        self._load_decryptor_prefs()
+
+    def _load_decryptor_prefs(self):
+        """Load last-used decryptor comparison settings from prefs file."""
+        if not LAUNCHER_PREFS_FILE.exists():
+            return
+        try:
+            with open(LAUNCHER_PREFS_FILE, "r", encoding="utf-8") as f:
+                prefs = json.load(f)
+        except Exception:
+            return
+        dec = prefs.get("decryptor_comparison") or {}
+        if dec.get("inv_cost") is not None:
+            self.decryptor_inv_cost_var.set(str(dec["inv_cost"]))
+        dc1_name = dec.get("dc1_name", "")
+        if dc1_name and dc1_name in DATACORE_NAMES:
+            self.decryptor_dc1_name_var.set(dc1_name)
+        if dec.get("dc1_qty") is not None:
+            self.decryptor_dc1_qty_var.set(str(int(dec["dc1_qty"])))
+        dc2_name = dec.get("dc2_name", "")
+        if dc2_name and dc2_name in DATACORE_NAMES:
+            self.decryptor_dc2_name_var.set(dc2_name)
+        if dec.get("dc2_qty") is not None:
+            self.decryptor_dc2_qty_var.set(str(int(dec["dc2_qty"])))
+
+    def _save_decryptor_prefs(self):
+        """Save current decryptor comparison settings (datacores + invention cost) to prefs file."""
+        try:
+            inv_cost = self.decryptor_inv_cost_var.get().strip()
+            prefs = {}
+            if LAUNCHER_PREFS_FILE.exists():
+                try:
+                    with open(LAUNCHER_PREFS_FILE, "r", encoding="utf-8") as f:
+                        prefs = json.load(f)
+                except Exception:
+                    pass
+            prefs["decryptor_comparison"] = {
+                "inv_cost": inv_cost,
+                "dc1_name": self.decryptor_dc1_name_var.get().strip(),
+                "dc1_qty": self.decryptor_dc1_qty_var.get().strip(),
+                "dc2_name": self.decryptor_dc2_name_var.get().strip(),
+                "dc2_qty": self.decryptor_dc2_qty_var.get().strip(),
+            }
+            with open(LAUNCHER_PREFS_FILE, "w", encoding="utf-8") as f:
+                json.dump(prefs, f, indent=2)
+        except Exception:
+            pass
+
+    def run_decryptor_comparison(self):
+        """Run decryptor profitability comparison and fill the tree."""
+        name = self.decryptor_product_var.get().strip()
+        if not name:
+            messagebox.showwarning("Decryptor comparison", "Enter a T2 blueprint or product name.")
+            return
+        self._save_decryptor_prefs()
+        base_chance = self.get_float(self.decryptor_base_chance_var, 40.0)
+        inv_cost = self.get_float(self.decryptor_inv_cost_var, 0.0)
+        base_runs = self.get_float(self.decryptor_base_runs_var, 10.0)
+        base_runs = 1 if base_runs == 1 else 10
+        system_pct = self.get_float(self.decryptor_system_cost_var, 8.61)
+        region_id = get_region_id_by_name(self.decryptor_region_var.get())
+        input_price_type = self.decryptor_input_price_var.get()
+        output_price_type = self.decryptor_output_price_var.get()
+        datacores = []
+        try:
+            q1 = int(self.decryptor_dc1_qty_var.get() or "0")
+        except ValueError:
+            q1 = 0
+        name1 = (self.decryptor_dc1_name_var.get() or "").strip()
+        if name1 and q1 > 0:
+            datacores.append((name1, q1))
+        try:
+            q2 = int(self.decryptor_dc2_qty_var.get() or "0")
+        except ValueError:
+            q2 = 0
+        name2 = (self.decryptor_dc2_name_var.get() or "").strip()
+        if name2 and q2 > 0:
+            datacores.append((name2, q2))
+        self.status_var.set("Comparing decryptors...")
+        for item in self.decryptor_tree.get_children():
+            self.decryptor_tree.delete(item)
+
+        def run():
+            try:
+                rows = compare_decryptor_profitability(
+                    blueprint_name_or_product=name,
+                    base_invention_chance_pct=base_chance,
+                    invention_cost_without_decryptor=inv_cost,
+                    base_bpc_runs=base_runs,
+                    input_price_type=input_price_type,
+                    output_price_type=output_price_type,
+                    system_cost_percent=system_pct,
+                    region_id=region_id,
+                    db_file=DATABASE_FILE,
+                    datacores=datacores,
+                )
+                def fmt_isk(x):
+                    return f"{x:,.0f}" if x is not None and isinstance(x, (int, float)) else (str(x) if x is not None else "")
+                best_profit = None
+                for r in rows:
+                    if r.get("error"):
+                        self.decryptor_tree.insert("", tk.END, values=(r.get("decryptor_name", ""), r["error"], "", "", "", "", "", ""), tags=("loss",))
+                        continue
+                    profit = r.get("profit_per_bpc")
+                    if profit is not None and (best_profit is None or profit > best_profit):
+                        best_profit = profit
+                for r in rows:
+                    if r.get("error"):
+                        continue
+                    vals = (
+                        r["decryptor_name"],
+                        f"{r['success_prob_pct']:.1f}",
+                        fmt_isk(r["expected_inv_cost"]),
+                        fmt_isk(r["decryptor_price"]),
+                        str(r["bpc_me"]),
+                        str(r["bpc_runs"]),
+                        fmt_isk(r["manufacturing_profit"]),
+                        fmt_isk(r["profit_per_bpc"]),
+                    )
+                    tag = None
+                    if best_profit is not None and r.get("profit_per_bpc") == best_profit and best_profit > 0:
+                        tag = "best"
+                    elif (r.get("profit_per_bpc") or 0) < 0:
+                        tag = "loss"
+                    self.decryptor_tree.insert("", tk.END, values=vals, tags=(tag,) if tag else ())
+                self.status_var.set("Decryptor comparison complete.")
+            except Exception as e:
+                self.decryptor_tree.insert("", tk.END, values=("Error", str(e), "", "", "", "", "", ""), tags=("loss",))
+                self.status_var.set("Error occurred")
+        threading.Thread(target=run, daemon=True).start()
+
     def create_price_update_tab(self):
         """Create the Price Update tab"""
         frame = ttk.Frame(self.notebook)

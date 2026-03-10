@@ -2,9 +2,11 @@
 Calculate manufacturing profitability for a single blueprint.
 
 Given a blueprint (or product name), computes:
-- Total input cost (materials × prices with transaction cost logic)
+- Total input cost (materials × prices)
 - Output revenue (product qty × sell price with transaction costs)
-- System cost (% of input cost, e.g. facility fee)
+- System cost: system_cost_percent × EIV (Estimated Item Value). EIV uses CCP's
+  adjusted_price for the output product (from ESI /markets/prices/), not market sell
+  price — e.g. Leshak EIV ~258m vs sell ~494m; Triglavian/some items have different EIV.
 - Profit and return %
 """
 
@@ -12,19 +14,19 @@ import math
 import sqlite3
 from pathlib import Path
 
+import requests
+
 from calculate_reprocessing_value import (
     sell_into_buy_order,
     sell_order_with_fees,
 )
 from assumptions import SALES_TAX
-from fetch_market_history import get_average_for_tax_if_fresh
+
+# ESI market prices (adjusted_price = CCP's value used for EIV, industry fees, etc.)
+ESI_MARKETS_PRICES = "https://esi.evetech.net/latest/markets/prices/"
+_adjusted_price_cache = {}
 
 DATABASE_FILE = "eve_manufacturing.db"
-
-# Minerals that are subject to manufacturing tax (refined ore minerals only)
-MANUFACTURING_TAX_MINERALS = frozenset({
-    "Tritanium", "Pyerite", "Mexallon", "Isogen", "Nocxium", "Zydrine", "Megacyte", "Morphite",
-})
 
 
 def resolve_blueprint(conn, name):
@@ -92,6 +94,29 @@ def _output_price_after_costs(price_row, output_price_type):
     return sell_order_with_fees(sell_min) if sell_min else 0.0
 
 
+def get_adjusted_price(type_id: int) -> float | None:
+    """
+    Return CCP adjusted_price for type_id from ESI /markets/prices/ (used for EIV).
+    Cached in-memory for the session. Returns None if not found or on error.
+    """
+    if type_id in _adjusted_price_cache:
+        return _adjusted_price_cache[type_id]
+    try:
+        r = requests.get(ESI_MARKETS_PRICES, timeout=15)
+        r.raise_for_status()
+        data = r.json()
+        for row in data:
+            if row.get("type_id") == type_id:
+                adj = float(row.get("adjusted_price") or 0)
+                _adjusted_price_cache[type_id] = adj
+                return adj
+        _adjusted_price_cache[type_id] = None
+        return None
+    except Exception:
+        _adjusted_price_cache[type_id] = None
+        return None
+
+
 def calculate_blueprint_profitability(
     blueprint_name_or_product=None,
     input_price_type="buy_immediate",
@@ -108,10 +133,10 @@ def calculate_blueprint_profitability(
 
     material_efficiency: ME level 0–10 (each level 4% reduction in material qty). Default 0.
     number_of_runs: number of runs (multiplies input and output quantities). Default 1.
-    region_id: if set, manufacturing tax is computed from market_history_daily (average × blueprint qty × tax rate per component, summed).
-    manufacturing_tax_rate: percentage (e.g. 3.5). Default SALES_TAX from assumptions. Tax uses blueprint base quantity (ME does not apply).
+    region_id: kept for compatibility; currently ignored for cost (only materials + system cost are used).
+    manufacturing_tax_rate: deprecated and ignored; manufacturing tax is no longer applied.
 
-    Returns dict with total_input_cost, system_cost, manufacturing_tax, output_revenue, profit, etc.
+    Returns dict with total_input_cost, system_cost, output_revenue, profit, etc.
     """
     if not Path(db_file).exists():
         return {"error": f"Database not found: {db_file}"}
@@ -174,36 +199,26 @@ def calculate_blueprint_profitability(
             out_price_row = dict(out_price_row)
         else:
             out_price_row = {}
-        # Manufacturing tax: per component = market_history_daily average × blueprint base qty × tax rate; sum then × runs. ME does not affect tax qty.
-        # system_cost_percent is used as the manufacturing tax rate (e.g. 21.77 for 21.77%).
-        manufacturing_tax_rate_fraction = float(system_cost_percent if system_cost_percent is not None else 0) / 100.0
-        manufacturing_tax_total = 0.0
+        # EIV (Estimated Item Value): CCP adjusted_price for the output product × output qty × runs.
+        # If no adjusted_price from ESI, fall back to market price (sell_min or buy_max).
+        # System cost (job/facility fee) = system_cost_percent × EIV (not raw material cost).
+        adjusted = get_adjusted_price(product_type_id)
+        sell_min_out = float(out_price_row.get("sell_min") or 0)
+        buy_max_out = float(out_price_row.get("buy_max") or 0)
+        eiv_price_per_unit = adjusted if adjusted is not None and adjusted > 0 else (sell_min_out or buy_max_out)
+        eiv = eiv_price_per_unit * output_quantity * runs
+        system_cost_percent_fraction = float(system_cost_percent if system_cost_percent is not None else 0) / 100.0
+        system_cost_isk = system_cost_percent_fraction * eiv
+
+        # Manufacturing tax is no longer applied; only material cost + system cost (EIV-based) are used.
         manufacturing_tax_total_all_runs = 0.0
         tax_details = []
-        if region_id is not None:
-            for m in materials:
-                if m["materialName"] not in MANUFACTURING_TAX_MINERALS:
-                    continue
-                base_qty = m["quantity"]
-                avg_price, _ = get_average_for_tax_if_fresh(conn, region_id, m["materialTypeID"])
-                if avg_price is not None and avg_price > 0:
-                    component_tax = avg_price * base_qty * manufacturing_tax_rate_fraction
-                    manufacturing_tax_total += component_tax
-                    tax_details.append({
-                        "materialName": m["materialName"],
-                        "average": avg_price,
-                        "quantity": base_qty,
-                        "tax": component_tax,
-                    })
-            manufacturing_tax_total_all_runs = manufacturing_tax_total * runs
 
         output_unit_price = _output_price_after_costs(out_price_row, output_price_type)
         output_total_qty = output_quantity * runs
         output_revenue = output_unit_price * output_total_qty
 
-        # No separate facility "system cost" in ISK; system_cost_percent is the manufacturing tax rate
-        system_cost_isk = 0.0
-        total_cost = total_input_cost + manufacturing_tax_total_all_runs
+        total_cost = total_input_cost + system_cost_isk + manufacturing_tax_total_all_runs
         profit = output_revenue - total_cost
         return_percent = (profit / total_cost * 100.0) if total_cost > 0 else 0.0
 
@@ -222,10 +237,14 @@ def calculate_blueprint_profitability(
             "input_materials": input_materials_out,
             "materials_priced_at_zero": materials_priced_at_zero,
             "total_input_cost": total_input_cost,
+            "eiv": eiv,
+            "adjusted_price": adjusted,
+            "eiv_price_per_unit": eiv_price_per_unit,
+            "eiv_source": "adjusted_price" if (adjusted is not None and adjusted > 0) else "market",
             "system_cost": system_cost_isk,
             "system_cost_percent": float(system_cost_percent or 0),
-            "manufacturing_tax": manufacturing_tax_total_all_runs,
-            "manufacturing_tax_rate": float(system_cost_percent or 0),
+            "manufacturing_tax": 0.0,
+            "manufacturing_tax_rate": 0.0,
             "tax_details": tax_details,
             "output_unit_price": output_unit_price,
             "output_total_quantity": output_total_qty,

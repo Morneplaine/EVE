@@ -6,6 +6,7 @@ This script identifies minerals and updates only their prices, leaving all other
 import sqlite3
 import logging
 from eve_manufacturing_database import get_fuzzwork_market_prices, JITA_SYSTEM_ID
+from decryptors_data import get_decryptor_type_ids
 
 # Set up logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -66,7 +67,7 @@ def get_mineral_type_ids(conn):
     return items
 
 def update_mineral_prices():
-    """Update only mineral prices in the database"""
+    """Update only mineral prices in the database (plus decryptors used for invention)."""
     logger.info("=" * 60)
     logger.info("Updating MINERAL and MATERIAL prices in database")
     logger.info("=" * 60)
@@ -78,6 +79,27 @@ def update_mineral_prices():
         items = get_mineral_type_ids(conn)
         type_ids = [row[0] for row in items]
         item_names = {row[0]: row[1] for row in items}
+        # Also include decryptors: we care about their prices for invention profitability.
+        decryptor_type_ids = get_decryptor_type_ids()
+        if decryptor_type_ids:
+            # Ensure price rows exist for decryptors as well.
+            placeholders_dec = ",".join(["?"] * len(decryptor_type_ids))
+            cur_dec = conn.execute(
+                f"SELECT typeID FROM prices WHERE typeID IN ({placeholders_dec})",
+                decryptor_type_ids,
+            )
+            existing_dec = {row[0] for row in cur_dec.fetchall()}
+            missing_dec = set(decryptor_type_ids) - existing_dec
+            for tid in missing_dec:
+                conn.execute(
+                    """
+                    INSERT INTO prices (typeID, buy_max, buy_volume, sell_min, sell_avg, sell_median, sell_volume)
+                    VALUES (?, 0, 0, 0, 0, 0, 0)
+                    """,
+                    (tid,),
+                )
+            conn.commit()
+            type_ids = type_ids + decryptor_type_ids
         
         if len(type_ids) == 0:
             logger.warning("No minerals or items found in database!")
