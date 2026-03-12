@@ -18,8 +18,9 @@ from calculate_reprocessing_value import (
     analyze_all_modules,
     format_reprocessing_result
 )
-from calculate_blueprint_profitability import calculate_blueprint_profitability
+from calculate_blueprint_profitability import calculate_blueprint_profitability, resolve_blueprint
 from decryptor_profitability import compare_decryptor_profitability, DATACORE_NAMES
+from invention_lookup import get_t2_products_from_t1
 from update_prices_db import update_prices, update_prices_by_type_ids
 from update_mineral_prices import update_mineral_prices
 from fetch_market_history import (
@@ -580,6 +581,22 @@ class EVELauncher:
         ttk.Label(row1, text="T2 blueprint / product name:").pack(side=tk.LEFT, padx=5)
         self.decryptor_product_var = tk.StringVar()
         ttk.Entry(row1, textvariable=self.decryptor_product_var, width=45).pack(side=tk.LEFT, padx=5, fill=tk.X, expand=True)
+        row1a = ttk.Frame(input_frame)
+        row1a.pack(fill=tk.X, pady=3)
+        ttk.Label(row1a, text="Or from T1 blueprint/product:").pack(side=tk.LEFT, padx=5)
+        self.decryptor_t1_name_var = tk.StringVar()
+        ttk.Entry(row1a, textvariable=self.decryptor_t1_name_var, width=40).pack(side=tk.LEFT, padx=5, fill=tk.X, expand=True)
+        ttk.Button(row1a, text="Look up T2 outputs", command=self._decryptor_lookup_t2_from_t1).pack(side=tk.LEFT, padx=5)
+        row1b = ttk.Frame(input_frame)
+        row1b.pack(fill=tk.X, pady=2)
+        ttk.Label(row1b, text="Possible T2 (click to set):").pack(side=tk.LEFT, padx=5)
+        self._decryptor_t2_listbox = tk.Listbox(row1b, height=4, width=50, exportselection=False)
+        self._decryptor_t2_listbox.pack(side=tk.LEFT, padx=5, fill=tk.X, expand=True)
+        scroll_t2 = ttk.Scrollbar(row1b, orient=tk.VERTICAL, command=self._decryptor_t2_listbox.yview)
+        scroll_t2.pack(side=tk.LEFT, fill=tk.Y)
+        self._decryptor_t2_listbox.configure(yscrollcommand=scroll_t2.set)
+        self._decryptor_t2_listbox.bind("<<ListboxSelect>>", self._on_decryptor_t2_list_select)
+        self._decryptor_t2_options = []
         row2 = ttk.Frame(input_frame)
         row2.pack(fill=tk.X, pady=3)
         ttk.Label(row2, text="Base invention chance %:").pack(side=tk.LEFT, padx=5)
@@ -626,6 +643,15 @@ class EVELauncher:
         ttk.Label(row5, text="Qty:").pack(side=tk.LEFT, padx=5)
         self.decryptor_dc2_qty_var = tk.StringVar(value="0")
         ttk.Entry(row5, textvariable=self.decryptor_dc2_qty_var, width=6).pack(side=tk.LEFT, padx=5)
+        row_bind = ttk.Frame(input_frame)
+        row_bind.pack(fill=tk.X, pady=3)
+        ttk.Button(row_bind, text="Bind datacores to blueprint", command=self._bind_datacores_to_blueprint).pack(side=tk.LEFT, padx=5)
+        ttk.Label(row_bind, text="(saves current datacore 1/2 for this T2 product; they will auto-load next time you use this blueprint)").pack(side=tk.LEFT, padx=5)
+        row_assoc = ttk.Frame(input_frame)
+        row_assoc.pack(fill=tk.X, pady=3)
+        ttk.Label(row_assoc, text="Associate T1 ↔ T2 (save to DB):").pack(side=tk.LEFT, padx=5)
+        ttk.Button(row_assoc, text="Associate T1 → T2", command=self._associate_t1_t2).pack(side=tk.LEFT, padx=5)
+        ttk.Label(row_assoc, text="Uses T1 from field above and T2 product from field at top. Next time you can enter only T1 and look up T2.").pack(side=tk.LEFT, padx=5)
         btn_row = ttk.Frame(frame)
         btn_row.pack(fill=tk.X, padx=10, pady=5)
         ttk.Button(btn_row, text="Compare decryptors", command=self.run_decryptor_comparison).pack(side=tk.LEFT, padx=5)
@@ -642,7 +668,55 @@ class EVELauncher:
         scroll.pack(side=tk.RIGHT, fill=tk.Y)
         self.decryptor_tree.tag_configure("best", background="#c8e6c9")
         self.decryptor_tree.tag_configure("loss", background="#ffcdd2")
+        self.decryptor_tree.bind("<<TreeviewSelect>>", self._on_decryptor_row_selected)
+        self._decryptor_comparison_results = []
+        details_frame = ttk.LabelFrame(frame, text="Calculation details (click a row)", padding=10)
+        details_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
+        self.decryptor_details_text = scrolledtext.ScrolledText(details_frame, wrap=tk.WORD, height=10, state=tk.DISABLED)
+        self.decryptor_details_text.pack(fill=tk.BOTH, expand=True)
         self._load_decryptor_prefs()
+
+    def _decryptor_lookup_t2_from_t1(self):
+        """Look up T2 products that can be invented from the given T1 blueprint/product."""
+        t1_name = self.decryptor_t1_name_var.get().strip()
+        if not t1_name:
+            messagebox.showinfo("T1 lookup", "Enter a T1 blueprint or product name, then click Look up T2 outputs.")
+            return
+        self._decryptor_t2_listbox.delete(0, tk.END)
+        self._decryptor_t2_options = []
+        try:
+            results = get_t2_products_from_t1(t1_name, db_file=DATABASE_FILE)
+        except Exception as e:
+            messagebox.showerror("T1 lookup", f"Lookup failed: {e}")
+            return
+        if not results:
+            messagebox.showinfo(
+                "T1 lookup",
+                f"No T2 outputs found for {t1_name!r}. Check the name or run 'Fetch blueprint data (SDE)' in Single Blueprint tab to load invention data."
+            )
+            return
+        for r in results:
+            name = r["t2_product_name"]
+            prob = r.get("probability")
+            qty = r.get("quantity", 1)
+            if prob is not None:
+                line = f"{name}  (prob {float(prob):.2%}, qty {qty})"
+            else:
+                line = f"{name}  (qty {qty})"
+            self._decryptor_t2_listbox.insert(tk.END, line)
+            self._decryptor_t2_options.append(name)
+        self.status_var.set(f"Found {len(results)} T2 output(s) for {t1_name}. Click one to set as T2 product.")
+
+    def _on_decryptor_t2_list_select(self, event=None):
+        """When user selects a T2 from the list, set the T2 product name field and load saved datacore binding."""
+        sel = self._decryptor_t2_listbox.curselection()
+        if not sel or not self._decryptor_t2_options:
+            return
+        idx = int(sel[0])
+        if 0 <= idx < len(self._decryptor_t2_options):
+            self.decryptor_product_var.set(self._decryptor_t2_options[idx])
+            self.status_var.set(f"T2 product set to: {self._decryptor_t2_options[idx]}")
+            self._load_datacore_binding_for_product(self._decryptor_t2_options[idx])
 
     def _load_decryptor_prefs(self):
         """Load last-used decryptor comparison settings from prefs file."""
@@ -690,12 +764,186 @@ class EVELauncher:
         except Exception:
             pass
 
+    def _ensure_blueprint_datacore_bindings_table(self, conn):
+        """Create blueprint_datacore_bindings table if it does not exist (for DBs created before schema had it)."""
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS blueprint_datacore_bindings (
+                blueprint_type_id INTEGER PRIMARY KEY,
+                dc1_name TEXT,
+                dc1_qty INTEGER NOT NULL DEFAULT 0,
+                dc2_name TEXT,
+                dc2_qty INTEGER NOT NULL DEFAULT 0,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (blueprint_type_id) REFERENCES blueprints(blueprintTypeID)
+            )
+        """)
+
+    def _load_datacore_binding_for_product(self, product_name):
+        """Load saved datacore binding for the given T2 product name and fill dc1/dc2 vars."""
+        if not product_name or not Path(DATABASE_FILE).exists():
+            return
+        try:
+            conn = sqlite3.connect(DATABASE_FILE)
+            try:
+                self._ensure_blueprint_datacore_bindings_table(conn)
+                bp = resolve_blueprint(conn, product_name)
+                if not bp:
+                    return
+                blueprint_type_id = bp["blueprintTypeID"]
+                row = conn.execute(
+                    "SELECT dc1_name, dc1_qty, dc2_name, dc2_qty FROM blueprint_datacore_bindings WHERE blueprint_type_id = ?",
+                    (blueprint_type_id,),
+                ).fetchone()
+                if not row:
+                    return
+                dc1_name, dc1_qty, dc2_name, dc2_qty = row
+                if dc1_name and dc1_name in DATACORE_NAMES:
+                    self.decryptor_dc1_name_var.set(dc1_name)
+                self.decryptor_dc1_qty_var.set(str(int(dc1_qty or 0)))
+                if dc2_name and dc2_name in DATACORE_NAMES:
+                    self.decryptor_dc2_name_var.set(dc2_name)
+                self.decryptor_dc2_qty_var.set(str(int(dc2_qty or 0)))
+                self.status_var.set(f"Loaded saved datacore binding for {product_name}.")
+            finally:
+                conn.close()
+        except Exception:
+            pass
+
+    def _bind_datacores_to_blueprint(self):
+        """Save current datacore 1/2 and quantities to the current T2 product (bind to blueprint)."""
+        product_name = self.decryptor_product_var.get().strip()
+        if not product_name:
+            messagebox.showwarning("Bind datacores", "Enter a T2 blueprint or product name first.")
+            return
+        if not Path(DATABASE_FILE).exists():
+            messagebox.showerror("Bind datacores", "Database not found. Run build_database / fetch blueprint data first.")
+            return
+        try:
+            conn = sqlite3.connect(DATABASE_FILE)
+            try:
+                self._ensure_blueprint_datacore_bindings_table(conn)
+                bp = resolve_blueprint(conn, product_name)
+                if not bp:
+                    messagebox.showerror("Bind datacores", f"Blueprint/product not found: {product_name!r}")
+                    return
+                blueprint_type_id = bp["blueprintTypeID"]
+                dc1_name = (self.decryptor_dc1_name_var.get() or "").strip()
+                try:
+                    dc1_qty = int(self.decryptor_dc1_qty_var.get() or "0")
+                except ValueError:
+                    dc1_qty = 0
+                dc2_name = (self.decryptor_dc2_name_var.get() or "").strip()
+                try:
+                    dc2_qty = int(self.decryptor_dc2_qty_var.get() or "0")
+                except ValueError:
+                    dc2_qty = 0
+                conn.execute("""
+                    INSERT OR REPLACE INTO blueprint_datacore_bindings
+                    (blueprint_type_id, dc1_name, dc1_qty, dc2_name, dc2_qty, updated_at)
+                    VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                """, (blueprint_type_id, dc1_name or None, dc1_qty, dc2_name or None, dc2_qty))
+                conn.commit()
+                self.status_var.set(f"Datacores bound to {product_name}. They will auto-load next time you use this blueprint.")
+            finally:
+                conn.close()
+        except Exception as e:
+            messagebox.showerror("Bind datacores", str(e))
+
+    def _associate_t1_t2(self):
+        """Save T1 → T2 association to invention_recipes so T2 can be looked up from T1 later."""
+        t1_name = self.decryptor_t1_name_var.get().strip()
+        t2_name = self.decryptor_product_var.get().strip()
+        if not t1_name or not t2_name:
+            messagebox.showwarning("Associate T1→T2", "Enter both T1 blueprint/product (Or from T1 field) and T2 blueprint/product name (top field).")
+            return
+        if not Path(DATABASE_FILE).exists():
+            messagebox.showerror("Associate T1→T2", "Database not found.")
+            return
+        try:
+            conn = sqlite3.connect(DATABASE_FILE)
+            try:
+                bp1 = resolve_blueprint(conn, t1_name)
+                bp2 = resolve_blueprint(conn, t2_name)
+                if not bp1:
+                    messagebox.showerror("Associate T1→T2", f"T1 not found: {t1_name!r}")
+                    return
+                if not bp2:
+                    messagebox.showerror("Associate T1→T2", f"T2 not found: {t2_name!r}")
+                    return
+                t1_bp_id = bp1["blueprintTypeID"]
+                t2_bp_id = bp2["blueprintTypeID"]
+                conn.execute("""
+                    INSERT OR REPLACE INTO invention_recipes (t1_blueprint_type_id, t2_blueprint_type_id, quantity, probability)
+                    VALUES (?, ?, 1, ?)
+                """, (t1_bp_id, t2_bp_id, 0.4))
+                conn.commit()
+                self.status_var.set(f"Associated {t1_name} → {t2_name}. You can now enter only T1 and use 'Look up T2 outputs'.")
+            finally:
+                conn.close()
+        except Exception as e:
+            messagebox.showerror("Associate T1→T2", str(e))
+
+    def _on_decryptor_row_selected(self, event=None):
+        """Show calculation breakdown for the selected decryptor row."""
+        self.decryptor_details_text.configure(state=tk.NORMAL)
+        self.decryptor_details_text.delete(1.0, tk.END)
+        sel = self.decryptor_tree.selection()
+        if not sel or not self._decryptor_comparison_results:
+            self.decryptor_details_text.insert(tk.END, "Run a comparison, then click a row to see the calculation.")
+            self.decryptor_details_text.configure(state=tk.DISABLED)
+            return
+        item_id = sel[0]
+        children = list(self.decryptor_tree.get_children())
+        try:
+            idx = children.index(item_id)
+        except ValueError:
+            self.decryptor_details_text.configure(state=tk.DISABLED)
+            return
+        if idx >= len(self._decryptor_comparison_results):
+            self.decryptor_details_text.configure(state=tk.DISABLED)
+            return
+        r = self._decryptor_comparison_results[idx]
+        if r.get("error"):
+            self.decryptor_details_text.insert(tk.END, f"Decryptor: {r.get('decryptor_name', '')}\nError: {r['error']}")
+            self.decryptor_details_text.configure(state=tk.DISABLED)
+            return
+        def fmt(x):
+            return f"{x:,.2f}" if x is not None and isinstance(x, (int, float)) else str(x)
+        inv = r.get("inv_cost_no_dec") or 0
+        dc = r.get("datacore_cost") or 0
+        dec_price = r.get("decryptor_price") or 0
+        attempt = r.get("attempt_cost") or (inv + dc + dec_price)
+        prob = r.get("success_prob_pct") or 0
+        expected = r.get("expected_inv_cost") or 0
+        mfg = r.get("manufacturing_profit") or 0
+        profit_bpc = r.get("profit_per_bpc") or 0
+        lines = [
+            f"Decryptor: {r.get('decryptor_name', '')}",
+            "",
+            "Invention cost per attempt:",
+            f"  Base (no decryptor, no datacores):  {fmt(inv)} ISK",
+            f"  Datacore cost:                        {fmt(dc)} ISK",
+            f"  Decryptor price:                     {fmt(dec_price)} ISK",
+            f"  → Attempt cost (one try):            {fmt(attempt)} ISK",
+            "",
+            f"Success probability: {fmt(prob)}%",
+            f"Expected cost per successful BPC = attempt_cost ÷ (success% / 100) = {fmt(attempt)} ÷ {prob/100:.4f} = {fmt(expected)} ISK",
+            "",
+            f"Resulting BPC: ME {r.get('bpc_me', '')}%, {r.get('bpc_runs', '')} runs",
+            f"Manufacturing profit (all runs): {fmt(mfg)} ISK",
+            f"Profit per BPC = manufacturing profit − expected inv. cost = {fmt(mfg)} − {fmt(expected)} = {fmt(profit_bpc)} ISK",
+        ]
+        self.decryptor_details_text.insert(tk.END, "\n".join(lines))
+        self.decryptor_details_text.configure(state=tk.DISABLED)
+
     def run_decryptor_comparison(self):
         """Run decryptor profitability comparison and fill the tree."""
         name = self.decryptor_product_var.get().strip()
         if not name:
             messagebox.showwarning("Decryptor comparison", "Enter a T2 blueprint or product name.")
             return
+        # Load saved datacore binding for this blueprint so we use bound values (and pre-fill form)
+        self._load_datacore_binding_for_product(name)
         self._save_decryptor_prefs()
         base_chance = self.get_float(self.decryptor_base_chance_var, 40.0)
         inv_cost = self.get_float(self.decryptor_inv_cost_var, 0.0)
@@ -721,8 +969,13 @@ class EVELauncher:
         if name2 and q2 > 0:
             datacores.append((name2, q2))
         self.status_var.set("Comparing decryptors...")
+        self._decryptor_comparison_results = []
         for item in self.decryptor_tree.get_children():
             self.decryptor_tree.delete(item)
+        self.decryptor_details_text.configure(state=tk.NORMAL)
+        self.decryptor_details_text.delete(1.0, tk.END)
+        self.decryptor_details_text.insert(tk.END, "Running comparison...")
+        self.decryptor_details_text.configure(state=tk.DISABLED)
 
         def run():
             try:
@@ -738,6 +991,7 @@ class EVELauncher:
                     db_file=DATABASE_FILE,
                     datacores=datacores,
                 )
+                self._decryptor_comparison_results = rows
                 def fmt_isk(x):
                     return f"{x:,.0f}" if x is not None and isinstance(x, (int, float)) else (str(x) if x is not None else "")
                 best_profit = None
@@ -768,6 +1022,10 @@ class EVELauncher:
                         tag = "loss"
                     self.decryptor_tree.insert("", tk.END, values=vals, tags=(tag,) if tag else ())
                 self.status_var.set("Decryptor comparison complete.")
+                self.decryptor_details_text.configure(state=tk.NORMAL)
+                self.decryptor_details_text.delete(1.0, tk.END)
+                self.decryptor_details_text.insert(tk.END, "Click a row above to see the calculation breakdown.")
+                self.decryptor_details_text.configure(state=tk.DISABLED)
             except Exception as e:
                 self.decryptor_tree.insert("", tk.END, values=("Error", str(e), "", "", "", "", "", ""), tags=("loss",))
                 self.status_var.set("Error occurred")

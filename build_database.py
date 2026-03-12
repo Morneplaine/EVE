@@ -170,6 +170,30 @@ def populate_manufacturing_materials(conn, sde_data):
     materials_data.to_sql('manufacturing_materials', conn, if_exists='replace', index=False)
     logger.info(f"Inserted {len(materials_data)} material requirements")
 
+def populate_invention_recipes(conn, sde_data):
+    """Populate invention_recipes: T1 blueprint type ID -> T2 blueprint type ID (activityID 8)."""
+    logger.info("Populating invention recipes (T1 -> T2)...")
+    products = sde_data['industryActivityProducts']
+    INVENTION_ACTIVITY = 8
+    inv = products[products['activityID'] == INVENTION_ACTIVITY].copy()
+    if inv.empty:
+        logger.warning("No invention activity products in SDE, skipping invention_recipes")
+        return
+    # typeID = input blueprint (T1 BPO), productTypeID = output blueprint (T2 BPO)
+    inv = inv[['typeID', 'productTypeID', 'quantity']].copy()
+    inv.columns = ['t1_blueprint_type_id', 't2_blueprint_type_id', 'quantity']
+    if 'probability' in products.columns:
+        probs = products[products['activityID'] == INVENTION_ACTIVITY]['probability']
+        inv['probability'] = probs.values
+    else:
+        inv['probability'] = None
+    # Only keep T2 blueprints that exist in our blueprints table (we have manufacturing data)
+    cur = conn.execute("SELECT blueprintTypeID FROM blueprints")
+    known_bp = {row[0] for row in cur.fetchall()}
+    inv = inv[inv['t2_blueprint_type_id'].isin(known_bp)]
+    inv.to_sql('invention_recipes', conn, if_exists='replace', index=False)
+    logger.info(f"Inserted {len(inv)} invention recipe(s) (T1 -> T2)")
+
 def populate_manufacturing_skills(conn, sde_data):
     """Populate manufacturing skills"""
     logger.info("Populating manufacturing skills...")
@@ -268,6 +292,7 @@ def main():
         populate_blueprints(conn, sde_data)
         populate_manufacturing_materials(conn, sde_data)
         populate_manufacturing_skills(conn, sde_data)
+        populate_invention_recipes(conn, sde_data)
         populate_reprocessing(conn, sde_data)
         
         # Initialize prices table with all items (prices will be 0 until updated)

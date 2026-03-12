@@ -20,20 +20,32 @@ from decryptors_data import (
 
 DATABASE_FILE = "eve_manufacturing.db"
 
-# Common datacores used in invention (static names, must match items.typeName)
+# Common datacores used in invention (static names, must match items.typeName).
+# Full list of EVE datacores, alphabetically ordered.
 DATACORE_NAMES = [
-    "Datacore - Mechanical Engineering",
+    "Datacore - Amarrian Starship Engineering",
+    "Datacore - Caldari Starship Engineering",
+    "Datacore - Core Subsystems Engineering",
+    "Datacore - Defensive Subsystems Engineering",
+    "Datacore - Electromagnetic Physics",
     "Datacore - Electronic Engineering",
+    "Datacore - Gallentean Starship Engineering",
+    "Datacore - Graviton Physics",
     "Datacore - High Energy Physics",
-    "Datacore - Plasma Physics",
-    "Datacore - Quantum Physics",
+    "Datacore - Hydromagnetic Physics",
+    "Datacore - Laser Physics",
+    "Datacore - Mechanical Engineering",
+    "Datacore - Minmatar Starship Engineering",
     "Datacore - Molecular Engineering",
     "Datacore - Nanite Engineering",
+    "Datacore - Nuclear Physics",
+    "Datacore - Offensive Subsystems Engineering",
+    "Datacore - Plasma Physics",
+    "Datacore - Propulsion Subsystems Engineering",
+    "Datacore - Quantum Physics",
     "Datacore - Rocket Science",
-    "Datacore - Graviton Physics",
-    "Datacore - Laser Physics",
-    "Datacore - Electromagnetic Physics",
-    "Datacore - Hydromagnetic Physics",
+    "Datacore - Triglavian Quantum Engineering",
+    "Datacore - Upwell Starship Engineering",
 ]
 
 
@@ -137,6 +149,9 @@ def compare_decryptor_profitability(
         "decryptor_name": "No decryptor",
         "decryptor_type_id": None,
         "success_prob_pct": success_prob * 100,
+        "attempt_cost": attempt_cost,
+        "inv_cost_no_dec": inv_cost_no_dec,
+        "datacore_cost": datacore_cost,
         "expected_inv_cost": expected_inv,
         "decryptor_price": 0.0,
         "bpc_me": me,
@@ -178,6 +193,9 @@ def compare_decryptor_profitability(
             "decryptor_name": name,
             "decryptor_type_id": type_id,
             "success_prob_pct": success_prob * 100,
+            "attempt_cost": attempt_cost,
+            "inv_cost_no_dec": inv_cost_no_dec,
+            "datacore_cost": datacore_cost,
             "expected_inv_cost": expected_inv,
             "decryptor_price": decryptor_price,
             "bpc_me": me,

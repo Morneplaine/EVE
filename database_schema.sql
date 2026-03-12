@@ -208,6 +208,30 @@ CREATE INDEX IF NOT EXISTS idx_esi_tx_character_date ON esi_wallet_transactions(
 CREATE INDEX IF NOT EXISTS idx_esi_journal_character_date ON esi_wallet_journal(character_id, date_utc);
 CREATE INDEX IF NOT EXISTS idx_esi_jobs_character_status ON esi_industry_jobs(character_id, status);
 
+-- Invention: T1 blueprint -> T2 blueprint (activityID 8 in SDE industryActivityProducts)
+CREATE TABLE IF NOT EXISTS invention_recipes (
+    t1_blueprint_type_id INTEGER NOT NULL,
+    t2_blueprint_type_id INTEGER NOT NULL,
+    quantity INTEGER NOT NULL DEFAULT 1,
+    probability REAL,
+    PRIMARY KEY (t1_blueprint_type_id, t2_blueprint_type_id),
+    FOREIGN KEY (t1_blueprint_type_id) REFERENCES items(typeID),
+    FOREIGN KEY (t2_blueprint_type_id) REFERENCES blueprints(blueprintTypeID)
+);
+CREATE INDEX IF NOT EXISTS idx_invention_t1 ON invention_recipes(t1_blueprint_type_id);
+
+-- User-defined datacore bindings per T2 blueprint (invention product)
+-- Keyed by T2 blueprint type ID; when user runs decryptor comparison we pre-fill from here
+CREATE TABLE IF NOT EXISTS blueprint_datacore_bindings (
+    blueprint_type_id INTEGER PRIMARY KEY,
+    dc1_name TEXT,
+    dc1_qty INTEGER NOT NULL DEFAULT 0,
+    dc2_name TEXT,
+    dc2_qty INTEGER NOT NULL DEFAULT 0,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (blueprint_type_id) REFERENCES blueprints(blueprintTypeID)
+);
+
 -- Indexes for performance
 CREATE INDEX IF NOT EXISTS idx_blueprints_product ON blueprints(productTypeID);
 CREATE INDEX IF NOT EXISTS idx_materials_blueprint ON manufacturing_materials(blueprintTypeID);
