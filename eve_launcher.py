@@ -18,7 +18,7 @@ from calculate_reprocessing_value import (
     analyze_all_modules,
     format_reprocessing_result
 )
-from calculate_blueprint_profitability import calculate_blueprint_profitability, resolve_blueprint
+from calculate_blueprint_profitability import calculate_blueprint_profitability, resolve_blueprint, get_blueprint_materials
 from decryptor_profitability import compare_decryptor_profitability, DATACORE_NAMES
 from invention_lookup import get_t2_products_from_t1
 from update_prices_db import update_prices, update_prices_by_type_ids
@@ -65,6 +65,7 @@ class EVELauncher:
         self.create_single_module_tab()
         self.create_single_blueprint_tab()
         self.create_decryptor_comparison_tab()
+        self.create_shopping_list_tab()
         self.create_price_update_tab()
         self.create_exclusions_tab()
         self.create_on_offer_tab()
@@ -78,6 +79,8 @@ class EVELauncher:
         # Store last analysis results for exclusion
         self.last_analysis_results = None
         self.last_analysis_params = None
+        # Shopping list: list of {"product_name": str, "quantity": int}
+        self.shopping_list = []
         
         # Status bar
         self.status_var = tk.StringVar(value="Ready")
@@ -428,6 +431,7 @@ class EVELauncher:
         btn_row.pack(pady=10)
         ttk.Button(btn_row, text="Calculate profitability", command=self.calculate_single_blueprint).pack(side=tk.LEFT, padx=5)
         ttk.Button(btn_row, text="Fetch blueprint data (SDE)", command=self.fetch_blueprint_data).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_row, text="Add to shopping list", command=self._add_single_blueprint_to_shopping_list).pack(side=tk.LEFT, padx=5)
         
         results_frame = ttk.LabelFrame(frame, text="Results", padding=10)
         results_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
@@ -655,6 +659,7 @@ class EVELauncher:
         btn_row = ttk.Frame(frame)
         btn_row.pack(fill=tk.X, padx=10, pady=5)
         ttk.Button(btn_row, text="Compare decryptors", command=self.run_decryptor_comparison).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_row, text="Add to shopping list", command=self._add_decryptor_to_shopping_list).pack(side=tk.LEFT, padx=5)
         results_frame = ttk.LabelFrame(frame, text="Results (profit per successful BPC)", padding=10)
         results_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
         cols = ("Decryptor", "Success %", "Expected inv. cost", "Decryptor price", "BPC ME", "BPC runs", "Mfg profit", "Profit/BPC")
@@ -675,6 +680,195 @@ class EVELauncher:
         self.decryptor_details_text = scrolledtext.ScrolledText(details_frame, wrap=tk.WORD, height=10, state=tk.DISABLED)
         self.decryptor_details_text.pack(fill=tk.BOTH, expand=True)
         self._load_decryptor_prefs()
+
+    def create_shopping_list_tab(self):
+        """Create the Shopping list tab: blueprints with quantities and aggregated materials list."""
+        frame = ttk.Frame(self.notebook)
+        self.notebook.add(frame, text="Shopping list")
+        top = ttk.LabelFrame(frame, text="Blueprints in list", padding=10)
+        top.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        cols = ("Blueprint / Product", "Quantity")
+        self.shopping_list_tree = ttk.Treeview(top, columns=cols, show="headings", height=10, selectmode="browse")
+        for c in cols:
+            self.shopping_list_tree.heading(c, text=c)
+            self.shopping_list_tree.column(c, width=200, stretch=True)
+        scroll_tree = ttk.Scrollbar(top, orient=tk.VERTICAL, command=self.shopping_list_tree.yview)
+        self.shopping_list_tree.configure(yscrollcommand=scroll_tree.set)
+        self.shopping_list_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scroll_tree.pack(side=tk.RIGHT, fill=tk.Y)
+        self.shopping_list_tree.bind("<<TreeviewSelect>>", self._on_shopping_list_selection)
+        btn_row1 = ttk.Frame(top)
+        btn_row1.pack(fill=tk.X, pady=5)
+        ttk.Label(btn_row1, text="Quantity for selected:").pack(side=tk.LEFT, padx=5)
+        self.shopping_list_qty_var = tk.StringVar(value="1")
+        self.shopping_list_qty_entry = ttk.Entry(btn_row1, textvariable=self.shopping_list_qty_var, width=8)
+        self.shopping_list_qty_entry.pack(side=tk.LEFT, padx=2)
+        ttk.Button(btn_row1, text="Update quantity", command=self._shopping_list_update_quantity).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_row1, text="Remove selected", command=self._shopping_list_remove_selected).pack(side=tk.LEFT, padx=5)
+        agg_frame = ttk.LabelFrame(frame, text="Items required for manufacturing (aggregated)", padding=10)
+        agg_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
+        self.shopping_list_aggregate_text = scrolledtext.ScrolledText(agg_frame, wrap=tk.WORD, height=14, state=tk.DISABLED)
+        self.shopping_list_aggregate_text.pack(fill=tk.BOTH, expand=True)
+        btn_row2 = ttk.Frame(agg_frame)
+        btn_row2.pack(fill=tk.X, pady=5)
+        ttk.Button(btn_row2, text="Copy to clipboard", command=self._shopping_list_copy_to_clipboard).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_row2, text="Refresh list", command=self._refresh_shopping_list_aggregate).pack(side=tk.LEFT, padx=5)
+
+    def _add_single_blueprint_to_shopping_list(self):
+        """Add current blueprint/product from Single Blueprint tab to the shopping list."""
+        name = self.blueprint_name_var.get().strip()
+        if not name:
+            messagebox.showwarning("Shopping list", "Enter a blueprint or product name first.")
+            return
+        try:
+            qty = max(1, int(self.blueprint_runs_var.get().strip() or "1"))
+        except ValueError:
+            qty = 1
+        self._shopping_list_append(name, qty)
+
+    def _add_decryptor_to_shopping_list(self):
+        """Add current T2 product from Decryptor comparison tab to the shopping list."""
+        name = self.decryptor_product_var.get().strip()
+        if not name:
+            messagebox.showwarning("Shopping list", "Enter a T2 blueprint or product name first.")
+            return
+        self._shopping_list_append(name, 1)
+
+    def _shopping_list_append(self, product_name: str, quantity: int):
+        """Append an entry to the shopping list and refresh the tab."""
+        self.shopping_list.append({"product_name": product_name, "quantity": quantity})
+        self._shopping_list_refresh_tree()
+        self._refresh_shopping_list_aggregate()
+        # Switch to Shopping list tab
+        for i in range(self.notebook.index("end")):
+            if self.notebook.tab(i, "text") == "Shopping list":
+                self.notebook.select(i)
+                break
+        self.status_var.set(f"Added {product_name} x{quantity} to shopping list.")
+
+    def _shopping_list_refresh_tree(self):
+        """Rebuild the Treeview from self.shopping_list."""
+        for item in self.shopping_list_tree.get_children():
+            self.shopping_list_tree.delete(item)
+        for entry in self.shopping_list:
+            self.shopping_list_tree.insert("", tk.END, values=(entry["product_name"], entry["quantity"]))
+
+    def _on_shopping_list_selection(self, event=None):
+        """When user selects a row, fill quantity entry with that row's quantity."""
+        sel = self.shopping_list_tree.selection()
+        if not sel:
+            return
+        item = sel[0]
+        vals = self.shopping_list_tree.item(item, "values")
+        if vals and len(vals) >= 2:
+            self.shopping_list_qty_var.set(str(vals[1]))
+
+    def _shopping_list_update_quantity(self):
+        """Set quantity of the selected row from the quantity entry."""
+        sel = self.shopping_list_tree.selection()
+        if not sel:
+            messagebox.showinfo("Shopping list", "Select a blueprint row first.")
+            return
+        try:
+            qty = max(1, int(self.shopping_list_qty_var.get().strip() or "1"))
+        except ValueError:
+            messagebox.showwarning("Shopping list", "Enter a valid quantity.")
+            return
+        item = sel[0]
+        children = list(self.shopping_list_tree.get_children())
+        try:
+            idx = children.index(item)
+        except ValueError:
+            return
+        if idx < 0 or idx >= len(self.shopping_list):
+            return
+        self.shopping_list[idx]["quantity"] = qty
+        product_name = self.shopping_list[idx]["product_name"]
+        self.shopping_list_tree.item(item, values=(product_name, qty))
+        self._refresh_shopping_list_aggregate()
+        self.status_var.set(f"Quantity updated to {qty}.")
+
+    def _shopping_list_remove_selected(self):
+        """Remove the selected row from the shopping list."""
+        sel = self.shopping_list_tree.selection()
+        if not sel:
+            messagebox.showinfo("Shopping list", "Select a blueprint row to remove.")
+            return
+        item = sel[0]
+        children = list(self.shopping_list_tree.get_children())
+        try:
+            idx = children.index(item)
+        except ValueError:
+            return
+        if 0 <= idx < len(self.shopping_list):
+            self.shopping_list.pop(idx)
+        self._shopping_list_refresh_tree()
+        self._refresh_shopping_list_aggregate()
+        self.status_var.set("Removed from shopping list.")
+
+    def _refresh_shopping_list_aggregate(self):
+        """Compute aggregated materials (and datacores) from shopping_list and update the text."""
+        self.shopping_list_aggregate_text.configure(state=tk.NORMAL)
+        self.shopping_list_aggregate_text.delete(1.0, tk.END)
+        if not self.shopping_list:
+            self.shopping_list_aggregate_text.insert(tk.END, "Add blueprints from Single Blueprint or Decryptor comparison, then set quantities. This list will show required materials and datacores (if bound).")
+            self.shopping_list_aggregate_text.configure(state=tk.DISABLED)
+            return
+        aggregated = {}
+        if not Path(DATABASE_FILE).exists():
+            self.shopping_list_aggregate_text.insert(tk.END, "Database not found. Run build_database / fetch blueprint data first.")
+            self.shopping_list_aggregate_text.configure(state=tk.DISABLED)
+            return
+        try:
+            conn = sqlite3.connect(DATABASE_FILE)
+            try:
+                self._ensure_blueprint_datacore_bindings_table(conn)
+                for entry in self.shopping_list:
+                    name = entry["product_name"]
+                    qty = max(1, int(entry["quantity"]))
+                    bp = resolve_blueprint(conn, name)
+                    if not bp:
+                        continue
+                    bid = bp["blueprintTypeID"]
+                    materials = get_blueprint_materials(conn, bid)
+                    for m in materials:
+                        mat_name = m["materialName"]
+                        need = m["quantity"] * qty
+                        aggregated[mat_name] = aggregated.get(mat_name, 0) + need
+                    row = conn.execute(
+                        "SELECT dc1_name, dc1_qty, dc2_name, dc2_qty FROM blueprint_datacore_bindings WHERE blueprint_type_id = ?",
+                        (bid,),
+                    ).fetchone()
+                    if row:
+                        dc1_name, dc1_qty, dc2_name, dc2_qty = row
+                        if dc1_name and dc1_qty:
+                            aggregated[dc1_name] = aggregated.get(dc1_name, 0) + (dc1_qty or 0) * qty
+                        if dc2_name and dc2_qty:
+                            aggregated[dc2_name] = aggregated.get(dc2_name, 0) + (dc2_qty or 0) * qty
+            finally:
+                conn.close()
+        except Exception as e:
+            self.shopping_list_aggregate_text.insert(tk.END, f"Error: {e}")
+            self.shopping_list_aggregate_text.configure(state=tk.DISABLED)
+            return
+        lines = []
+        for name in sorted(aggregated.keys()):
+            lines.append(f"{name}\t{aggregated[name]:,}")
+        self.shopping_list_aggregate_text.insert(tk.END, "\n".join(lines) if lines else "No materials resolved.")
+        self.shopping_list_aggregate_text.configure(state=tk.DISABLED)
+
+    def _shopping_list_copy_to_clipboard(self):
+        """Copy the aggregated materials text to the clipboard."""
+        self.shopping_list_aggregate_text.configure(state=tk.NORMAL)
+        text = self.shopping_list_aggregate_text.get(1.0, tk.END)
+        self.shopping_list_aggregate_text.configure(state=tk.DISABLED)
+        text = text.strip()
+        if not text or text.startswith("Add blueprints") or text.startswith("Database not found") or text.startswith("Error:"):
+            messagebox.showinfo("Copy", "Nothing to copy. Add blueprints and refresh the list first.")
+            return
+        self.root.clipboard_clear()
+        self.root.clipboard_append(text)
+        self.status_var.set("Copied aggregated list to clipboard.")
 
     def _decryptor_lookup_t2_from_t1(self):
         """Look up T2 products that can be invented from the given T1 blueprint/product."""
@@ -778,6 +972,21 @@ class EVELauncher:
             )
         """)
 
+    def _ensure_invention_recipes_table(self, conn):
+        """Create invention_recipes table if it does not exist (for older DBs)."""
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS invention_recipes (
+                t1_blueprint_type_id INTEGER NOT NULL,
+                t2_blueprint_type_id INTEGER NOT NULL,
+                quantity INTEGER NOT NULL DEFAULT 1,
+                probability REAL,
+                PRIMARY KEY (t1_blueprint_type_id, t2_blueprint_type_id),
+                FOREIGN KEY (t1_blueprint_type_id) REFERENCES items(typeID),
+                FOREIGN KEY (t2_blueprint_type_id) REFERENCES blueprints(blueprintTypeID)
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_invention_t1 ON invention_recipes(t1_blueprint_type_id)")
+
     def _load_datacore_binding_for_product(self, product_name):
         """Load saved datacore binding for the given T2 product name and fill dc1/dc2 vars."""
         if not product_name or not Path(DATABASE_FILE).exists():
@@ -862,6 +1071,8 @@ class EVELauncher:
         try:
             conn = sqlite3.connect(DATABASE_FILE)
             try:
+                # Ensure invention_recipes exists even for databases created before this feature
+                self._ensure_invention_recipes_table(conn)
                 bp1 = resolve_blueprint(conn, t1_name)
                 bp2 = resolve_blueprint(conn, t2_name)
                 if not bp1:
