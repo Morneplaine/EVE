@@ -21,6 +21,13 @@ from calculate_reprocessing_value import (
 from calculate_blueprint_profitability import calculate_blueprint_profitability, resolve_blueprint, get_blueprint_materials
 from decryptor_profitability import compare_decryptor_profitability, DATACORE_NAMES
 from invention_lookup import get_t2_products_from_t1
+from skills_blueprints import (
+    get_unique_skills,
+    get_available_blueprint_ids,
+    run_profitability_analysis,
+    top_n_by_profit,
+    top_n_by_return,
+)
 from update_prices_db import update_prices, update_prices_by_type_ids
 from update_mineral_prices import update_mineral_prices
 from fetch_market_history import (
@@ -37,6 +44,10 @@ DATABASE_FILE = "eve_manufacturing.db"
 MARKET_HISTORY_REGION_ID = 10000002
 # Preferences file for decryptor comparison and other persisted settings
 LAUNCHER_PREFS_FILE = Path(__file__).resolve().parent / "eve_launcher_prefs.json"
+# Persisted shopping list (survives restarts until reset)
+SHOPPING_LIST_FILE = Path(__file__).resolve().parent / "eve_launcher_shopping_list.json"
+# Persisted skill levels (My Skills tab)
+SKILLS_FILE = Path(__file__).resolve().parent / "eve_launcher_skills.json"
 
 from regions_data import REGIONS_BY_NAME, DEFAULT_REGION_NAME, get_region_id_by_name
 
@@ -66,6 +77,7 @@ class EVELauncher:
         self.create_single_blueprint_tab()
         self.create_decryptor_comparison_tab()
         self.create_shopping_list_tab()
+        self.create_skills_blueprints_tab()
         self.create_price_update_tab()
         self.create_exclusions_tab()
         self.create_on_offer_tab()
@@ -79,7 +91,9 @@ class EVELauncher:
         # Store last analysis results for exclusion
         self.last_analysis_results = None
         self.last_analysis_params = None
-        # Shopping list: list of {"product_name": str, "quantity": int}
+        # Last single-blueprint calculation result (for shopping list profit when adding from Single Blueprint tab)
+        self.last_single_blueprint_result = None
+        # Shopping list: list of {"product_name": str, "quantity": int, "profit": float|None}
         self.shopping_list = []
         
         # Status bar
@@ -483,7 +497,9 @@ class EVELauncher:
                 if "error" in result:
                     self.single_blueprint_results.configure(bg=self.single_blueprint_results_default_bg)
                     append(result["error"] + "\n")
+                    self.last_single_blueprint_result = None
                 else:
+                    self.last_single_blueprint_result = result
                     me_pct = result['material_efficiency']  # calculator stores 0–10 as percent
                     append(f"Blueprint / Product: {result['productName']}\n")
                     append(f"Output: {result['output_total_quantity']:,} × {result['productName']}  ({result['number_of_runs']} run(s), ME {me_pct:.0f}%)\n\n")
@@ -529,6 +545,7 @@ class EVELauncher:
                 self.single_blueprint_results.insert(tk.END, f"Error: {str(e)}\n")
                 self.single_blueprint_results.configure(bg=self.single_blueprint_results_default_bg)
                 self.status_var.set("Error occurred")
+                self.last_single_blueprint_result = None
         threading.Thread(target=run, daemon=True).start()
     
     def fetch_blueprint_data(self):
@@ -687,11 +704,11 @@ class EVELauncher:
         self.notebook.add(frame, text="Shopping list")
         top = ttk.LabelFrame(frame, text="Blueprints in list", padding=10)
         top.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
-        cols = ("Blueprint / Product", "Quantity")
+        cols = ("Blueprint / Product", "BPC", "Total runs", "Profit (ISK)")
         self.shopping_list_tree = ttk.Treeview(top, columns=cols, show="headings", height=10, selectmode="browse")
         for c in cols:
             self.shopping_list_tree.heading(c, text=c)
-            self.shopping_list_tree.column(c, width=200, stretch=True)
+            self.shopping_list_tree.column(c, width=140, stretch=True)
         scroll_tree = ttk.Scrollbar(top, orient=tk.VERTICAL, command=self.shopping_list_tree.yview)
         self.shopping_list_tree.configure(yscrollcommand=scroll_tree.set)
         self.shopping_list_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
@@ -699,12 +716,13 @@ class EVELauncher:
         self.shopping_list_tree.bind("<<TreeviewSelect>>", self._on_shopping_list_selection)
         btn_row1 = ttk.Frame(top)
         btn_row1.pack(fill=tk.X, pady=5)
-        ttk.Label(btn_row1, text="Quantity for selected:").pack(side=tk.LEFT, padx=5)
+        ttk.Label(btn_row1, text="BPC (blueprint count) for selected:").pack(side=tk.LEFT, padx=5)
         self.shopping_list_qty_var = tk.StringVar(value="1")
         self.shopping_list_qty_entry = ttk.Entry(btn_row1, textvariable=self.shopping_list_qty_var, width=8)
         self.shopping_list_qty_entry.pack(side=tk.LEFT, padx=2)
         ttk.Button(btn_row1, text="Update quantity", command=self._shopping_list_update_quantity).pack(side=tk.LEFT, padx=5)
         ttk.Button(btn_row1, text="Remove selected", command=self._shopping_list_remove_selected).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_row1, text="Copy plan to clipboard", command=self._shopping_list_copy_plan_to_clipboard).pack(side=tk.LEFT, padx=5)
         agg_frame = ttk.LabelFrame(frame, text="Items required for manufacturing (aggregated)", padding=10)
         agg_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
         self.shopping_list_aggregate_text = scrolledtext.ScrolledText(agg_frame, wrap=tk.WORD, height=14, state=tk.DISABLED)
@@ -713,32 +731,328 @@ class EVELauncher:
         btn_row2.pack(fill=tk.X, pady=5)
         ttk.Button(btn_row2, text="Copy to clipboard", command=self._shopping_list_copy_to_clipboard).pack(side=tk.LEFT, padx=5)
         ttk.Button(btn_row2, text="Refresh list", command=self._refresh_shopping_list_aggregate).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_row2, text="Reset list (clear and save)", command=self._shopping_list_reset).pack(side=tk.LEFT, padx=5)
+        # Inventory paste: compare with aggregated list to show shortfall
+        inv_frame = ttk.LabelFrame(frame, text="Your inventory (paste item names and quantities; one per line, e.g. 'Tritanium 5000' or 'Tritanium\t5000')", padding=8)
+        inv_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
+        self.shopping_list_inventory_text = scrolledtext.ScrolledText(inv_frame, wrap=tk.WORD, height=6, state=tk.NORMAL)
+        self.shopping_list_inventory_text.pack(fill=tk.BOTH, expand=True)
+        inv_btn_row = ttk.Frame(inv_frame)
+        inv_btn_row.pack(fill=tk.X, pady=4)
+        ttk.Button(inv_btn_row, text="Compare: show shortfall (need − have)", command=self._shopping_list_compare_inventory).pack(side=tk.LEFT, padx=5)
+        shortfall_frame = ttk.LabelFrame(frame, text="Still need to get (required minus in inventory)", padding=8)
+        shortfall_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
+        self.shopping_list_shortfall_text = scrolledtext.ScrolledText(shortfall_frame, wrap=tk.WORD, height=8, state=tk.DISABLED)
+        self.shopping_list_shortfall_text.pack(fill=tk.BOTH, expand=True)
+        self._load_shopping_list()
+
+    def create_skills_blueprints_tab(self):
+        """Tab: select your skill levels, then run analysis for top 20 by profit and by return %. T1=10%% ME, T2=0%% ME."""
+        frame = ttk.Frame(self.notebook)
+        self.notebook.add(frame, text="My Skills")
+        self.skills_analysis_status_var = tk.StringVar(value="Set your skill levels and click Run analysis.")
+        # Skills panel: scrollable list of (skill name, level 0-5)
+        skills_frame = ttk.LabelFrame(frame, text="Your skill levels (0 = none, 1–5 = level)", padding=8)
+        skills_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=6)
+        skills_inner = ttk.Frame(skills_frame)
+        skills_inner.pack(fill=tk.BOTH, expand=True)
+        self.skills_canvas = tk.Canvas(skills_inner, highlightthickness=0)
+        scrollbar_skills = ttk.Scrollbar(skills_inner, orient=tk.VERTICAL, command=self.skills_canvas.yview)
+        self.skills_table_frame = ttk.Frame(self.skills_canvas)
+        self.skills_table_frame.bind(
+            "<Configure>",
+            lambda e: self.skills_canvas.configure(scrollregion=self.skills_canvas.bbox("all")),
+        )
+        self.skills_canvas.create_window((0, 0), window=self.skills_table_frame, anchor=tk.NW)
+        self.skills_canvas.configure(yscrollcommand=scrollbar_skills.set)
+        self.skills_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scrollbar_skills.pack(side=tk.RIGHT, fill=tk.Y)
+        self.skills_level_vars = {}  # skillID -> IntVar(0..5)
+        self._skills_blueprints_fill_skills()
+        btn_refresh_skills = ttk.Button(skills_frame, text="Refresh skills from DB", command=self._skills_blueprints_fill_skills)
+        btn_refresh_skills.pack(pady=4)
+        # Price settings
+        price_frame = ttk.LabelFrame(frame, text="Price and system cost (used for analysis)", padding=8)
+        price_frame.pack(fill=tk.X, padx=10, pady=6)
+        row = ttk.Frame(price_frame)
+        row.pack(fill=tk.X)
+        ttk.Label(row, text="Input price:").pack(side=tk.LEFT, padx=(0, 4))
+        self.skills_input_price_var = tk.StringVar(value="buy_immediate")
+        ttk.Combobox(row, textvariable=self.skills_input_price_var, values=["buy_immediate", "buy_offer"], state="readonly", width=14).pack(side=tk.LEFT, padx=(0, 12))
+        ttk.Label(row, text="Output price:").pack(side=tk.LEFT, padx=(0, 4))
+        self.skills_output_price_var = tk.StringVar(value="sell_immediate")
+        ttk.Combobox(row, textvariable=self.skills_output_price_var, values=["sell_immediate", "sell_offer"], state="readonly", width=14).pack(side=tk.LEFT, padx=(0, 12))
+        ttk.Label(row, text="System cost %:").pack(side=tk.LEFT, padx=(0, 4))
+        self.skills_system_cost_var = tk.StringVar(value="8.61")
+        ttk.Entry(row, textvariable=self.skills_system_cost_var, width=8).pack(side=tk.LEFT)
+        # Run button
+        run_row = ttk.Frame(frame)
+        run_row.pack(fill=tk.X, padx=10, pady=6)
+        ttk.Button(run_row, text="Run analysis (top 20 by ISK and by return %)", command=self._run_skills_blueprints_analysis).pack(side=tk.LEFT, padx=5)
+        ttk.Label(run_row, textvariable=self.skills_analysis_status_var).pack(side=tk.LEFT, padx=10)
+        # Results: two tables
+        results_frame = ttk.Frame(frame)
+        results_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=6)
+        left = ttk.LabelFrame(results_frame, text="Top 20 by profit (ISK)", padding=6)
+        left.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 4))
+        cols = ("Product", "Profit (ISK)", "Return %", "ME")
+        self.skills_top_profit_tree = ttk.Treeview(left, columns=cols, show="headings", height=12)
+        for c in cols:
+            self.skills_top_profit_tree.heading(c, text=c)
+            self.skills_top_profit_tree.column(c, width=120, stretch=True)
+        scroll_left = ttk.Scrollbar(left, orient=tk.VERTICAL, command=self.skills_top_profit_tree.yview)
+        scroll_left.pack(side=tk.RIGHT, fill=tk.Y)
+        self.skills_top_profit_tree.configure(yscrollcommand=scroll_left.set)
+        self.skills_top_profit_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        right = ttk.LabelFrame(results_frame, text="Top 20 by return %", padding=6)
+        right.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(4, 0))
+        self.skills_top_return_tree = ttk.Treeview(right, columns=cols, show="headings", height=12)
+        for c in cols:
+            self.skills_top_return_tree.heading(c, text=c)
+            self.skills_top_return_tree.column(c, width=120, stretch=True)
+        scroll_right = ttk.Scrollbar(right, orient=tk.VERTICAL, command=self.skills_top_return_tree.yview)
+        scroll_right.pack(side=tk.RIGHT, fill=tk.Y)
+        self.skills_top_return_tree.configure(yscrollcommand=scroll_right.set)
+        self.skills_top_return_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+    def _load_skills_prefs(self):
+        """Load saved skill levels from JSON. Returns dict skillID (int) -> level (0-5)."""
+        if not SKILLS_FILE.exists():
+            return {}
+        try:
+            with open(SKILLS_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if not isinstance(data, dict):
+                return {}
+            return {int(k): max(0, min(5, int(v))) for k, v in data.items() if str(k).isdigit() and isinstance(v, (int, float))}
+        except Exception:
+            return {}
+
+    def _save_skills_prefs(self):
+        """Save current skill levels to JSON so they persist across sessions."""
+        if not getattr(self, "skills_level_vars", None):
+            return
+        try:
+            data = {}
+            for sid, var in self.skills_level_vars.items():
+                try:
+                    data[str(sid)] = max(0, min(5, int(var.get())))
+                except (ValueError, tk.TclError):
+                    data[str(sid)] = 0
+            with open(SKILLS_FILE, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2)
+        except Exception:
+            pass
+
+    def _skills_blueprints_fill_skills(self):
+        """Load unique skills from DB and fill the skills table with level spinboxes; restore saved levels from file."""
+        for w in self.skills_table_frame.winfo_children():
+            w.destroy()
+        self.skills_level_vars.clear()
+        saved = self._load_skills_prefs()
+        if not Path(DATABASE_FILE).exists():
+            ttk.Label(self.skills_table_frame, text="Database not found. Run Fetch blueprint data first.").pack(anchor=tk.W)
+            return
+        conn = sqlite3.connect(DATABASE_FILE)
+        try:
+            skills = get_unique_skills(conn)
+        finally:
+            conn.close()
+        if not skills:
+            ttk.Label(self.skills_table_frame, text="No skills in manufacturing_skills. Run Fetch blueprint data (SDE) in Single Blueprint tab.").pack(anchor=tk.W)
+            return
+        for s in skills:
+            sid, name = s["skillID"], s["skillName"]
+            row_f = ttk.Frame(self.skills_table_frame)
+            row_f.pack(fill=tk.X, pady=1)
+            ttk.Label(row_f, text=name, width=36, anchor=tk.W).pack(side=tk.LEFT, padx=(0, 8))
+            default = saved.get(sid, 0)
+            var = tk.IntVar(value=default)
+            self.skills_level_vars[sid] = var
+            sb = ttk.Spinbox(row_f, from_=0, to=5, width=4, textvariable=var)
+            sb.pack(side=tk.LEFT)
+        self.skills_analysis_status_var.set(f"Loaded {len(skills)} skills (levels restored from file). Set levels and click Run analysis.")
+
+    def _run_skills_blueprints_analysis(self):
+        """Gather skill levels, get available blueprints, run profitability, show top 20 by profit and return."""
+        user_levels = {}
+        for sid, var in self.skills_level_vars.items():
+            try:
+                user_levels[sid] = max(0, min(5, int(var.get())))
+            except (ValueError, tk.TclError):
+                user_levels[sid] = 0
+        self._save_skills_prefs()
+        if not Path(DATABASE_FILE).exists():
+            self.skills_analysis_status_var.set("Database not found.")
+            return
+        self.skills_analysis_status_var.set("Running analysis...")
+        for item in self.skills_top_profit_tree.get_children():
+            self.skills_top_profit_tree.delete(item)
+        for item in self.skills_top_return_tree.get_children():
+            self.skills_top_return_tree.delete(item)
+        try:
+            system_pct = self.get_float(self.skills_system_cost_var, 8.61)
+        except (ValueError, tk.TclError):
+            system_pct = 8.61
+        inp = self.skills_input_price_var.get() or "buy_immediate"
+        out = self.skills_output_price_var.get() or "sell_immediate"
+
+        def run():
+            conn = sqlite3.connect(DATABASE_FILE)
+            try:
+                bp_ids = get_available_blueprint_ids(conn, user_levels)
+            finally:
+                conn.close()
+            if not bp_ids:
+                self.root.after(0, lambda: self.skills_analysis_status_var.set("No blueprints match your skills."))
+                return
+            total_bp = len(bp_ids)
+            self.root.after(0, lambda: self.skills_analysis_status_var.set(f"Running analysis... 0/{total_bp} blueprints"))
+
+            def on_progress(current, total):
+                self.root.after(0, lambda c=current, t=total: self.skills_analysis_status_var.set(f"Running analysis... {c}/{t} blueprints"))
+
+            results = run_profitability_analysis(
+                DATABASE_FILE,
+                bp_ids,
+                input_price_type=inp,
+                output_price_type=out,
+                system_cost_percent=system_pct,
+                progress_callback=on_progress,
+            )
+            top_profit = top_n_by_profit(results, 20)
+            top_return = top_n_by_return(results, 20)
+
+            def show():
+                for r in top_profit:
+                    self.skills_top_profit_tree.insert("", tk.END, values=(
+                        r["productName"][:40],
+                        f"{r['profit']:,.0f}",
+                        f"{r['return_percent']:.1f}%",
+                        f"{r['material_efficiency']}%",
+                    ))
+                for r in top_return:
+                    self.skills_top_return_tree.insert("", tk.END, values=(
+                        r["productName"][:40],
+                        f"{r['profit']:,.0f}",
+                        f"{r['return_percent']:.1f}%",
+                        f"{r['material_efficiency']}%",
+                    ))
+                self.skills_analysis_status_var.set(f"Done: {len(results)} blueprints, showing top 20 by profit and by return %.")
+
+            self.root.after(0, show)
+
+        threading.Thread(target=run, daemon=True).start()
 
     def _add_single_blueprint_to_shopping_list(self):
-        """Add current blueprint/product from Single Blueprint tab to the shopping list."""
+        """Add current blueprint/product from Single Blueprint tab: 1 BPC, runs = form's Number of runs; profit if last calculation matches."""
         name = self.blueprint_name_var.get().strip()
         if not name:
             messagebox.showwarning("Shopping list", "Enter a blueprint or product name first.")
             return
         try:
-            qty = max(1, int(self.blueprint_runs_var.get().strip() or "1"))
+            runs = max(1, int(self.blueprint_runs_var.get().strip() or "1"))
         except ValueError:
-            qty = 1
-        self._shopping_list_append(name, qty)
+            runs = 1
+        profit = None
+        last = getattr(self, "last_single_blueprint_result", None)
+        if last and last.get("productName", "").strip() == name:
+            profit = last.get("profit")
+        self._shopping_list_append(name, 1, profit, runs_per_bpc=runs)
 
     def _add_decryptor_to_shopping_list(self):
-        """Add current T2 product from Decryptor comparison tab to the shopping list."""
+        """Add current T2 product from Decryptor comparison tab: 1 BPC, runs per BPC from best decryptor row (so materials = per-run × total runs). Add decryptor too if best uses one."""
         name = self.decryptor_product_var.get().strip()
         if not name:
             messagebox.showwarning("Shopping list", "Enter a T2 blueprint or product name first.")
             return
-        self._shopping_list_append(name, 1)
+        profit_per_bpc = None
+        runs_per_bpc = 1
+        if getattr(self, "_decryptor_comparison_results", None):
+            rows = [r for r in self._decryptor_comparison_results if not r.get("error")]
+            if rows:
+                best = max(rows, key=lambda r: r.get("profit_per_bpc") or -1e99)
+                profit_per_bpc = best.get("profit_per_bpc")
+                runs_per_bpc = max(1, int(best.get("bpc_runs") or 1))
+        self._shopping_list_append(name, 1, profit_per_bpc, runs_per_bpc=runs_per_bpc)
+        # If the best outcome uses a decryptor, add that decryptor too (1 per BPC)
+        if getattr(self, "_decryptor_comparison_results", None):
+            rows = [r for r in self._decryptor_comparison_results if not r.get("error")]
+            if rows:
+                best = max(rows, key=lambda r: r.get("profit_per_bpc") or -1e99)
+                if (best.get("profit_per_bpc") or 0) > 0:
+                    dec_name = (best.get("decryptor_name") or "").strip()
+                    if dec_name and dec_name != "No decryptor":
+                        self._shopping_list_append(dec_name, 1, None, runs_per_bpc=1)
 
-    def _shopping_list_append(self, product_name: str, quantity: int):
-        """Append an entry to the shopping list and refresh the tab."""
-        self.shopping_list.append({"product_name": product_name, "quantity": quantity})
+    def _save_shopping_list(self):
+        """Persist shopping list to JSON so it survives restarts."""
+        try:
+            with open(SHOPPING_LIST_FILE, "w", encoding="utf-8") as f:
+                json.dump(self.shopping_list, f, indent=2)
+        except Exception:
+            pass
+
+    def _load_shopping_list(self):
+        """Load shopping list from JSON if present and refresh tree/aggregate."""
+        if not SHOPPING_LIST_FILE.exists():
+            return
+        try:
+            with open(SHOPPING_LIST_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if not isinstance(data, list):
+                return
+            self.shopping_list.clear()
+            for entry in data:
+                if isinstance(entry, dict) and "product_name" in entry:
+                    qty = entry.get("quantity", 1)
+                    try:
+                        qty = max(1, int(qty))
+                    except (TypeError, ValueError):
+                        qty = 1
+                    profit = entry.get("profit")
+                    if profit is not None:
+                        try:
+                            profit = float(profit)
+                        except (TypeError, ValueError):
+                            profit = None
+                    runs_per_bpc = entry.get("runs_per_bpc")
+                    if runs_per_bpc is not None:
+                        try:
+                            runs_per_bpc = max(1, int(runs_per_bpc))
+                        except (TypeError, ValueError):
+                            runs_per_bpc = 1
+                    else:
+                        runs_per_bpc = 1
+                    self.shopping_list.append({"product_name": entry["product_name"], "quantity": qty, "profit": profit, "runs_per_bpc": runs_per_bpc})
+            self._shopping_list_refresh_tree()
+            self._refresh_shopping_list_aggregate()
+        except Exception:
+            pass
+
+    def _shopping_list_reset(self):
+        """Clear the shopping list, refresh UI, and save empty list (e.g. after procuring items)."""
+        self.shopping_list.clear()
         self._shopping_list_refresh_tree()
         self._refresh_shopping_list_aggregate()
+        self._save_shopping_list()
+        self.status_var.set("Shopping list reset and saved.")
+
+    def _format_shopping_list_profit(self, profit):
+        """Format profit for tree display; profit may be None or a number."""
+        if profit is None:
+            return ""
+        try:
+            return f"{float(profit):,.0f}"
+        except (TypeError, ValueError):
+            return ""
+
+    def _shopping_list_append(self, product_name: str, quantity: int, profit=None, runs_per_bpc=1):
+        """Append an entry to the shopping list. quantity = BPC count; runs_per_bpc = runs per BPC (manufacturing materials scale by total_runs = quantity * runs_per_bpc; datacores/decryptors scale by quantity)."""
+        self.shopping_list.append({"product_name": product_name, "quantity": quantity, "profit": profit, "runs_per_bpc": max(1, int(runs_per_bpc))})
+        self._shopping_list_refresh_tree()
+        self._refresh_shopping_list_aggregate()
+        self._save_shopping_list()
         # Switch to Shopping list tab
         for i in range(self.notebook.index("end")):
             if self.notebook.tab(i, "text") == "Shopping list":
@@ -747,11 +1061,15 @@ class EVELauncher:
         self.status_var.set(f"Added {product_name} x{quantity} to shopping list.")
 
     def _shopping_list_refresh_tree(self):
-        """Rebuild the Treeview from self.shopping_list."""
+        """Rebuild the Treeview from self.shopping_list. Columns: Product, BPC, Total runs, Profit."""
         for item in self.shopping_list_tree.get_children():
             self.shopping_list_tree.delete(item)
         for entry in self.shopping_list:
-            self.shopping_list_tree.insert("", tk.END, values=(entry["product_name"], entry["quantity"]))
+            bpc = entry["quantity"]
+            runs_per_bpc = max(1, int(entry.get("runs_per_bpc") or 1))
+            total_runs = bpc * runs_per_bpc
+            profit_str = self._format_shopping_list_profit(entry.get("profit"))
+            self.shopping_list_tree.insert("", tk.END, values=(entry["product_name"], bpc, total_runs, profit_str))
 
     def _on_shopping_list_selection(self, event=None):
         """When user selects a row, fill quantity entry with that row's quantity."""
@@ -761,7 +1079,8 @@ class EVELauncher:
         item = sel[0]
         vals = self.shopping_list_tree.item(item, "values")
         if vals and len(vals) >= 2:
-            self.shopping_list_qty_var.set(str(vals[1]))
+            self.shopping_list_qty_var.set(str(vals[1]))  # BPC
+        # vals[2] = Total runs, vals[3] = Profit (read-only)
 
     def _shopping_list_update_quantity(self):
         """Set quantity of the selected row from the quantity entry."""
@@ -784,8 +1103,12 @@ class EVELauncher:
             return
         self.shopping_list[idx]["quantity"] = qty
         product_name = self.shopping_list[idx]["product_name"]
-        self.shopping_list_tree.item(item, values=(product_name, qty))
+        runs_per_bpc = max(1, int(self.shopping_list[idx].get("runs_per_bpc") or 1))
+        total_runs = qty * runs_per_bpc
+        profit_str = self._format_shopping_list_profit(self.shopping_list[idx].get("profit"))
+        self.shopping_list_tree.item(item, values=(product_name, qty, total_runs, profit_str))
         self._refresh_shopping_list_aggregate()
+        self._save_shopping_list()
         self.status_var.set(f"Quantity updated to {qty}.")
 
     def _shopping_list_remove_selected(self):
@@ -804,12 +1127,14 @@ class EVELauncher:
             self.shopping_list.pop(idx)
         self._shopping_list_refresh_tree()
         self._refresh_shopping_list_aggregate()
+        self._save_shopping_list()
         self.status_var.set("Removed from shopping list.")
 
     def _refresh_shopping_list_aggregate(self):
-        """Compute aggregated materials (and datacores) from shopping_list and update the text."""
+        """Compute aggregated materials (and datacores) from shopping_list and update the text. Stores result in self.shopping_list_aggregated for inventory comparison."""
         self.shopping_list_aggregate_text.configure(state=tk.NORMAL)
         self.shopping_list_aggregate_text.delete(1.0, tk.END)
+        self.shopping_list_aggregated = None
         if not self.shopping_list:
             self.shopping_list_aggregate_text.insert(tk.END, "Add blueprints from Single Blueprint or Decryptor comparison, then set quantities. This list will show required materials and datacores (if bound).")
             self.shopping_list_aggregate_text.configure(state=tk.DISABLED)
@@ -825,15 +1150,19 @@ class EVELauncher:
                 self._ensure_blueprint_datacore_bindings_table(conn)
                 for entry in self.shopping_list:
                     name = entry["product_name"]
-                    qty = max(1, int(entry["quantity"]))
+                    bpc_count = max(1, int(entry["quantity"]))
+                    runs_per_bpc = max(1, int(entry.get("runs_per_bpc") or 1))
+                    total_runs = bpc_count * runs_per_bpc
                     bp = resolve_blueprint(conn, name)
                     if not bp:
+                        # Not a blueprint (e.g. decryptor): add as direct item (per BPC/copy)
+                        aggregated[name] = aggregated.get(name, 0) + bpc_count
                         continue
                     bid = bp["blueprintTypeID"]
                     materials = get_blueprint_materials(conn, bid)
                     for m in materials:
                         mat_name = m["materialName"]
-                        need = m["quantity"] * qty
+                        need = m["quantity"] * total_runs
                         aggregated[mat_name] = aggregated.get(mat_name, 0) + need
                     row = conn.execute(
                         "SELECT dc1_name, dc1_qty, dc2_name, dc2_qty FROM blueprint_datacore_bindings WHERE blueprint_type_id = ?",
@@ -842,20 +1171,110 @@ class EVELauncher:
                     if row:
                         dc1_name, dc1_qty, dc2_name, dc2_qty = row
                         if dc1_name and dc1_qty:
-                            aggregated[dc1_name] = aggregated.get(dc1_name, 0) + (dc1_qty or 0) * qty
+                            aggregated[dc1_name] = aggregated.get(dc1_name, 0) + (dc1_qty or 0) * bpc_count
                         if dc2_name and dc2_qty:
-                            aggregated[dc2_name] = aggregated.get(dc2_name, 0) + (dc2_qty or 0) * qty
+                            aggregated[dc2_name] = aggregated.get(dc2_name, 0) + (dc2_qty or 0) * bpc_count
             finally:
                 conn.close()
         except Exception as e:
             self.shopping_list_aggregate_text.insert(tk.END, f"Error: {e}")
             self.shopping_list_aggregate_text.configure(state=tk.DISABLED)
             return
+        self.shopping_list_aggregated = aggregated
         lines = []
         for name in sorted(aggregated.keys()):
             lines.append(f"{name}\t{aggregated[name]:,}")
         self.shopping_list_aggregate_text.insert(tk.END, "\n".join(lines) if lines else "No materials resolved.")
         self.shopping_list_aggregate_text.configure(state=tk.DISABLED)
+
+    def _parse_inventory_paste(self, text):
+        """Parse pasted inventory text into dict item_name -> quantity. Handles 'Name\\tQty', 'Name Qty', 'Qty Name'."""
+        import re
+        inventory = {}
+        for line in text.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            # Tab-separated: "Name\t1234" or "1234\tName"
+            if "\t" in line:
+                parts = [p.strip() for p in line.split("\t", 1)]
+                if len(parts) == 2:
+                    a, b = parts
+                    try:
+                        qty = int(a.replace(",", ""))
+                        name = b
+                    except ValueError:
+                        try:
+                            qty = int(b.replace(",", ""))
+                            name = a
+                        except ValueError:
+                            continue
+                    if name:
+                        inventory[name] = inventory.get(name, 0) + qty
+                continue
+            # Space-separated: find a number (with optional commas)
+            parts = re.split(r"\s+", line)
+            if not parts:
+                continue
+            qty = None
+            name_parts = []
+            for i, p in enumerate(parts):
+                try:
+                    qty = int(p.replace(",", ""))
+                    name_parts = parts[:i] + parts[i + 1:]
+                    break
+                except ValueError:
+                    pass
+            if qty is not None and name_parts:
+                name = " ".join(name_parts).strip()
+                if name:
+                    inventory[name] = inventory.get(name, 0) + qty
+        return inventory
+
+    def _normalize_inventory_key(self, name, required_keys):
+        """Match pasted item name to an aggregated key (exact or case-insensitive)."""
+        name = (name or "").strip()
+        if name in required_keys:
+            return name
+        lower = name.lower()
+        for k in required_keys:
+            if k.lower() == lower:
+                return k
+        return name
+
+    def _shopping_list_compare_inventory(self):
+        """Parse pasted inventory, compare to aggregated requirements, show shortfall (need − have) in the shortfall text."""
+        self.shopping_list_shortfall_text.configure(state=tk.NORMAL)
+        self.shopping_list_shortfall_text.delete(1.0, tk.END)
+        if not getattr(self, "shopping_list_aggregated", None):
+            self._refresh_shopping_list_aggregate()
+        aggregated = getattr(self, "shopping_list_aggregated", None) or {}
+        if not aggregated:
+            self.shopping_list_shortfall_text.insert(tk.END, "No required items (add blueprints and refresh list first).")
+            self.shopping_list_shortfall_text.configure(state=tk.DISABLED)
+            return
+        raw = self.shopping_list_inventory_text.get(1.0, tk.END)
+        inventory = self._parse_inventory_paste(raw)
+        # Build inventory by normalized key (match to aggregated keys)
+        have_by_key = {}
+        for pasted_name, qty in inventory.items():
+            key = self._normalize_inventory_key(pasted_name, set(aggregated.keys()))
+            if key in aggregated:
+                have_by_key[key] = have_by_key.get(key, 0) + qty
+        shortfall = {}
+        for name, need in aggregated.items():
+            have = have_by_key.get(name, 0)
+            if need > have:
+                shortfall[name] = need - have
+        if not shortfall:
+            self.shopping_list_shortfall_text.insert(tk.END, "You have everything. No shortfall.")
+        else:
+            lines = []
+            for name in sorted(shortfall.keys()):
+                lines.append(f"{name}\t{shortfall[name]:,}")
+            self.shopping_list_shortfall_text.insert(tk.END, "\n".join(lines))
+        self.shopping_list_shortfall_text.configure(state=tk.DISABLED)
+        self.status_var.set("Shortfall updated (required − pasted inventory).")
 
     def _shopping_list_copy_to_clipboard(self):
         """Copy the aggregated materials text to the clipboard."""
@@ -869,6 +1288,23 @@ class EVELauncher:
         self.root.clipboard_clear()
         self.root.clipboard_append(text)
         self.status_var.set("Copied aggregated list to clipboard.")
+
+    def _shopping_list_copy_plan_to_clipboard(self):
+        """Copy the blueprint/BPC/runs table (the plan) to the clipboard as tab-separated lines for reference."""
+        if not self.shopping_list:
+            messagebox.showinfo("Copy plan", "Shopping list is empty.")
+            return
+        lines = ["Blueprint / Product\tBPC\tTotal runs\tProfit (ISK)"]
+        for entry in self.shopping_list:
+            bpc = entry["quantity"]
+            runs_per_bpc = max(1, int(entry.get("runs_per_bpc") or 1))
+            total_runs = bpc * runs_per_bpc
+            profit_str = self._format_shopping_list_profit(entry.get("profit")) or ""
+            lines.append(f"{entry['product_name']}\t{bpc}\t{total_runs}\t{profit_str}")
+        text = "\n".join(lines)
+        self.root.clipboard_clear()
+        self.root.clipboard_append(text)
+        self.status_var.set("Copied plan (blueprint table) to clipboard.")
 
     def _decryptor_lookup_t2_from_t1(self):
         """Look up T2 products that can be invented from the given T1 blueprint/product."""
@@ -959,7 +1395,7 @@ class EVELauncher:
             pass
 
     def _ensure_blueprint_datacore_bindings_table(self, conn):
-        """Create blueprint_datacore_bindings table if it does not exist (for DBs created before schema had it)."""
+        """Create blueprint_datacore_bindings table if it does not exist; add columns for chance/cost/runs if missing."""
         conn.execute("""
             CREATE TABLE IF NOT EXISTS blueprint_datacore_bindings (
                 blueprint_type_id INTEGER PRIMARY KEY,
@@ -971,6 +1407,15 @@ class EVELauncher:
                 FOREIGN KEY (blueprint_type_id) REFERENCES blueprints(blueprintTypeID)
             )
         """)
+        cur = conn.execute("PRAGMA table_info(blueprint_datacore_bindings)")
+        cols = [row[1] for row in cur.fetchall()]
+        for col, typ in [
+            ("base_invention_chance_pct", "REAL"),
+            ("invention_cost_per_attempt", "REAL"),
+            ("base_bpc_runs", "INTEGER"),
+        ]:
+            if col not in cols:
+                conn.execute(f"ALTER TABLE blueprint_datacore_bindings ADD COLUMN {col} {typ}")
 
     def _ensure_invention_recipes_table(self, conn):
         """Create invention_recipes table if it does not exist (for older DBs)."""
@@ -988,7 +1433,7 @@ class EVELauncher:
         conn.execute("CREATE INDEX IF NOT EXISTS idx_invention_t1 ON invention_recipes(t1_blueprint_type_id)")
 
     def _load_datacore_binding_for_product(self, product_name):
-        """Load saved datacore binding for the given T2 product name and fill dc1/dc2 vars."""
+        """Load saved datacore binding and invention params (chance, cost, base runs) for the given T2 product."""
         if not product_name or not Path(DATABASE_FILE).exists():
             return
         try:
@@ -1000,26 +1445,34 @@ class EVELauncher:
                     return
                 blueprint_type_id = bp["blueprintTypeID"]
                 row = conn.execute(
-                    "SELECT dc1_name, dc1_qty, dc2_name, dc2_qty FROM blueprint_datacore_bindings WHERE blueprint_type_id = ?",
+                    """SELECT dc1_name, dc1_qty, dc2_name, dc2_qty,
+                              base_invention_chance_pct, invention_cost_per_attempt, base_bpc_runs
+                       FROM blueprint_datacore_bindings WHERE blueprint_type_id = ?""",
                     (blueprint_type_id,),
                 ).fetchone()
                 if not row:
                     return
-                dc1_name, dc1_qty, dc2_name, dc2_qty = row
+                dc1_name, dc1_qty, dc2_name, dc2_qty = row[0], row[1], row[2], row[3]
                 if dc1_name and dc1_name in DATACORE_NAMES:
                     self.decryptor_dc1_name_var.set(dc1_name)
                 self.decryptor_dc1_qty_var.set(str(int(dc1_qty or 0)))
                 if dc2_name and dc2_name in DATACORE_NAMES:
                     self.decryptor_dc2_name_var.set(dc2_name)
                 self.decryptor_dc2_qty_var.set(str(int(dc2_qty or 0)))
-                self.status_var.set(f"Loaded saved datacore binding for {product_name}.")
+                if len(row) > 4 and row[4] is not None:
+                    self.decryptor_base_chance_var.set(str(row[4]))
+                if len(row) > 5 and row[5] is not None:
+                    self.decryptor_inv_cost_var.set(str(int(row[5])))
+                if len(row) > 6 and row[6] is not None:
+                    self.decryptor_base_runs_var.set(str(int(row[6])))
+                self.status_var.set(f"Loaded saved binding for {product_name} (datacores, chance, cost, runs).")
             finally:
                 conn.close()
         except Exception:
             pass
 
     def _bind_datacores_to_blueprint(self):
-        """Save current datacore 1/2 and quantities to the current T2 product (bind to blueprint)."""
+        """Save current datacores, base chance %, invention cost, and base BPC runs to the current T2 product (bind to blueprint)."""
         product_name = self.decryptor_product_var.get().strip()
         if not product_name:
             messagebox.showwarning("Bind datacores", "Enter a T2 blueprint or product name first.")
@@ -1046,13 +1499,18 @@ class EVELauncher:
                     dc2_qty = int(self.decryptor_dc2_qty_var.get() or "0")
                 except ValueError:
                     dc2_qty = 0
+                base_chance = self.get_float(self.decryptor_base_chance_var, 40.0)
+                inv_cost = self.get_float(self.decryptor_inv_cost_var, 0.0)
+                base_runs = self.get_float(self.decryptor_base_runs_var, 10.0)
+                base_runs = 1 if base_runs == 1 else 10
                 conn.execute("""
                     INSERT OR REPLACE INTO blueprint_datacore_bindings
-                    (blueprint_type_id, dc1_name, dc1_qty, dc2_name, dc2_qty, updated_at)
-                    VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-                """, (blueprint_type_id, dc1_name or None, dc1_qty, dc2_name or None, dc2_qty))
+                    (blueprint_type_id, dc1_name, dc1_qty, dc2_name, dc2_qty,
+                     base_invention_chance_pct, invention_cost_per_attempt, base_bpc_runs, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                """, (blueprint_type_id, dc1_name or None, dc1_qty, dc2_name or None, dc2_qty, base_chance, inv_cost, int(base_runs)))
                 conn.commit()
-                self.status_var.set(f"Datacores bound to {product_name}. They will auto-load next time you use this blueprint.")
+                self.status_var.set(f"Binding saved for {product_name} (datacores, chance %, cost, runs).")
             finally:
                 conn.close()
         except Exception as e:
@@ -1436,6 +1894,8 @@ for one search may still appear in searches with different parameters.
         
         # Tag for rows where buy price >= 85% of breakeven max (light red background)
         self.on_offer_tree.tag_configure('high_buy_near_breakeven', background='#ffcccc')
+        # Darker red when sell_min is above breakeven max (buy order) — above breakeven
+        self.on_offer_tree.tag_configure('sell_above_breakeven', background='#cc6666')
         
         # Scrollbar
         scrollbar = ttk.Scrollbar(table_frame, orient=tk.VERTICAL, command=self.on_offer_tree.yview)
@@ -3331,10 +3791,12 @@ for one search may still appear in searches with different parameters.
                         else:
                             breakeven_immediate = "N/A"
                     
-                    # Light red row if buy price >= 85% of breakeven max (Buy Order)
+                    # Darker red if sell_min > breakeven max (buy order); else light red if buy >= 85% of breakeven
                     row_tags = ()
-                    if buy_max > 0 and breakeven_raw_buy is not None and breakeven_raw_buy > 0:
-                        if buy_max >= 0.85 * breakeven_raw_buy:
+                    if breakeven_raw_buy is not None and breakeven_raw_buy > 0:
+                        if sell_min > breakeven_raw_buy:
+                            row_tags = ('sell_above_breakeven',)
+                        elif buy_max > 0 and buy_max >= 0.85 * breakeven_raw_buy:
                             row_tags = ('high_buy_near_breakeven',)
                     
                     # Insert into treeview (iid = module_type_id for reset)
