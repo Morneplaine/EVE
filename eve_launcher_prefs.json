@@ -1,9 +1,9 @@
 {
   "decryptor_comparison": {
-    "inv_cost": "3648",
-    "dc1_name": "Datacore - Electronic Engineering",
+    "inv_cost": "3367",
+    "dc1_name": "Datacore - Nuclear Physics",
     "dc1_qty": "1",
-    "dc2_name": "Datacore - Rocket Science",
+    "dc2_name": "Datacore - Mechanical Engineering",
     "dc2_qty": "1"
   }
 }

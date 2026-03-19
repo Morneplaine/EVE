@@ -49,22 +49,44 @@ def is_t2_blueprint(conn, blueprint_type_id):
     return row is not None
 
 
-def get_available_blueprint_ids(conn, user_skill_levels):
+def get_available_blueprint_ids(conn, user_skill_levels, bp_type_filter="Any"):
     """
     user_skill_levels: dict skillID -> int (0-5, user's level).
     Return list of blueprintTypeID for which the user meets all required skills.
     """
     reqs = get_blueprint_requirements(conn)
+    # Get tech level and faction flags for blueprints
+    cur = conn.execute(
+        "SELECT b.blueprintTypeID, i.techLevel, i.isFaction "
+        "FROM blueprints b JOIN items i ON b.blueprintTypeID = i.typeID"
+    )
+    tech_by_bid = {}
+    for row in cur.fetchall():
+        tech_by_bid[int(row[0])] = (int(row[1] or 0), int(row[2] or 0))
     cur = conn.execute("SELECT blueprintTypeID FROM blueprints")
     all_bp_ids = [row[0] for row in cur.fetchall()]
     available = []
+    f = (bp_type_filter or "Any").strip().lower()
     for bid in all_bp_ids:
         needed = reqs.get(bid, [])
         if not needed:
-            available.append(bid)
+            passes_skills = True
+        else:
+            passes_skills = all(user_skill_levels.get(sid, 0) >= lvl for sid, lvl in needed)
+        if not passes_skills:
             continue
-        if all(user_skill_levels.get(sid, 0) >= lvl for sid, lvl in needed):
-            available.append(bid)
+        tech, is_faction = tech_by_bid.get(int(bid), (0, 0))
+        if f == "t2 only":
+            if tech < 2:
+                continue
+        elif f == "t1 only":
+            if tech != 1 or is_faction:
+                continue
+        elif f == "faction only":
+            if not is_faction:
+                continue
+        # "Any" and unrecognized filters just accept all that pass skills
+        available.append(bid)
     return available
 
 

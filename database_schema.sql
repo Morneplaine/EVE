@@ -1,7 +1,6 @@
 -- EVE Manufacturing Database Schema
 -- SQLite database for storing EVE Online manufacturing data
 
--- Items table: All items in EVE
 CREATE TABLE IF NOT EXISTS items (
     typeID INTEGER PRIMARY KEY,
     typeName TEXT NOT NULL,
@@ -9,6 +8,8 @@ CREATE TABLE IF NOT EXISTS items (
     categoryID INTEGER,
     volume REAL,
     packaged_volume REAL,
+    techLevel INTEGER DEFAULT 0,
+    isFaction INTEGER DEFAULT 0,
     FOREIGN KEY (groupID) REFERENCES groups(groupID)
 );
 

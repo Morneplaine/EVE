@@ -35,6 +35,7 @@ REQUIRED_FILES = [
     "invTypeMaterials.csv.bz2",      # Reprocessing outputs
     "industryActivity.csv.bz2",      # Activity types (manufacturing, etc.)
     "invVolumes.csv.bz2",            # Packaged volumes for items
+    "dgmTypeAttributes.csv.bz2",     # Attributes (for tech level, etc.)
 ]
 
 def download_sde_file(filename, force_update=False):

@@ -511,12 +511,11 @@ def calculate_reprocessing_value(
         
         # Calculate breakeven price (maximum purchase price for 0 profit)
         
-        if total_mineral_value > 0 and input_quantity > 0:
+        if total_mineral_value > 0 and input_quantity > 0 and module_price_before_markup > 0:
             job_income_after_costs = total_mineral_value - reprocessing_cost
             income_per_item = job_income_after_costs / input_quantity
-            cost_factor = module_price_post_transaction_costs/module_price_before_markup
+            cost_factor = module_price_post_transaction_costs / module_price_before_markup
             module_price_breakeven = income_per_item / cost_factor
-
         else:
             module_price_breakeven = "na"
         

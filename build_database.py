@@ -43,6 +43,7 @@ def populate_items_and_groups(conn, sde_data):
     inv_types = sde_data['invTypes']
     inv_groups = sde_data['invGroups']
     inv_volumes = sde_data['invVolumes']
+    dgm_attrs = sde_data.get('dgmTypeAttributes')
     
     # Create volume lookup from invVolumes (preferred - has packaged volumes)
     volume_lookup = {}
@@ -65,24 +66,56 @@ def populate_items_and_groups(conn, sde_data):
                 if type_id not in packaged_volume_lookup or packaged_volume_lookup[type_id] == 0:
                     packaged_volume_lookup[type_id] = inv_types_volume
     
+    # Build tech level lookup from dgmTypeAttributes (attributeID 422)
+    tech_level_lookup = {}
+    if dgm_attrs is not None:
+        try:
+            tech_rows = dgm_attrs[dgm_attrs['attributeID'] == 422]
+            for _, row in tech_rows.iterrows():
+                t_id = int(row['typeID'])
+                # tech level may be in valueInt or valueFloat
+                val = row.get('valueInt')
+                if pd.isna(val):
+                    val = row.get('valueFloat', 0)
+                try:
+                    tech_level_lookup[t_id] = int(val or 0)
+                except Exception:
+                    tech_level_lookup[t_id] = 0
+        except Exception:
+            tech_level_lookup = {}
+    
     # Insert groups
     groups_data = inv_groups[['groupID', 'groupName', 'categoryID']].copy()
     groups_data.to_sql('groups', conn, if_exists='replace', index=False)
     logger.info(f"Inserted {len(groups_data)} groups")
     
-    # Insert items with volumes
+    # Insert items with volumes and tech level / faction flag
     # Note: categoryID is not in invTypes, it's in invGroups, so we merge to get it
     items_data = inv_types[['typeID', 'typeName', 'groupID']].copy()
     
     # Merge with groups to get categoryID
     items_data = items_data.merge(
-        inv_groups[['groupID', 'categoryID']],
+        inv_groups[['groupID', 'categoryID', 'groupName']],
         on='groupID',
         how='left'
     )
     
     items_data['volume'] = items_data['typeID'].map(volume_lookup).fillna(0.0)
     items_data['packaged_volume'] = items_data['typeID'].map(packaged_volume_lookup).fillna(0.0)
+    # Tech level from lookup (default 0)
+    items_data['techLevel'] = items_data['typeID'].map(tech_level_lookup).fillna(0).astype(int)
+    # Heuristic faction flag based on typeName (and optionally groupName) keywords
+    faction_patterns = [
+        ' navy', ' fleet', 'republic fleet', 'federation navy', 'imperial navy',
+        'caldari navy', 'khanid', 'syndicate', 'guristas', 'sansha', 'blood',
+        'angel', 'serpentis', 'mordu', 'ore', 'sisters of eve'
+    ]
+    def _is_faction(name):
+        if not isinstance(name, str):
+            return 0
+        lower = name.lower()
+        return 1 if any(pat in lower for pat in faction_patterns) else 0
+    items_data['isFaction'] = items_data['typeName'].apply(_is_faction)
     items_data.to_sql('items', conn, if_exists='replace', index=False)
     logger.info(f"Inserted {len(items_data)} items")
 
@@ -317,6 +350,47 @@ def main():
         
     except Exception as e:
         logger.error(f"Error building database: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+        raise
+
+
+def rebuild_sde_only():
+    """
+    Rebuild only SDE-derived tables (items, groups, blueprints, manufacturing_*,
+    invention_recipes, reprocessing_outputs) without touching user/ESI data.
+
+    This assumes the database and schema already exist.
+    """
+    logger.info("=" * 60)
+    logger.info("Rebuilding SDE-derived tables (items, blueprints, etc.)")
+    logger.info("=" * 60)
+    if not Path(DB_FILE).exists():
+        logger.info(f"Database {DB_FILE} does not exist yet; running full build instead.")
+        return main()
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        logger.info("Loading SDE data...")
+        sde_data = load_sde_data()
+        populate_items_and_groups(conn, sde_data)
+        populate_blueprints(conn, sde_data)
+        populate_manufacturing_materials(conn, sde_data)
+        populate_manufacturing_skills(conn, sde_data)
+        populate_invention_recipes(conn, sde_data)
+        populate_reprocessing(conn, sde_data)
+        logger.info("Ensuring prices table has entries for all items...")
+        conn.execute("""
+            INSERT OR IGNORE INTO prices (typeID)
+            SELECT typeID FROM items
+        """)
+        conn.commit()
+        conn.close()
+        logger.info("=" * 60)
+        logger.info("SUCCESS! SDE-derived tables rebuilt successfully.")
+        logger.info(f"Database file: {DB_FILE}")
+        logger.info("=" * 60)
+    except Exception as e:
+        logger.error(f"Error rebuilding SDE tables: {e}")
         import traceback
         logger.error(traceback.format_exc())
         raise
