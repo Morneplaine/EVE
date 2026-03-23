@@ -10,6 +10,7 @@ import sys
 import math
 import json
 import sqlite3
+import subprocess
 from pathlib import Path
 
 # Import our modules
@@ -21,8 +22,9 @@ from calculate_reprocessing_value import (
     sell_order_with_fees,
 )
 from calculate_blueprint_profitability import calculate_blueprint_profitability, resolve_blueprint, get_blueprint_materials
-from decryptor_profitability import compare_decryptor_profitability, DATACORE_NAMES
+from decryptor_profitability import compare_decryptor_profitability, DATACORE_NAMES, _estimate_datacore_cost_per_attempt
 from invention_lookup import get_t2_products_from_t1
+from decryptors_data import get_decryptor_by_name
 from skills_blueprints import (
     get_unique_skills,
     get_available_blueprint_ids,
@@ -73,18 +75,22 @@ class EVELauncher:
         self.notebook = ttk.Notebook(root)
         self.notebook.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
         
-        # Create tabs
+        # Shopping list: filled from eve_launcher_shopping_list.json in create_shopping_list_tab (must exist before that runs)
+        self.shopping_list = []
+        
+        # Create tabs (reordered: price update, On Offer, decryptor comparison, Shopping list first; others follow)
+        self.create_price_update_tab()
+        self.create_on_offer_tab()
+        self.create_decryptor_comparison_tab()
+        self.create_shopping_list_tab()
         self.create_analysis_tab()
         self.create_single_module_tab()
         self.create_single_blueprint_tab()
-        self.create_decryptor_comparison_tab()
-        self.create_shopping_list_tab()
         self.create_skills_blueprints_tab()
-        self.create_price_update_tab()
         self.create_exclusions_tab()
-        self.create_on_offer_tab()
         self.create_paste_compare_tab()
         self.create_planning_tab()
+        self.create_market_patterns_tab()
         self.create_sso_sync_tab()
         
         # So analysis tab fields are editable immediately (focus first entry when that tab is shown)
@@ -96,13 +102,20 @@ class EVELauncher:
         self.last_analysis_params = None
         # Last single-blueprint calculation result (for shopping list profit when adding from Single Blueprint tab)
         self.last_single_blueprint_result = None
-        # Shopping list: list of {"product_name": str, "quantity": int, "profit": float|None}
-        self.shopping_list = []
         
         # Status bar
         self.status_var = tk.StringVar(value="Ready")
         status_bar = ttk.Label(root, textvariable=self.status_var, relief=tk.SUNKEN, anchor=tk.W)
         status_bar.pack(side=tk.BOTTOM, fill=tk.X)
+        self.root.protocol("WM_DELETE_WINDOW", self._on_launcher_close)
+    
+    def _on_launcher_close(self):
+        """Save shopping list when closing the app (belt-and-suspenders; list also saves on each edit)."""
+        try:
+            self._save_shopping_list()
+        except Exception:
+            pass
+        self.root.destroy()
     
     def init_exclusion_table(self):
         """Initialize the excluded_modules table in the database"""
@@ -715,16 +728,21 @@ class EVELauncher:
         self.notebook.add(frame, text="Shopping list")
         top = ttk.LabelFrame(frame, text="Blueprints in list", padding=10)
         top.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
-        cols = ("Blueprint / Product", "BPC", "Decryptor", "Total runs", "Total material cost", "Sell immediate", "Sell offer", "Expected profit (buy imm, sell off)", "Profit (ISK)")
+        cols = ("Own BPC", "Blueprint / Product", "BPC", "Decryptor", "Total runs", "Total material cost", "Sell immediate", "Sell offer", "Expected profit (buy imm, sell off)", "Profit (ISK)")
+        self.shopping_list_columns = cols
+        self.shopping_list_sort_column = None
+        self.shopping_list_sort_reverse = False
         self.shopping_list_tree = ttk.Treeview(top, columns=cols, show="headings", height=10, selectmode="browse")
         for c in cols:
-            self.shopping_list_tree.heading(c, text=c)
-            self.shopping_list_tree.column(c, width=120, stretch=True)
+            self.shopping_list_tree.heading(c, text=c, command=lambda col=c: self._shopping_list_sort_by(col))
+            w = 52 if c == "Own BPC" else 120
+            self.shopping_list_tree.column(c, width=w, stretch=(c != "Own BPC"))
         scroll_tree = ttk.Scrollbar(top, orient=tk.VERTICAL, command=self.shopping_list_tree.yview)
         self.shopping_list_tree.configure(yscrollcommand=scroll_tree.set)
         self.shopping_list_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         scroll_tree.pack(side=tk.RIGHT, fill=tk.Y)
         self.shopping_list_tree.bind("<<TreeviewSelect>>", self._on_shopping_list_selection)
+        self.shopping_list_tree.bind("<ButtonRelease-1>", self._shopping_list_toggle_own_bpc_click)
         btn_row1 = ttk.Frame(top)
         btn_row1.pack(fill=tk.X, pady=5)
         ttk.Label(btn_row1, text="BPC (blueprint count) for selected:").pack(side=tk.LEFT, padx=5)
@@ -734,6 +752,15 @@ class EVELauncher:
         ttk.Button(btn_row1, text="Update quantity", command=self._shopping_list_update_quantity).pack(side=tk.LEFT, padx=5)
         ttk.Button(btn_row1, text="Remove selected", command=self._shopping_list_remove_selected).pack(side=tk.LEFT, padx=5)
         ttk.Button(btn_row1, text="Copy plan to clipboard", command=self._shopping_list_copy_plan_to_clipboard).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_row1, text="Refresh profitability", command=self._shopping_list_refresh_profitability).pack(side=tk.LEFT, padx=5)
+        ttk.Label(
+            top,
+            text="Own BPC: click [ ] / [x] if you already have a researched copy (no invention). Removes datacores/decryptors from required items and adds expected datacore ISK back into Profit (ISK). "
+                 "Click any column header to sort (click again to reverse). Refresh profitability recalculates profit, decryptor choice, success %, and datacore cost from current database prices (update prices in the Prices tab first for live market data). "
+                 "Expected profit / material cost use the same T2 BPC ME as your decryptor row when known; Profit (ISK) is manufacturing minus expected invention cost per BPC.",
+            wraplength=720,
+            justify=tk.LEFT,
+        ).pack(fill=tk.X, anchor=tk.W, pady=(0, 4))
         agg_frame = ttk.LabelFrame(frame, text="Items required for manufacturing (aggregated)", padding=10)
         agg_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
         self.shopping_list_aggregate_text = scrolledtext.ScrolledText(agg_frame, wrap=tk.WORD, height=14, state=tk.DISABLED)
@@ -1004,29 +1031,51 @@ class EVELauncher:
         self._shopping_list_append(name, 1, profit, runs_per_bpc=runs)
 
     def _add_decryptor_to_shopping_list(self):
-        """Add current T2 product from Decryptor comparison tab: 1 BPC, runs per BPC from best decryptor row (so materials = per-run × total runs). Add decryptor too if best uses one."""
+        """Add current T2 product from Decryptor comparison: one row with optional decryptor; invention success prob for datacore/decryptor scaling."""
         name = self.decryptor_product_var.get().strip()
         if not name:
             messagebox.showwarning("Shopping list", "Enter a T2 blueprint or product name first.")
             return
         profit_per_bpc = None
         runs_per_bpc = 1
+        entry = {"product_name": name, "quantity": 1, "profit": None, "runs_per_bpc": 1}
         if getattr(self, "_decryptor_comparison_results", None):
             rows = [r for r in self._decryptor_comparison_results if not r.get("error")]
             if rows:
                 best = max(rows, key=lambda r: r.get("profit_per_bpc") or -1e99)
                 profit_per_bpc = best.get("profit_per_bpc")
                 runs_per_bpc = max(1, int(best.get("bpc_runs") or 1))
-        self._shopping_list_append(name, 1, profit_per_bpc, runs_per_bpc=runs_per_bpc)
-        # If the best outcome uses a decryptor, add that decryptor too (1 per BPC)
-        if getattr(self, "_decryptor_comparison_results", None):
-            rows = [r for r in self._decryptor_comparison_results if not r.get("error")]
-            if rows:
-                best = max(rows, key=lambda r: r.get("profit_per_bpc") or -1e99)
-                if (best.get("profit_per_bpc") or 0) > 0:
-                    dec_name = (best.get("decryptor_name") or "").strip()
-                    if dec_name and dec_name != "No decryptor":
-                        self._shopping_list_append(dec_name, 1, None, runs_per_bpc=1)
+                entry["profit"] = profit_per_bpc
+                entry["runs_per_bpc"] = runs_per_bpc
+                sp = best.get("success_prob_pct")
+                if sp is not None:
+                    try:
+                        p = float(sp) / 100.0
+                        if 0 < p <= 1.0:
+                            entry["invention_success_prob"] = p
+                    except (TypeError, ValueError):
+                        pass
+                dec_name = (best.get("decryptor_name") or "").strip()
+                if dec_name and dec_name != "No decryptor":
+                    dinfo = get_decryptor_by_name(dec_name)
+                    if dinfo:
+                        entry["decryptor_name"] = dinfo[0]
+                        entry["decryptor_type_id"] = dinfo[1]
+                dc_isk = best.get("datacore_cost")
+                if dc_isk is not None and sp is not None:
+                    try:
+                        p = float(sp) / 100.0
+                        if p > 0:
+                            entry["expected_datacore_cost_per_bpc"] = float(dc_isk) / p
+                    except (TypeError, ValueError):
+                        pass
+                bm = best.get("bpc_me")
+                if bm is not None:
+                    try:
+                        entry["manufacturing_me"] = max(0, min(10, float(bm)))
+                    except (TypeError, ValueError):
+                        pass
+        self._shopping_list_append_planning(entry)
 
     def _save_shopping_list(self):
         """Persist shopping list to JSON so it survives restarts."""
@@ -1071,6 +1120,27 @@ class EVELauncher:
                     if entry.get("decryptor_name") and entry.get("decryptor_type_id") is not None:
                         rec["decryptor_name"] = entry["decryptor_name"]
                         rec["decryptor_type_id"] = entry["decryptor_type_id"]
+                    if entry.get("invention_success_prob") is not None:
+                        try:
+                            p = float(entry["invention_success_prob"])
+                            if 0 < p <= 1.0:
+                                rec["invention_success_prob"] = p
+                        except (TypeError, ValueError):
+                            pass
+                    if entry.get("expected_datacore_cost_per_bpc") is not None:
+                        try:
+                            edc = float(entry["expected_datacore_cost_per_bpc"])
+                            if edc >= 0:
+                                rec["expected_datacore_cost_per_bpc"] = edc
+                        except (TypeError, ValueError):
+                            pass
+                    if entry.get("bpc_owned_skip_invention"):
+                        rec["bpc_owned_skip_invention"] = True
+                    if entry.get("manufacturing_me") is not None:
+                        try:
+                            rec["manufacturing_me"] = max(0, min(10, float(entry["manufacturing_me"])))
+                        except (TypeError, ValueError):
+                            pass
                     self.shopping_list.append(rec)
             self._shopping_list_refresh_tree()
             self._refresh_shopping_list_aggregate()
@@ -1113,6 +1183,27 @@ class EVELauncher:
         if entry.get("decryptor_name") and entry.get("decryptor_type_id"):
             base["decryptor_name"] = entry["decryptor_name"]
             base["decryptor_type_id"] = entry["decryptor_type_id"]
+        if entry.get("invention_success_prob") is not None:
+            try:
+                p = float(entry["invention_success_prob"])
+                if 0 < p <= 1.0:
+                    base["invention_success_prob"] = p
+            except (TypeError, ValueError):
+                pass
+        if entry.get("expected_datacore_cost_per_bpc") is not None:
+            try:
+                edc = float(entry["expected_datacore_cost_per_bpc"])
+                if edc >= 0:
+                    base["expected_datacore_cost_per_bpc"] = edc
+            except (TypeError, ValueError):
+                pass
+        if entry.get("bpc_owned_skip_invention"):
+            base["bpc_owned_skip_invention"] = True
+        if entry.get("manufacturing_me") is not None:
+            try:
+                base["manufacturing_me"] = max(0, min(10, float(entry["manufacturing_me"])))
+            except (TypeError, ValueError):
+                pass
         self.shopping_list.append(base)
         self._shopping_list_refresh_tree()
         self._refresh_shopping_list_aggregate()
@@ -1139,15 +1230,29 @@ class EVELauncher:
         sell_off = sell_order_with_fees(sell_min) if sell_min and sell_min > 0 else None
         return (sell_imm, sell_off)
 
-    def _shopping_list_expected_profit_and_cost(self, product_name, total_runs):
-        """Expected profit and total material cost (buy immediate, sell offer) for product_name over total_runs. Returns (profit, total_input_cost) or (None, None)."""
+    def _shopping_list_expected_profit_and_cost(self, entry, total_runs):
+        """
+        Manufacturing-only profit and material cost: buy inputs at sell orders (buy_immediate),
+        sell output via sell_offer, over total_runs. Uses entry['manufacturing_me'] when set
+        (T2 BPC ME from decryptor/invention) so this matches the mfg slice of Profit (ISK);
+        otherwise ME 0. Profit (ISK) still subtracts invention costs on top of mfg for T2 rows.
+        """
+        product_name = entry["product_name"]
+        me = entry.get("manufacturing_me")
+        if me is not None:
+            try:
+                me = max(0, min(10, float(me)))
+            except (TypeError, ValueError):
+                me = 0.0
+        else:
+            me = 0.0
         try:
             result = calculate_blueprint_profitability(
                 blueprint_name_or_product=product_name,
                 input_price_type="buy_immediate",
                 output_price_type="sell_offer",
                 system_cost_percent=8.61,
-                material_efficiency=0,
+                material_efficiency=me,
                 number_of_runs=max(1, int(total_runs)),
                 region_id=None,
                 db_file=DATABASE_FILE,
@@ -1158,6 +1263,154 @@ class EVELauncher:
             pass
         return (None, None)
 
+    def _shopping_list_refresh_one_entry_profit(self, conn, entry):
+        """
+        Recompute stored profitability fields for one shopping list row from current DB prices.
+        T2 rows with blueprint_datacore_bindings use decryptor comparison (keeps chosen decryptor if still valid).
+        Others use single-blueprint manufacturing profit for runs_per_bpc.
+        """
+        name = (entry.get("product_name") or "").strip()
+        if not name:
+            return
+        system_cost_pct = 8.61
+        region_id = get_region_id_by_name(DEFAULT_REGION_NAME) if DEFAULT_REGION_NAME else MARKET_HISTORY_REGION_ID
+        input_price = "buy_immediate"
+        output_price = "sell_offer"
+        bp = resolve_blueprint(conn, name)
+        bind = None
+        if bp:
+            bind = conn.execute(
+                """SELECT dc1_name, dc1_qty, dc2_name, dc2_qty, base_invention_chance_pct, invention_cost_per_attempt, base_bpc_runs
+                   FROM blueprint_datacore_bindings WHERE blueprint_type_id = ?""",
+                (bp["blueprintTypeID"],),
+            ).fetchone()
+        if bind and bp:
+            dc1, dq1, dc2, dq2 = bind[0], bind[1], bind[2], bind[3]
+            base_chance_pct = 40.0
+            if len(bind) > 4 and bind[4] is not None:
+                base_chance_pct = float(bind[4])
+            inv_cost = float(bind[5]) if len(bind) > 5 and bind[5] is not None else 0.0
+            base_runs = int(bind[6]) if len(bind) > 6 and bind[6] is not None else 10
+            if base_runs not in (1, 10):
+                base_runs = 10
+            datacores = []
+            if dc1 and (dq1 or 0) > 0:
+                datacores.append((dc1, int(dq1)))
+            if dc2 and (dq2 or 0) > 0:
+                datacores.append((dc2, int(dq2)))
+            dec_results = compare_decryptor_profitability(
+                blueprint_name_or_product=name,
+                base_invention_chance_pct=base_chance_pct,
+                invention_cost_without_decryptor=inv_cost,
+                base_bpc_runs=base_runs,
+                input_price_type=input_price,
+                output_price_type=output_price,
+                system_cost_percent=system_cost_pct,
+                region_id=region_id,
+                db_file=DATABASE_FILE,
+                datacores=datacores if datacores else None,
+            )
+            valid = [x for x in dec_results if not x.get("error")]
+            if valid:
+                stored_dec = (entry.get("decryptor_name") or "").strip()
+                selected = None
+                if stored_dec and stored_dec != "No decryptor":
+                    for r in valid:
+                        if (r.get("decryptor_name") or "").strip() == stored_dec:
+                            selected = r
+                            break
+                if selected is None:
+                    selected = max(valid, key=lambda x: x.get("profit_per_bpc") or -1e99)
+                entry["profit"] = selected.get("profit_per_bpc")
+                entry["runs_per_bpc"] = max(1, int(selected.get("bpc_runs") or 10))
+                sp = selected.get("success_prob_pct")
+                if sp is not None:
+                    try:
+                        p = float(sp) / 100.0
+                        if 0 < p <= 1.0:
+                            entry["invention_success_prob"] = p
+                    except (TypeError, ValueError):
+                        pass
+                dc_isk = selected.get("datacore_cost")
+                if dc_isk is not None and sp is not None:
+                    try:
+                        p = float(sp) / 100.0
+                        if p > 0:
+                            entry["expected_datacore_cost_per_bpc"] = float(dc_isk) / p
+                    except (TypeError, ValueError):
+                        pass
+                dn = (selected.get("decryptor_name") or "").strip()
+                if dn and dn != "No decryptor":
+                    dinfo = get_decryptor_by_name(dn)
+                    if dinfo:
+                        entry["decryptor_name"] = dinfo[0]
+                        entry["decryptor_type_id"] = dinfo[1]
+                else:
+                    entry.pop("decryptor_name", None)
+                    entry.pop("decryptor_type_id", None)
+                try:
+                    bm = selected.get("bpc_me")
+                    if bm is not None:
+                        entry["manufacturing_me"] = max(0, min(10, float(bm)))
+                except (TypeError, ValueError):
+                    pass
+                return
+        entry.pop("manufacturing_me", None)
+        runs = max(1, int(entry.get("runs_per_bpc") or 1))
+        result = calculate_blueprint_profitability(
+            blueprint_name_or_product=name,
+            input_price_type=input_price,
+            output_price_type=output_price,
+            system_cost_percent=system_cost_pct,
+            material_efficiency=0,
+            number_of_runs=runs,
+            region_id=region_id,
+            db_file=DATABASE_FILE,
+        )
+        if result and "error" not in result:
+            entry["profit"] = result.get("profit")
+            entry["runs_per_bpc"] = runs
+
+    def _shopping_list_refresh_profitability(self):
+        """Background refresh of profit, invention stats, and decryptor line from current DB prices."""
+        if not self.shopping_list:
+            messagebox.showinfo("Shopping list", "The list is empty.")
+            return
+        self.status_var.set("Refreshing shopping list profitability...")
+
+        def worker():
+            errs = []
+            try:
+                conn = sqlite3.connect(DATABASE_FILE)
+                try:
+                    self._ensure_blueprint_datacore_bindings_table(conn)
+                    for entry in self.shopping_list:
+                        try:
+                            self._shopping_list_refresh_one_entry_profit(conn, entry)
+                        except Exception as ex:
+                            errs.append(f"{entry.get('product_name', '?')}: {ex}")
+                finally:
+                    conn.close()
+            except Exception as ex:
+                errs.append(str(ex))
+
+            def done():
+                self._shopping_list_refresh_tree()
+                self._refresh_shopping_list_aggregate()
+                self._save_shopping_list()
+                if errs:
+                    self.status_var.set(f"Profitability refresh finished with {len(errs)} error(s).")
+                    msg = "\n".join(errs[:20])
+                    if len(errs) > 20:
+                        msg += f"\n... and {len(errs) - 20} more"
+                    messagebox.showwarning("Refresh profitability", msg)
+                else:
+                    self.status_var.set("Shopping list profitability refreshed from DB.")
+
+            self.root.after(0, done)
+
+        threading.Thread(target=worker, daemon=True).start()
+
     def _shopping_list_decryptor_display(self, entry):
         """Return display string for Decryptor column: 'Name x BPC' or '—'."""
         dec_name = (entry.get("decryptor_name") or "").strip()
@@ -1165,6 +1418,179 @@ class EVELauncher:
             return "—"
         bpc = entry.get("quantity", 1)
         return f"{dec_name} x {bpc}"
+
+    def _shopping_list_invention_prob(self, entry):
+        """Return success probability 0–1 if this row is an invention plan, else None."""
+        p = entry.get("invention_success_prob")
+        if p is None:
+            return None
+        try:
+            p = float(p)
+            if p <= 0 or p > 1.0:
+                return None
+            return p
+        except (TypeError, ValueError):
+            return None
+
+    def _shopping_list_scaled_invention_qty(self, entry, bpc_count, qty_per_attempt):
+        """
+        Expected consumables for invention attempts to obtain bpc_count successful BPCs:
+        ceil((bpc_count * qty_per_attempt) / success_probability).
+        qty_per_attempt = datacores consumed per attempt, or 1 for decryptor.
+        Without invention_success_prob, returns bpc_count * qty_per_attempt (manufacturing-style).
+        """
+        bpc_count = max(1, int(bpc_count))
+        qty_per_attempt = max(0, int(qty_per_attempt))
+        prob = self._shopping_list_invention_prob(entry)
+        if prob is None:
+            return bpc_count * qty_per_attempt
+        return math.ceil((bpc_count * qty_per_attempt) / prob)
+
+    def _shopping_list_own_bpc_display(self, entry):
+        """ASCII checkbox for Treeview: already have researched BPC (skip invention in totals)."""
+        return "[x]" if entry.get("bpc_owned_skip_invention") else "[ ]"
+
+    def _shopping_list_expected_datacore_cost_per_bpc_resolved(self, conn, entry):
+        """
+        Expected ISK spent on datacores per successful T2 BPC (datacore_cost_per_attempt / success_probability).
+        Uses stored value from Planning/Decryptor when present; else derives from DB + invention_success_prob.
+        """
+        v = entry.get("expected_datacore_cost_per_bpc")
+        if v is not None:
+            try:
+                f = float(v)
+                return f if f >= 0 else None
+            except (TypeError, ValueError):
+                pass
+        prob = self._shopping_list_invention_prob(entry)
+        if prob is None or prob <= 0:
+            return None
+        bp = resolve_blueprint(conn, entry["product_name"])
+        if not bp:
+            return None
+        row = conn.execute(
+            "SELECT dc1_name, dc1_qty, dc2_name, dc2_qty FROM blueprint_datacore_bindings WHERE blueprint_type_id = ?",
+            (bp["blueprintTypeID"],),
+        ).fetchone()
+        if not row:
+            return None
+        dc1_name, dc1_qty, dc2_name, dc2_qty = row
+        datacores = []
+        if dc1_name and (dc1_qty or 0) > 0:
+            datacores.append((dc1_name, int(dc1_qty)))
+        if dc2_name and (dc2_qty or 0) > 0:
+            datacores.append((dc2_name, int(dc2_qty)))
+        if not datacores:
+            return None
+        cpa = _estimate_datacore_cost_per_attempt(conn, datacores)
+        if cpa <= 0:
+            return None
+        return cpa / prob
+
+    def _shopping_list_profit_cell(self, conn, entry):
+        """Profit (ISK) column: manufacturing-style profit from entry; if Own BPC, add back expected datacore ISK per successful BPC."""
+        p = entry.get("profit")
+        if p is None:
+            return ""
+        try:
+            p = float(p)
+        except (TypeError, ValueError):
+            return ""
+        if entry.get("bpc_owned_skip_invention") and conn is not None:
+            add = self._shopping_list_expected_datacore_cost_per_bpc_resolved(conn, entry)
+            if add is not None:
+                p += add
+        return f"{p:,.0f}"
+
+    def _shopping_list_toggle_own_bpc_click(self, event):
+        """Toggle bpc_owned_skip_invention when user clicks the Own BPC column ([ ] / [x])."""
+        tree = self.shopping_list_tree
+        if tree.identify_region(event.x, event.y) not in ("cell", "tree"):
+            return
+        row_id = tree.identify_row(event.y)
+        if not row_id:
+            return
+        col = tree.identify_column(event.x)
+        if col != "#1":
+            return
+        children = list(tree.get_children())
+        try:
+            idx = children.index(row_id)
+        except ValueError:
+            return
+        if idx < 0 or idx >= len(self.shopping_list):
+            return
+        e = self.shopping_list[idx]
+        e["bpc_owned_skip_invention"] = not bool(e.get("bpc_owned_skip_invention"))
+        self._shopping_list_refresh_tree()
+        self._refresh_shopping_list_aggregate()
+        self._save_shopping_list()
+
+    def _shopping_list_sort_key(self, conn, entry, column):
+        """Return a sortable tuple (type_order, value) for shopping list row and column name."""
+        bpc = max(1, int(entry.get("quantity") or 1))
+        rpb = max(1, int(entry.get("runs_per_bpc") or 1))
+        total_runs = bpc * rpb
+        if column == "Own BPC":
+            return (0, 0 if entry.get("bpc_owned_skip_invention") else 1)
+        if column == "Blueprint / Product":
+            return (0, (entry.get("product_name") or "").lower())
+        if column == "BPC":
+            return (0, float(bpc))
+        if column == "Decryptor":
+            return (0, self._shopping_list_decryptor_display(entry).lower())
+        if column == "Total runs":
+            return (0, float(total_runs))
+        if column == "Total material cost":
+            _, tc = self._shopping_list_expected_profit_and_cost(entry, total_runs)
+            return (0, float(tc) if tc is not None else float("-inf"))
+        if column == "Sell immediate":
+            si, _ = self._shopping_list_unit_sell_prices(conn, entry["product_name"])
+            return (0, float(si) if si is not None else float("-inf"))
+        if column == "Sell offer":
+            _, so = self._shopping_list_unit_sell_prices(conn, entry["product_name"])
+            return (0, float(so) if so is not None else float("-inf"))
+        if column == "Expected profit (buy imm, sell off)":
+            ep, _ = self._shopping_list_expected_profit_and_cost(entry, total_runs)
+            return (0, float(ep) if ep is not None else float("-inf"))
+        if column == "Profit (ISK)":
+            p = entry.get("profit")
+            try:
+                pf = float(p) if p is not None else float("-inf")
+            except (TypeError, ValueError):
+                pf = float("-inf")
+            if entry.get("bpc_owned_skip_invention"):
+                add = self._shopping_list_expected_datacore_cost_per_bpc_resolved(conn, entry)
+                if add is not None:
+                    pf += add
+            return (0, pf)
+        return (0, "")
+
+    def _shopping_list_sort_by(self, column):
+        """Sort shopping_list in place by column (second click reverses), then rebuild tree."""
+        cols = getattr(self, "shopping_list_columns", None)
+        if not cols or column not in cols or not self.shopping_list:
+            return
+        if self.shopping_list_sort_column == column:
+            self.shopping_list_sort_reverse = not self.shopping_list_sort_reverse
+        else:
+            self.shopping_list_sort_reverse = False
+            self.shopping_list_sort_column = column
+        try:
+            conn = sqlite3.connect(DATABASE_FILE)
+            try:
+                decorated = [
+                    (self._shopping_list_sort_key(conn, e, column), i, e)
+                    for i, e in enumerate(self.shopping_list)
+                ]
+            finally:
+                conn.close()
+        except Exception:
+            decorated = [((0, ""), i, e) for i, e in enumerate(self.shopping_list)]
+        decorated.sort(key=lambda t: t[0], reverse=self.shopping_list_sort_reverse)
+        self.shopping_list = [t[2] for t in decorated]
+        self._shopping_list_refresh_tree()
+        self._save_shopping_list()
 
     def _shopping_list_refresh_tree(self):
         """Rebuild the Treeview from self.shopping_list. Columns include Decryptor (per blueprint, not a separate line)."""
@@ -1179,17 +1605,18 @@ class EVELauncher:
                     bpc = entry["quantity"]
                     runs_per_bpc = max(1, int(entry.get("runs_per_bpc") or 1))
                     total_runs = bpc * runs_per_bpc
+                    own_str = self._shopping_list_own_bpc_display(entry)
                     decryptor_str = self._shopping_list_decryptor_display(entry)
                     sell_imm, sell_off = self._shopping_list_unit_sell_prices(conn, entry["product_name"])
                     sell_imm_str = f"{sell_imm:,.2f}" if sell_imm is not None and sell_imm > 0 else "—"
                     sell_off_str = f"{sell_off:,.2f}" if sell_off is not None and sell_off > 0 else "—"
-                    exp_profit, total_cost = self._shopping_list_expected_profit_and_cost(entry["product_name"], total_runs)
+                    exp_profit, total_cost = self._shopping_list_expected_profit_and_cost(entry, total_runs)
                     exp_profit_str = f"{exp_profit:,.0f}" if exp_profit is not None else "—"
                     total_cost_str = f"{total_cost:,.0f}" if total_cost is not None else "—"
-                    profit_str = self._format_shopping_list_profit(entry.get("profit"))
+                    profit_str = self._shopping_list_profit_cell(conn, entry)
                     self.shopping_list_tree.insert(
                         "", tk.END,
-                        values=(entry["product_name"], bpc, decryptor_str, total_runs, total_cost_str, sell_imm_str, sell_off_str, exp_profit_str, profit_str),
+                        values=(own_str, entry["product_name"], bpc, decryptor_str, total_runs, total_cost_str, sell_imm_str, sell_off_str, exp_profit_str, profit_str),
                     )
             finally:
                 conn.close()
@@ -1198,14 +1625,23 @@ class EVELauncher:
                 bpc = entry["quantity"]
                 runs_per_bpc = max(1, int(entry.get("runs_per_bpc") or 1))
                 total_runs = bpc * runs_per_bpc
+                own_str = self._shopping_list_own_bpc_display(entry)
                 decryptor_str = self._shopping_list_decryptor_display(entry)
-                exp_profit, total_cost = self._shopping_list_expected_profit_and_cost(entry["product_name"], total_runs)
+                exp_profit, total_cost = self._shopping_list_expected_profit_and_cost(entry, total_runs)
                 exp_profit_str = f"{exp_profit:,.0f}" if exp_profit is not None else "—"
                 total_cost_str = f"{total_cost:,.0f}" if total_cost is not None else "—"
-                profit_str = self._format_shopping_list_profit(entry.get("profit"))
+                profit_str = ""
+                try:
+                    c2 = sqlite3.connect(DATABASE_FILE)
+                    try:
+                        profit_str = self._shopping_list_profit_cell(c2, entry)
+                    finally:
+                        c2.close()
+                except Exception:
+                    profit_str = self._format_shopping_list_profit(entry.get("profit"))
                 self.shopping_list_tree.insert(
                     "", tk.END,
-                    values=(entry["product_name"], bpc, decryptor_str, total_runs, total_cost_str, "—", "—", exp_profit_str, profit_str),
+                    values=(own_str, entry["product_name"], bpc, decryptor_str, total_runs, total_cost_str, "—", "—", exp_profit_str, profit_str),
                 )
 
     def _on_shopping_list_selection(self, event=None):
@@ -1215,9 +1651,8 @@ class EVELauncher:
             return
         item = sel[0]
         vals = self.shopping_list_tree.item(item, "values")
-        if vals and len(vals) >= 2:
-            self.shopping_list_qty_var.set(str(vals[1]))  # BPC
-        # vals[2] = Total runs, vals[3] = Profit (read-only)
+        if vals and len(vals) >= 3:
+            self.shopping_list_qty_var.set(str(vals[2]))  # BPC
 
     def _shopping_list_update_quantity(self):
         """Set quantity of the selected row from the quantity entry."""
@@ -1242,23 +1677,26 @@ class EVELauncher:
         product_name = self.shopping_list[idx]["product_name"]
         runs_per_bpc = max(1, int(self.shopping_list[idx].get("runs_per_bpc") or 1))
         total_runs = qty * runs_per_bpc
-        profit_str = self._format_shopping_list_profit(self.shopping_list[idx].get("profit"))
+        ent = self.shopping_list[idx]
         sell_imm_str, sell_off_str = "—", "—"
-        exp_profit, total_cost = self._shopping_list_expected_profit_and_cost(product_name, total_runs)
+        exp_profit, total_cost = self._shopping_list_expected_profit_and_cost(ent, total_runs)
         exp_profit_str = f"{exp_profit:,.0f}" if exp_profit is not None else "—"
         total_cost_str = f"{total_cost:,.0f}" if total_cost is not None else "—"
+        own_str = self._shopping_list_own_bpc_display(ent)
+        profit_str = ""
         try:
             conn = sqlite3.connect(DATABASE_FILE)
             try:
                 sell_imm, sell_off = self._shopping_list_unit_sell_prices(conn, product_name)
                 sell_imm_str = f"{sell_imm:,.2f}" if sell_imm is not None and sell_imm > 0 else "—"
                 sell_off_str = f"{sell_off:,.2f}" if sell_off is not None and sell_off > 0 else "—"
+                profit_str = self._shopping_list_profit_cell(conn, ent)
             finally:
                 conn.close()
         except Exception:
-            pass
-        decryptor_str = self._shopping_list_decryptor_display(self.shopping_list[idx])
-        self.shopping_list_tree.item(item, values=(product_name, qty, decryptor_str, total_runs, total_cost_str, sell_imm_str, sell_off_str, exp_profit_str, profit_str))
+            profit_str = self._format_shopping_list_profit(ent.get("profit"))
+        decryptor_str = self._shopping_list_decryptor_display(ent)
+        self.shopping_list_tree.item(item, values=(own_str, product_name, qty, decryptor_str, total_runs, total_cost_str, sell_imm_str, sell_off_str, exp_profit_str, profit_str))
         self._refresh_shopping_list_aggregate()
         self._save_shopping_list()
         self.status_var.set(f"Quantity updated to {qty}.")
@@ -1288,7 +1726,9 @@ class EVELauncher:
         self.shopping_list_aggregate_text.delete(1.0, tk.END)
         self.shopping_list_aggregated = None
         if not self.shopping_list:
-            self.shopping_list_aggregate_text.insert(tk.END, "Add blueprints from Single Blueprint or Decryptor comparison, then set quantities. This list will show required materials and datacores (if bound).")
+            self.shopping_list_aggregate_text.insert(tk.END, "Add blueprints from Single Blueprint, Decryptor comparison, or Planning, then set quantities. "
+                "For invention rows, datacores and decryptors use ceil((BPC × per attempt) ÷ success probability). "
+                "Rows marked [x] Own BPC skip invention materials in this list.")
             self.shopping_list_aggregate_text.configure(state=tk.DISABLED)
             return
         aggregated = {}
@@ -1305,10 +1745,12 @@ class EVELauncher:
                     bpc_count = max(1, int(entry["quantity"]))
                     runs_per_bpc = max(1, int(entry.get("runs_per_bpc") or 1))
                     total_runs = bpc_count * runs_per_bpc
+                    skip_inv = bool(entry.get("bpc_owned_skip_invention"))
                     dec_name = entry.get("decryptor_name")
                     dec_type_id = entry.get("decryptor_type_id")
-                    if dec_name and dec_type_id and bpc_count > 0:
-                        aggregated[dec_name] = aggregated.get(dec_name, 0) + bpc_count
+                    if not skip_inv and dec_name and dec_type_id and bpc_count > 0:
+                        dec_need = self._shopping_list_scaled_invention_qty(entry, bpc_count, 1)
+                        aggregated[dec_name] = aggregated.get(dec_name, 0) + dec_need
                     bp = resolve_blueprint(conn, name)
                     if not bp:
                         # Not a blueprint (e.g. decryptor): add as direct item (per BPC/copy)
@@ -1324,12 +1766,16 @@ class EVELauncher:
                         "SELECT dc1_name, dc1_qty, dc2_name, dc2_qty FROM blueprint_datacore_bindings WHERE blueprint_type_id = ?",
                         (bid,),
                     ).fetchone()
-                    if row:
+                    if row and not skip_inv:
                         dc1_name, dc1_qty, dc2_name, dc2_qty = row
                         if dc1_name and dc1_qty:
-                            aggregated[dc1_name] = aggregated.get(dc1_name, 0) + (dc1_qty or 0) * bpc_count
+                            n1 = self._shopping_list_scaled_invention_qty(entry, bpc_count, int(dc1_qty or 0))
+                            if n1:
+                                aggregated[dc1_name] = aggregated.get(dc1_name, 0) + n1
                         if dc2_name and dc2_qty:
-                            aggregated[dc2_name] = aggregated.get(dc2_name, 0) + (dc2_qty or 0) * bpc_count
+                            n2 = self._shopping_list_scaled_invention_qty(entry, bpc_count, int(dc2_qty or 0))
+                            if n2:
+                                aggregated[dc2_name] = aggregated.get(dc2_name, 0) + n2
             finally:
                 conn.close()
         except Exception as e:
@@ -1450,7 +1896,7 @@ class EVELauncher:
         if not self.shopping_list:
             messagebox.showinfo("Copy plan", "Shopping list is empty.")
             return
-        lines = ["Blueprint / Product\tBPC\tDecryptor\tTotal runs\tTotal material cost\tSell immediate\tSell offer\tExpected profit (buy imm, sell off)\tProfit (ISK)"]
+        lines = ["Own BPC\tBlueprint / Product\tBPC\tDecryptor\tTotal runs\tTotal material cost\tSell immediate\tSell offer\tExpected profit (buy imm, sell off)\tProfit (ISK)"]
         try:
             conn = sqlite3.connect(DATABASE_FILE)
             try:
@@ -1458,15 +1904,16 @@ class EVELauncher:
                     bpc = entry["quantity"]
                     runs_per_bpc = max(1, int(entry.get("runs_per_bpc") or 1))
                     total_runs = bpc * runs_per_bpc
+                    own_str = self._shopping_list_own_bpc_display(entry)
                     decryptor_str = self._shopping_list_decryptor_display(entry)
                     sell_imm, sell_off = self._shopping_list_unit_sell_prices(conn, entry["product_name"])
                     sell_imm_str = f"{sell_imm:,.2f}" if sell_imm is not None and sell_imm > 0 else "—"
                     sell_off_str = f"{sell_off:,.2f}" if sell_off is not None and sell_off > 0 else "—"
-                    exp_profit, total_cost = self._shopping_list_expected_profit_and_cost(entry["product_name"], total_runs)
+                    exp_profit, total_cost = self._shopping_list_expected_profit_and_cost(entry, total_runs)
                     exp_profit_str = f"{exp_profit:,.0f}" if exp_profit is not None else "—"
                     total_cost_str = f"{total_cost:,.0f}" if total_cost is not None else "—"
-                    profit_str = self._format_shopping_list_profit(entry.get("profit")) or ""
-                    lines.append(f"{entry['product_name']}\t{bpc}\t{decryptor_str}\t{total_runs}\t{total_cost_str}\t{sell_imm_str}\t{sell_off_str}\t{exp_profit_str}\t{profit_str}")
+                    profit_str = self._shopping_list_profit_cell(conn, entry) or ""
+                    lines.append(f"{own_str}\t{entry['product_name']}\t{bpc}\t{decryptor_str}\t{total_runs}\t{total_cost_str}\t{sell_imm_str}\t{sell_off_str}\t{exp_profit_str}\t{profit_str}")
             finally:
                 conn.close()
         except Exception:
@@ -1474,12 +1921,13 @@ class EVELauncher:
                 bpc = entry["quantity"]
                 runs_per_bpc = max(1, int(entry.get("runs_per_bpc") or 1))
                 total_runs = bpc * runs_per_bpc
+                own_str = self._shopping_list_own_bpc_display(entry)
                 decryptor_str = self._shopping_list_decryptor_display(entry)
-                exp_profit, total_cost = self._shopping_list_expected_profit_and_cost(entry["product_name"], total_runs)
+                exp_profit, total_cost = self._shopping_list_expected_profit_and_cost(entry, total_runs)
                 exp_profit_str = f"{exp_profit:,.0f}" if exp_profit is not None else "—"
                 total_cost_str = f"{total_cost:,.0f}" if total_cost is not None else "—"
                 profit_str = self._format_shopping_list_profit(entry.get("profit")) or ""
-                lines.append(f"{entry['product_name']}\t{bpc}\t{decryptor_str}\t{total_runs}\t{total_cost_str}\t—\t—\t{exp_profit_str}\t{profit_str}")
+                lines.append(f"{own_str}\t{entry['product_name']}\t{bpc}\t{decryptor_str}\t{total_runs}\t{total_cost_str}\t—\t—\t{exp_profit_str}\t{profit_str}")
         text = "\n".join(lines)
         self.root.clipboard_clear()
         self.root.clipboard_append(text)
@@ -1896,8 +2344,11 @@ Price Update Options:
 
 2. Update Mineral Prices Only: Updates prices only for:
    - Basic minerals (Tritanium, Pyerite, Mexallon, Isogen, Nocxium, Zydrine, Megacyte, Morphite)
-   - Mutaplasmid residues
-   - Other specified materials
+   - Mutaplasmid residues and other specified materials
+   - All invention datacores (same set as Decryptor comparison)
+   - Decryptors (for invention profitability)
+   
+   After the run, a before/after table is shown for Mexallon, Pyerite, Tritanium, Zydrine, Megacyte, Nocxium, Isogen.
    
    This is much faster and recommended for regular updates.
 
@@ -2095,6 +2546,10 @@ for one search may still appear in searches with different parameters.
         
         remove_btn = ttk.Button(action_frame, text="Remove Selected", command=self.remove_on_offer_item)
         remove_btn.pack(side=tk.LEFT, padx=5)
+
+        # Launch overview alert helper
+        launch_overview_btn = ttk.Button(action_frame, text="Open Overview Alert", command=self.launch_overview_alert)
+        launch_overview_btn.pack(side=tk.LEFT, padx=20)
         
         # Load items on startup
         self.refresh_on_offer_list()
@@ -2834,10 +3289,34 @@ for one search may still appear in searches with different parameters.
                 profit = rd.get("t2_profit_isk")
                 dec_name = (rd.get("t2_decryptor") or "").strip()
                 dec_type_id = rd.get("t2_decryptor_type_id")
+                item = {"product_name": product_name, "quantity": 1, "profit": profit, "runs_per_bpc": runs_per_bpc}
+                br = rd.get("best_decryptor_row")
+                if br and br.get("success_prob_pct") is not None:
+                    try:
+                        p = float(br["success_prob_pct"]) / 100.0
+                        if 0 < p <= 1.0:
+                            item["invention_success_prob"] = p
+                    except (TypeError, ValueError):
+                        pass
                 if dec_name and dec_name != "No decryptor" and dec_type_id:
-                    to_add.append({"product_name": product_name, "quantity": 1, "profit": profit, "runs_per_bpc": runs_per_bpc, "decryptor_name": dec_name, "decryptor_type_id": dec_type_id})
-                else:
-                    to_add.append({"product_name": product_name, "quantity": 1, "profit": profit, "runs_per_bpc": runs_per_bpc})
+                    item["decryptor_name"] = dec_name
+                    item["decryptor_type_id"] = dec_type_id
+                if br:
+                    dc_isk = br.get("datacore_cost")
+                    sp = br.get("success_prob_pct")
+                    if dc_isk is not None and sp is not None:
+                        try:
+                            p = float(sp) / 100.0
+                            if p > 0:
+                                item["expected_datacore_cost_per_bpc"] = float(dc_isk) / p
+                        except (TypeError, ValueError):
+                            pass
+                    if br.get("bpc_me") is not None:
+                        try:
+                            item["manufacturing_me"] = max(0, min(10, float(br["bpc_me"])))
+                        except (TypeError, ValueError):
+                            pass
+                to_add.append(item)
             else:
                 product_name = rd.get("t1_name")
                 if not product_name:
@@ -2867,6 +3346,77 @@ for one search may still appear in searches with different parameters.
             self._shopping_list_append_planning(entry)
         if to_add:
             self.planning_status_var.set(f"Added {len(to_add)} blueprint(s) to Shopping List.")
+    
+    def create_market_patterns_tab(self):
+        """Market Patterns tab: run day-of-week price/volume analysis and show textual output."""
+        frame = ttk.Frame(self.notebook)
+        self.notebook.add(frame, text="Market Patterns")
+        info = ttk.LabelFrame(frame, text="Day-of-week market analysis", padding=10)
+        info.pack(fill=tk.X, padx=10, pady=10)
+        ttk.Label(
+            info,
+            text="Runs analyze_market_patterns.py to compute average price, volume and expected buy volume per weekday\n"
+                 "for core minerals and items in the On Offer list (region 10000002 / The Forge).",
+            justify=tk.LEFT,
+            wraplength=900,
+        ).pack(anchor=tk.W)
+        btn_row = ttk.Frame(frame)
+        btn_row.pack(fill=tk.X, padx=10, pady=5)
+        ttk.Button(btn_row, text="Run analysis", command=self._run_market_patterns_analysis).pack(side=tk.LEFT, padx=5)
+        self.market_patterns_status_var = tk.StringVar(value="Click 'Run analysis' to generate report.")
+        ttk.Label(btn_row, textvariable=self.market_patterns_status_var).pack(side=tk.LEFT, padx=10)
+        text_frame = ttk.LabelFrame(frame, text="Analysis output", padding=10)
+        text_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
+        self.market_patterns_text = scrolledtext.ScrolledText(text_frame, wrap=tk.WORD, height=25)
+        self.market_patterns_text.pack(fill=tk.BOTH, expand=True)
+
+    def _run_market_patterns_analysis(self):
+        """Run analyze_market_patterns.py in a background thread and display its stdout."""
+        self.market_patterns_status_var.set("Running market patterns analysis...")
+        self.market_patterns_text.delete(1.0, tk.END)
+        self.market_patterns_text.insert(tk.END, "Running analyze_market_patterns.py...\n\n")
+        self.root.update_idletasks()
+
+        def worker():
+            try:
+                result = subprocess.run(
+                    [sys.executable, "analyze_market_patterns.py"],
+                    cwd=Path(__file__).resolve().parent,
+                    capture_output=True,
+                    text=True,
+                    timeout=600,
+                )
+                out = result.stdout or ""
+                err = result.stderr or ""
+                text = out
+                if err:
+                    if text:
+                        text += "\n\n--- stderr ---\n"
+                    text += err
+                self.root.after(0, lambda: self._market_patterns_apply_result(text, result.returncode))
+            except Exception as e:
+                self.root.after(0, lambda: self._market_patterns_apply_result(f"Error: {e}", 1))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _market_patterns_apply_result(self, text: str, returncode: int):
+        self.market_patterns_text.delete(1.0, tk.END)
+        self.market_patterns_text.insert(tk.END, text or "(no output)")
+        if returncode == 0:
+            self.market_patterns_status_var.set("Market patterns analysis completed.")
+        else:
+            self.market_patterns_status_var.set("Market patterns analysis failed (see output).")
+
+    def launch_overview_alert(self):
+        """Launch overview_alert.py in a separate process (uses same Python executable)."""
+        try:
+            subprocess.Popen(
+                [sys.executable, "overview_alert.py"],
+                cwd=Path(__file__).resolve().parent,
+            )
+            self.status_var.set("Launched overview_alert.py.")
+        except Exception as e:
+            messagebox.showerror("Overview Alert", f"Failed to launch overview_alert.py:\n{e}")
 
     def create_sso_sync_tab(self):
         """EVE SSO sync tab: login and sync wallet transactions, journal, industry jobs for profitability tracking."""
@@ -3869,12 +4419,14 @@ for one search may still appear in searches with different parameters.
                 logger = logging.getLogger()
                 logger.addHandler(handler)
                 
-                update_mineral_prices()
+                comparison_report = update_mineral_prices()
                 
                 logger.removeHandler(handler)
                 output = log_capture.getvalue()
                 
                 self.price_update_log.insert(tk.END, output)
+                if comparison_report:
+                    self.price_update_log.insert(tk.END, comparison_report)
                 self.price_update_log.insert(tk.END, "\n\nMineral price update complete!\n")
                 self.status_var.set("Mineral price update complete!")
                 messagebox.showinfo("Success", "Mineral prices updated successfully!")
