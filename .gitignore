@@ -38,6 +38,8 @@ venv.bak/
 eve_data/
 *.xlsx
 *.xls
+# Local SQLite (never commit; regenerate with eve_manufacturing_database.py / build flow)
+eve_manufacturing.db
 *.db
 *.db-journal
 fuzzwork_prices_*.csv
