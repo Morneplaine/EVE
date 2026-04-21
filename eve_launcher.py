@@ -1003,6 +1003,9 @@ class EVELauncher:
         shortfall_frame.pack(fill=tk.X, padx=10, pady=5)
         self.shopping_list_shortfall_text = scrolledtext.ScrolledText(shortfall_frame, wrap=tk.WORD, height=8, state=tk.DISABLED)
         self.shopping_list_shortfall_text.pack(fill=tk.BOTH, expand=True)
+        shortfall_btn_row = ttk.Frame(shortfall_frame)
+        shortfall_btn_row.pack(fill=tk.X, pady=(4, 0))
+        ttk.Button(shortfall_btn_row, text="Copy to clipboard", command=self._shopping_list_copy_shortfall).pack(side=tk.LEFT, padx=5)
         # Propagate mousewheel from all non-scrolling child frames to the outer canvas
         for _w in (top, agg_frame, inv_frame, shortfall_frame):
             _w.bind("<MouseWheel>", _sl_mousewheel)
@@ -2908,6 +2911,26 @@ class EVELauncher:
             self.shopping_list_shortfall_text.insert(tk.END, "\n".join(lines))
         self.shopping_list_shortfall_text.configure(state=tk.DISABLED)
         self.status_var.set("Shortfall updated (required − pasted inventory).")
+
+    def _shopping_list_copy_shortfall(self):
+        """Copy the shortfall item list to clipboard, excluding the total-cost summary line."""
+        self.shopping_list_shortfall_text.configure(state=tk.NORMAL)
+        raw = self.shopping_list_shortfall_text.get(1.0, tk.END)
+        self.shopping_list_shortfall_text.configure(state=tk.DISABLED)
+        lines = [
+            ln for ln in raw.splitlines()
+            if ln.strip()
+            and not ln.startswith("Total cost")
+            and not ln.startswith("(no price for")
+            and not ln.startswith("You have everything")
+            and not ln.startswith("No required items")
+        ]
+        if not lines:
+            messagebox.showinfo("Copy shortfall", "Nothing to copy.")
+            return
+        self.root.clipboard_clear()
+        self.root.clipboard_append("\n".join(lines))
+        self.status_var.set(f"Copied {len(lines)} shortfall item(s) to clipboard.")
 
     def _shopping_list_copy_to_clipboard(self):
         """Copy the aggregated materials text to the clipboard."""

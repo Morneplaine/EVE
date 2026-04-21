@@ -1,9 +1,13 @@
 {
   "decryptor_comparison": {
-    "inv_cost": "2125",
+    "inv_cost": "5800",
     "dc1_name": "Datacore - High Energy Physics",
     "dc1_qty": "2",
-    "dc2_name": "Datacore - Laser Physics",
+    "dc2_name": "Datacore - Quantum Physics",
     "dc2_qty": "2"
+  },
+  "shopping_list": {
+    "max_research_days": "6",
+    "max_research_hours": "12"
   }
 }
