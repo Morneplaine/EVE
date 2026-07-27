@@ -50,6 +50,9 @@ from fetch_market_history import (
 )
 
 DATABASE_FILE = "eve_manufacturing.db"
+# Small, git-tracked snapshot (no market history, no SSO tokens). On a fresh clone
+# the runtime DB is bootstrapped from this so the app works immediately.
+CORE_DATABASE_FILE = "eve_manufacturing_core.db"
 # Region ID for market_history_daily (The Forge); must match data fetched by fetch_market_history.py
 MARKET_HISTORY_REGION_ID = 10000002
 # Preferences file for decryptor comparison and other persisted settings
@@ -8910,7 +8913,27 @@ Price Update Options:
             conn.close()
 
 
+def ensure_runtime_database():
+    """Bootstrap the runtime DB from the git-tracked core snapshot on a fresh clone.
+
+    The large runtime DB (with market history) is git-ignored, so a new checkout only
+    has eve_manufacturing_core.db. Copy it to eve_manufacturing.db so the launcher works
+    out of the box; market history can then be rebuilt locally via fetch_market_history.
+    """
+    try:
+        runtime = Path(DATABASE_FILE)
+        core = Path(CORE_DATABASE_FILE)
+        if not runtime.exists() and core.exists():
+            import shutil
+            shutil.copyfile(core, runtime)
+            print(f"Initialized {DATABASE_FILE} from {CORE_DATABASE_FILE} "
+                  "(market history empty — rebuild locally with fetch_market_history.py).")
+    except Exception as e:
+        print(f"Could not bootstrap runtime database: {e}")
+
+
 def main():
+    ensure_runtime_database()
     root = tk.Tk()
     app = EVELauncher(root)
     root.mainloop()

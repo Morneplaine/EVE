@@ -38,9 +38,12 @@ venv.bak/
 eve_data/
 *.xlsx
 *.xls
-# SQLite databases – not tracked (too large for GitHub; rebuilt/synced locally).
-# Portable working data travels via the launcher's Export/Import feature instead.
+# SQLite databases – the full runtime DB is too large for GitHub (market history
+# is ~99% of it), so it stays local. Only the small core snapshot is tracked; the
+# launcher bootstraps the runtime DB from it on a fresh clone. Regenerate the core
+# with: python make_core_db.py
 *.db
+!eve_manufacturing_core.db
 # Optional future split DB for market-only cache (keep ignored)
 eve_market_prices.db
 *.db-journal
