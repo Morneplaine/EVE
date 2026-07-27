@@ -1,11 +1,12 @@
 {
   "decryptor_comparison": {
-    "inv_cost": "5800",
-    "dc1_name": "Datacore - High Energy Physics",
-    "dc1_qty": "2",
-    "dc2_name": "Datacore - Quantum Physics",
-    "dc2_qty": "2"
+    "inv_cost": "258",
+    "dc1_name": "Datacore - Electronic Engineering",
+    "dc1_qty": "1",
+    "dc2_name": "Datacore - Rocket Science",
+    "dc2_qty": "1"
   },
+  "planning_paste": "\nAntimatter Charge M Blueprint\t\nAntimatter Charge M Blueprint\t\nAntimatter Charge M Blueprint\t\nAntimatter Charge M Blueprint\t\nAntimatter Charge M Blueprint\t1\nBaryon Exotic Plasma L Blueprint\t\nBaryon Exotic Plasma L Blueprint\t\nBreacher Blueprint\t\nBreacher Blueprint\t\nBreacher Blueprint\t\nBuzzard Blueprint\t\nCap Booster 800 Blueprint\t\nCap Booster 800 Blueprint\t\nCapital Ancillary Armor Repairer Blueprint\t\nCorax Blueprint\t\nGlorified Decayed Warp Scrambler Mutaplasmid Blueprint\t\nGlorified Decayed Warp Scrambler Mutaplasmid Blueprint\t\nHeavy Entropic Disintegrator I Blueprint\t\nHeavy Mutadaptive Compact Remote Armor Repairer Blueprint\t\nHeavy Scoped Entropic Disintegrator Blueprint\t\nHeron Blueprint\t\nHeron Blueprint\t\nHeron Blueprint\t\nHeron Blueprint\t\nIridium Charge S Blueprint\t1\nIron Charge S Blueprint\t\nIron Charge S Blueprint\t\nIron Charge S Blueprint\t\nIteron Mark V Blueprint\t\nIteron Mark V Blueprint\t\nLarge Auxiliary Nano Pump I Blueprint\t\nLarge Auxiliary Nano Pump I Blueprint\t\nLarge Auxiliary Nano Pump I Blueprint\t\nLarge Auxiliary Nano Pump II Blueprint\t\nLeshak Blueprint\t\nLeshak Blueprint\t\nLight Compact Entropic Disintegrator Blueprint\t\nLight Entropic Disintegrator I Blueprint\t\nLight Scoped Entropic Disintegrator Blueprint\t\nLight Scoped Entropic Disintegrator Blueprint\t\nLight Scoped Entropic Disintegrator Blueprint\t\nMedium Core Defense Field Extender I Blueprint\t\nMeson Exotic Plasma L Blueprint\t\nMeson Exotic Plasma M Blueprint\t\nMeson Exotic Plasma S Blueprint\t\nMjolnir Torpedo Blueprint\t\nMjolnir Torpedo Blueprint\t\nMjolnir Torpedo Blueprint\t\nMobile Phase Anchor Blueprint\t\nMobile Phase Anchor Blueprint\t\nNereus Blueprint\t\nNereus Blueprint\t\nPolarized 200mm AutoCannon Blueprint\t\nPolarized 800mm Repeating Cannon Blueprint\t\nProton S Blueprint\t\nR.Db - Lai Dai Blueprint\t\nSimple Asteroid Mining Crystal Type A I Blueprint\t\nSimple Asteroid Mining Crystal Type A I Blueprint\t\nSimple Asteroid Mining Crystal Type A I Blueprint\t\nSupratidal Compact Entropic Disintegrator Blueprint\t\nSupratidal Compact Entropic Disintegrator Blueprint\t\nSupratidal Compact Entropic Disintegrator Blueprint\t\nSupratidal Entropic Disintegrator I Blueprint\t\nTetryon Exotic Plasma L Blueprint\t\nTetryon Exotic Plasma L Blueprint\t\nTetryon Exotic Plasma M Blueprint\t\nTetryon Exotic Plasma M Blueprint\t\nTetryon Exotic Plasma M Blueprint\t\nTetryon Exotic Plasma M Blueprint\t\nTetryon Exotic Plasma S Blueprint\t\nTetryon Exotic Plasma XL Blueprint\t\nTungsten Charge S Blueprint\t\nTungsten Charge S Blueprint\t\nTungsten Charge S Blueprint\t\nVedmak Blueprint\t\nViator Blueprint\t\nWrecked Thruster Sections\t1\nWrecked Weapon Subroutines\t1\n",
   "shopping_list": {
     "max_research_days": "6",
     "max_research_hours": "12"

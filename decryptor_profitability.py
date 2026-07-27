@@ -101,6 +101,7 @@ def compare_decryptor_profitability(
     region_id=None,
     db_file=DATABASE_FILE,
     datacores=None,
+    conn: sqlite3.Connection | None = None,
 ):
     """
     Compare profit per successful BPC for no-decryptor and each decryptor.
@@ -113,11 +114,12 @@ def compare_decryptor_profitability(
     Returns list of dicts: decryptor_name, success_prob_pct, expected_inv_cost, bpc_me, bpc_runs,
     decryptor_price, manufacturing_profit, profit_per_bpc, error (if any).
     """
-    if not Path(db_file).exists():
-        return [{"error": f"Database not found: {db_file}"}]
-
-    conn = sqlite3.connect(db_file)
-    conn.row_factory = sqlite3.Row
+    own_conn = conn is None
+    if own_conn:
+        if not Path(db_file).exists():
+            return [{"error": f"Database not found: {db_file}"}]
+        conn = sqlite3.connect(db_file)
+        conn.row_factory = sqlite3.Row
     base_chance = max(0.01, min(1.0, float(base_invention_chance_pct) / 100.0))
     inv_cost_no_dec = max(0.0, float(invention_cost_without_decryptor))
     datacore_cost = _estimate_datacore_cost_per_attempt(conn, datacores)
@@ -142,7 +144,8 @@ def compare_decryptor_profitability(
         db_file=db_file,
     )
     if "error" in mfg:
-        conn.close()
+        if own_conn:
+            conn.close()
         return [{"decryptor_name": "No decryptor", "error": mfg["error"]}]
     profit_bpc = mfg["profit"] - expected_inv
     out.append({
@@ -204,5 +207,77 @@ def compare_decryptor_profitability(
             "profit_per_bpc": profit_bpc,
         })
 
-    conn.close()
+    if own_conn:
+        conn.close()
     return out
+
+
+def estimate_t2_invention_from_bindings(
+    conn: sqlite3.Connection,
+    blueprint_type_id: int,
+    product_name: str,
+    *,
+    input_price_type: str = "buy_immediate",
+    output_price_type: str = "sell_immediate",
+    system_cost_percent: float = 8.61,
+    region_id=None,
+) -> dict | None:
+    """
+    Expected invention cost per successful T2 BPC using saved blueprint_datacore_bindings
+    and the best decryptor by profit_per_bpc (same rule as shopping-list refresh).
+
+    Returns dict with expected_inv_cost, bpc_runs, bpc_me, decryptor_name, production_cost_per_run,
+    or None if no binding row exists.
+    """
+    try:
+        row = conn.execute(
+            """
+            SELECT dc1_name, dc1_qty, dc2_name, dc2_qty,
+                   base_invention_chance_pct, invention_cost_per_attempt, base_bpc_runs,
+                   production_cost_per_run
+              FROM blueprint_datacore_bindings
+             WHERE blueprint_type_id = ?
+            """,
+            (int(blueprint_type_id),),
+        ).fetchone()
+    except sqlite3.OperationalError:
+        return None
+    if not row:
+        return None
+    dc1, dq1, dc2, dq2 = row[0], row[1], row[2], row[3]
+    base_chance_pct = float(row[4]) if row[4] is not None else 40.0
+    inv_cost = float(row[5]) if row[5] is not None else 0.0
+    base_runs = int(row[6]) if row[6] is not None else 10
+    if base_runs not in (1, 10):
+        base_runs = 10
+    prod_per_run = float(row[7]) if len(row) > 7 and row[7] is not None and float(row[7]) > 0 else None
+    datacores = []
+    if dc1 and (dq1 or 0) > 0:
+        datacores.append((dc1, int(dq1)))
+    if dc2 and (dq2 or 0) > 0:
+        datacores.append((dc2, int(dq2)))
+
+    results = compare_decryptor_profitability(
+        blueprint_name_or_product=product_name,
+        base_invention_chance_pct=base_chance_pct,
+        invention_cost_without_decryptor=inv_cost,
+        base_bpc_runs=base_runs,
+        input_price_type=input_price_type,
+        output_price_type=output_price_type,
+        system_cost_percent=system_cost_percent,
+        region_id=region_id,
+        datacores=datacores if datacores else None,
+        conn=conn,
+    )
+    valid = [x for x in results if not x.get("error")]
+    if not valid:
+        return None
+    best = max(valid, key=lambda x: x.get("profit_per_bpc") or -1e99)
+    return {
+        "expected_inv_cost": float(best.get("expected_inv_cost") or 0.0),
+        "bpc_runs": max(1, int(best.get("bpc_runs") or base_runs)),
+        "bpc_me": max(0, min(10, float(best.get("bpc_me") or 0.0))),
+        "decryptor_name": (best.get("decryptor_name") or "").strip() or "No decryptor",
+        "production_cost_per_run": prod_per_run,
+        "success_prob_pct": best.get("success_prob_pct"),
+    }

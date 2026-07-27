@@ -195,6 +195,62 @@ def _get_expected_buy_order_volume_nd_avg(conn, region_id, type_id, n_days, as_o
     return (avg, most_recent_date_utc)
 
 
+def get_market_average_price_7d_avg(conn, region_id, type_id, as_of_date_utc=None):
+    """
+    Mean of daily VWAP (`average` column in market_history_daily) over up to 7 most recent days.
+    Same date window as get_expected_buy_order_volume_7d_avg (most recent rows in DB).
+    Returns (mean_price, most_recent_date_utc) or (None, None) if no data.
+    """
+    ensure_table(conn)
+    n_days = 7
+    if as_of_date_utc:
+        cur = conn.execute(
+            """
+            SELECT date_utc, average
+            FROM market_history_daily
+            WHERE region_id = ? AND type_id = ? AND date_utc <= ?
+            ORDER BY date_utc DESC
+            LIMIT ?
+            """,
+            (region_id, type_id, as_of_date_utc, n_days),
+        )
+    else:
+        cur = conn.execute(
+            """
+            SELECT date_utc, average
+            FROM market_history_daily
+            WHERE region_id = ? AND type_id = ?
+            ORDER BY date_utc DESC
+            LIMIT ?
+            """,
+            (region_id, type_id, n_days),
+        )
+    rows = cur.fetchall()
+    if not rows:
+        return (None, None)
+    vals = []
+    for _d, av in rows:
+        if av is None:
+            continue
+        try:
+            vals.append(float(av))
+        except (TypeError, ValueError):
+            continue
+    if not vals:
+        return (None, None)
+    return (sum(vals) / len(vals), rows[0][0])
+
+
+def clear_market_history_session_cache():
+    """Clear in-process cache so refresh_market_history_for_type will call the API again."""
+    _refreshed_this_session.clear()
+
+
+def discard_market_history_session_refresh(region_id, type_id):
+    """Allow refresh_market_history_for_type to call the API again for this type in the current process."""
+    _refreshed_this_session.discard((region_id, type_id))
+
+
 def get_type_ids_with_no_or_zero_volume(conn, region_id, scope="prices", limit=None):
     """
     Return type_ids from the given scope that have no market_history_daily data for region_id,

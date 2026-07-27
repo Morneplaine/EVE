@@ -30,8 +30,10 @@ def update_prices_by_type_ids(type_ids, description="items"):
     try:
         logger.info("Updating database...")
         updated_count = 0
-        
-        for type_id, price_data in fuzzwork_prices.items():
+        items = list(fuzzwork_prices.items())
+        total_items = len(items)
+
+        for idx, (type_id, price_data) in enumerate(items, start=1):
             conn.execute("""
                 UPDATE prices SET
                     buy_max = ?,
@@ -54,7 +56,9 @@ def update_prices_by_type_ids(type_ids, description="items"):
             
             if price_data.get('buy_max', 0) > 0 or price_data.get('sell_min', 0) > 0:
                 updated_count += 1
-        
+            if total_items and (idx % 5000 == 0 or idx == total_items):
+                logger.info(f"Database write progress: {idx}/{total_items} rows processed ({updated_count} with non-zero prices so far)")
+
         conn.commit()
         
         logger.info("=" * 60)
@@ -83,6 +87,7 @@ def update_prices():
         # Get all typeIDs that need prices
         cursor = conn.execute("SELECT typeID FROM prices")
         type_ids = [row[0] for row in cursor.fetchall()]
+        logger.info(f"Found {len(type_ids)} items to update")
         
         update_prices_by_type_ids(type_ids, "items")
         

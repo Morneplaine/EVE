@@ -4,14 +4,17 @@ A GUI interface for managing and analyzing EVE Online manufacturing and reproces
 """
 
 import tkinter as tk
-from tkinter import ttk, scrolledtext, messagebox, simpledialog
+from tkinter import ttk, scrolledtext, messagebox, simpledialog, filedialog
 import threading
+import time
 import sys
 import math
 import json
+import logging
 import sqlite3
 import subprocess
 from pathlib import Path
+from typing import Optional
 
 # Import our modules
 from calculate_reprocessing_value import (
@@ -38,7 +41,10 @@ from fetch_market_history import (
     get_expected_buy_order_volume_7d_avg,
     get_expected_buy_order_volume_30d_avg,
     get_market_history_raw,
+    get_market_average_price_7d_avg,
     refresh_market_history_for_type,
+    clear_market_history_session_cache,
+    discard_market_history_session_refresh,
     get_type_ids_with_no_or_zero_volume,
     run_fetch,
 )
@@ -50,8 +56,12 @@ MARKET_HISTORY_REGION_ID = 10000002
 LAUNCHER_PREFS_FILE = Path(__file__).resolve().parent / "eve_launcher_prefs.json"
 # Persisted shopping list (survives restarts until reset)
 SHOPPING_LIST_FILE = Path(__file__).resolve().parent / "eve_launcher_shopping_list.json"
+PRODUCTION_TRACKING_FILE = Path(__file__).resolve().parent / "eve_launcher_production_tracking.json"
+PUT_IN_PRODUCTION_ROW_SEP = "\x1f"
 # Persisted skill levels (My Skills tab)
 SKILLS_FILE = Path(__file__).resolve().parent / "eve_launcher_skills.json"
+# Persisted EVE SSO credentials (Client ID / Client Secret). Gitignored.
+SSO_CREDENTIALS_FILE = Path(__file__).resolve().parent / "eve_sso_credentials.json"
 
 from regions_data import REGIONS_BY_NAME, DEFAULT_REGION_NAME, get_region_id_by_name
 
@@ -83,15 +93,18 @@ class EVELauncher:
         self.create_on_offer_tab()
         self.create_decryptor_comparison_tab()
         self.create_shopping_list_tab()
+        self.create_put_in_production_tab()
         self.create_analysis_tab()
         self.create_single_module_tab()
         self.create_single_blueprint_tab()
         self.create_skills_blueprints_tab()
-        self.create_exclusions_tab()
         self.create_paste_compare_tab()
         self.create_planning_tab()
         self.create_market_patterns_tab()
         self.create_sso_sync_tab()
+        self.create_profitability_tab()
+        self.create_arbitrage_tab()
+        self.create_remap_planner_tab()
         
         # So analysis tab fields are editable immediately (focus first entry when that tab is shown)
         self.root.after(150, self._focus_analysis_first_entry_if_visible)
@@ -108,11 +121,36 @@ class EVELauncher:
         status_bar = ttk.Label(root, textvariable=self.status_var, relief=tk.SUNKEN, anchor=tk.W)
         status_bar.pack(side=tk.BOTTOM, fill=tk.X)
         self.root.protocol("WM_DELETE_WINDOW", self._on_launcher_close)
-    
+        self.root.after(50, self._startup_heavy_refresh)
+
+    def _startup_heavy_refresh(self):
+        """Defer On Offer + shopping list refresh until after first paint."""
+        try:
+            self.status_var.set("Loading On Offer and shopping list…")
+        except Exception:
+            pass
+        try:
+            self.refresh_on_offer_list(quiet=True)
+        except Exception:
+            pass
+        try:
+            self._shopping_list_refresh_tree()
+            self._refresh_shopping_list_aggregate()
+        except Exception:
+            pass
+        try:
+            self.status_var.set("Ready")
+        except Exception:
+            pass
+
     def _on_launcher_close(self):
         """Save shopping list when closing the app (belt-and-suspenders; list also saves on each edit)."""
         try:
             self._save_shopping_list()
+        except Exception:
+            pass
+        try:
+            self._save_production_tracking()
         except Exception:
             pass
         self.root.destroy()
@@ -876,7 +914,7 @@ class EVELauncher:
 
         top = ttk.LabelFrame(sl_inner, text="Blueprints in list", padding=10)
         top.pack(fill=tk.X, padx=10, pady=10)
-        cols = ("Blueprint / Product", "Research", "Runs", "# prod", "Decryptor", "Run per BPC", "Total material cost", "Sell immediate", "Sell offer", "Breakeven", "E[research]", "E[prod]", "E[prod -min]")
+        cols = ("Blueprint / Product", "Research", "Runs", "# prod", "Decryptor", "Run per BPC", "Total material cost", "Sell immediate", "Hist 7d avg", "Sell offer", "Breakeven", "E[research]", "E[prod]", "E[prod -min]")
         self.shopping_list_columns = cols
         self.shopping_list_sort_column = None
         self.shopping_list_sort_reverse = False
@@ -887,10 +925,10 @@ class EVELauncher:
         col_widths = {
             "Blueprint / Product": 180, "Research": 65, "Runs": 55, "# prod": 60,
             "Decryptor": 120, "Run per BPC": 85, "Total material cost": 120,
-            "Sell immediate": 100, "Sell offer": 100, "Breakeven": 100,
+            "Sell immediate": 100, "Hist 7d avg": 88, "Sell offer": 100, "Breakeven": 100,
             "E[research]": 110, "E[prod]": 110, "E[prod -min]": 110,
         }
-        non_stretch = {"Research", "Runs", "# prod"}
+        non_stretch = {"Research", "Runs", "# prod", "Hist 7d avg"}
         for c in cols:
             self.shopping_list_tree.heading(c, text=c, command=lambda col=c: self._shopping_list_sort_by(col))
             self.shopping_list_tree.column(c, width=col_widths.get(c, 100), stretch=(c not in non_stretch))
@@ -921,6 +959,7 @@ class EVELauncher:
         # ────────────────────────────────────────────────────────────────────────────
 
         self.shopping_list_tree.tag_configure("manual_rpb", background="#cce5ff")
+        self.shopping_list_tree.tag_configure("mat_override", background="#fff2cc")
         self.shopping_list_tree.bind("<<TreeviewSelect>>", self._on_shopping_list_selection)
         self.shopping_list_tree.bind("<Double-1>", self._shopping_list_on_double_click)
         self.shopping_list_tree.bind("<ButtonRelease-1>", self._sl_tree_click)
@@ -944,6 +983,7 @@ class EVELauncher:
         ttk.Entry(btn_row1, textvariable=self.shopping_list_prod_var, width=6).pack(side=tk.LEFT, padx=2)
         ttk.Button(btn_row1, text="Update quantities", command=self._shopping_list_update_quantity).pack(side=tk.LEFT, padx=5)
         ttk.Button(btn_row1, text="Set prod to 0", command=self._shopping_list_set_prod_zero).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_row1, text="Reset all qty to 0", command=self._shopping_list_reset_all_quantities_zero).pack(side=tk.LEFT, padx=5)
         ttk.Button(btn_row1, text="Revert RPB", command=self._sl_revert_rpb).pack(side=tk.LEFT, padx=5)
         # Row 1b: max research time + computed max runs for selected row
         max_time_row = ttk.Frame(top)
@@ -971,6 +1011,20 @@ class EVELauncher:
         ttk.Button(btn_row2_top, text="Remove selected", command=self._shopping_list_remove_selected).pack(side=tk.LEFT, padx=5)
         ttk.Button(btn_row2_top, text="Copy plan to clipboard", command=self._shopping_list_copy_plan_to_clipboard).pack(side=tk.LEFT, padx=5)
         ttk.Button(btn_row2_top, text="Refresh profitability", command=self._shopping_list_refresh_profitability).pack(side=tk.LEFT, padx=5)
+        ttk.Button(
+            btn_row2_top,
+            text="Refresh market history (selected)",
+            command=self._shopping_list_refresh_market_history_selected,
+        ).pack(side=tk.LEFT, padx=5)
+        ttk.Button(
+            btn_row2_top,
+            text="Refresh market history (all in list)",
+            command=self._shopping_list_refresh_market_history,
+        ).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_row2_top, text="Put in production…", command=self._shopping_list_open_put_in_production).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_row2_top, text="Edit materials (selected)…", command=self._shopping_list_edit_materials).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_row2_top, text="Export data…", command=self._export_state_to_file).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_row2_top, text="Import data…", command=self._import_state_from_file).pack(side=tk.LEFT, padx=5)
         ttk.Label(
             top,
             text="Research × Runs = invention attempts (drives datacores/decryptors). "
@@ -978,7 +1032,9 @@ class EVELauncher:
                  "Run per BPC = manufacturing runs per BPC (from decryptor; click cell to override, shown in blue). "
                  "Materials = # prod × Run per BPC × qty/run. "
                  "E[research] = profit/BPC (hover). E[prod] = total mfg profit (hover). "
-                 "Double-click a row to copy item name. Click column header to sort.",
+                 "Double-click a row to copy item name. Click column header to sort. "
+                 "Select a row and click 'Edit materials' to bind a custom per-run material list "
+                 "(for null-sec/structure bonuses); such rows are highlighted and their bound list is used in the aggregate.",
             wraplength=720,
             justify=tk.LEFT,
         ).pack(fill=tk.X, anchor=tk.W, pady=(0, 4))
@@ -998,16 +1054,32 @@ class EVELauncher:
         self.shopping_list_inventory_text.pack(fill=tk.BOTH, expand=True)
         inv_btn_row = ttk.Frame(inv_frame)
         inv_btn_row.pack(fill=tk.X, pady=4)
-        ttk.Button(inv_btn_row, text="Compare: show shortfall (need − have)", command=self._shopping_list_compare_inventory).pack(side=tk.LEFT, padx=5)
-        shortfall_frame = ttk.LabelFrame(sl_inner, text="Still need to get (required minus in inventory)", padding=8)
-        shortfall_frame.pack(fill=tk.X, padx=10, pady=5)
+        ttk.Button(inv_btn_row, text="Compare: shortfall + unused / excess", command=self._shopping_list_compare_inventory).pack(side=tk.LEFT, padx=5)
+        compare_row = ttk.Frame(sl_inner)
+        compare_row.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
+        inv_compare_paned = ttk.PanedWindow(compare_row, orient=tk.HORIZONTAL)
+        inv_compare_paned.pack(fill=tk.BOTH, expand=True)
+        shortfall_frame = ttk.LabelFrame(inv_compare_paned, text="Still need to get (required minus in inventory)", padding=8)
+        excess_frame = ttk.LabelFrame(inv_compare_paned, text="Unused & excess (vs plan)", padding=8)
+        inv_compare_paned.add(shortfall_frame, weight=1)
+        inv_compare_paned.add(excess_frame, weight=1)
         self.shopping_list_shortfall_text = scrolledtext.ScrolledText(shortfall_frame, wrap=tk.WORD, height=8, state=tk.DISABLED)
         self.shopping_list_shortfall_text.pack(fill=tk.BOTH, expand=True)
         shortfall_btn_row = ttk.Frame(shortfall_frame)
         shortfall_btn_row.pack(fill=tk.X, pady=(4, 0))
         ttk.Button(shortfall_btn_row, text="Copy to clipboard", command=self._shopping_list_copy_shortfall).pack(side=tk.LEFT, padx=5)
+        excess_help = (
+            "Unused: pasted items that do not match anything in the aggregated plan.\n"
+            "Excess: for plan items, quantity held beyond 3× what the plan requires (have − 3×need).\n"
+            "Run Compare after pasting inventory.\n\n"
+        )
+        self.shopping_list_excess_unused_text = scrolledtext.ScrolledText(excess_frame, wrap=tk.WORD, height=8, state=tk.DISABLED)
+        self.shopping_list_excess_unused_text.pack(fill=tk.BOTH, expand=True)
+        self.shopping_list_excess_unused_text.configure(state=tk.NORMAL)
+        self.shopping_list_excess_unused_text.insert(tk.END, excess_help)
+        self.shopping_list_excess_unused_text.configure(state=tk.DISABLED)
         # Propagate mousewheel from all non-scrolling child frames to the outer canvas
-        for _w in (top, agg_frame, inv_frame, shortfall_frame):
+        for _w in (top, agg_frame, inv_frame, compare_row):
             _w.bind("<MouseWheel>", _sl_mousewheel)
 
         # Defer loading until after the window is fully rendered so startup is instant
@@ -1036,8 +1108,19 @@ class EVELauncher:
         scrollbar_skills.pack(side=tk.RIGHT, fill=tk.Y)
         self.skills_level_vars = {}  # skillID -> IntVar(0..5)
         self._skills_blueprints_fill_skills()
-        btn_refresh_skills = ttk.Button(skills_frame, text="Refresh skills from DB", command=self._skills_blueprints_fill_skills)
-        btn_refresh_skills.pack(pady=4)
+        # Controls: refresh from DB + load actual trained levels from an SSO character
+        skills_ctrl = ttk.Frame(skills_frame)
+        skills_ctrl.pack(fill=tk.X, pady=4)
+        ttk.Button(skills_ctrl, text="Refresh skills from DB", command=self._skills_blueprints_fill_skills).pack(side=tk.LEFT, padx=(0, 12))
+        ttk.Label(skills_ctrl, text="SSO character:").pack(side=tk.LEFT, padx=(0, 4))
+        self.skills_sso_char_var = tk.StringVar()
+        self.skills_sso_char_combo = ttk.Combobox(skills_ctrl, textvariable=self.skills_sso_char_var, state="readonly", width=28, values=[])
+        self.skills_sso_char_combo.pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(skills_ctrl, text="Refresh chars", command=self._skills_refresh_sso_chars).pack(side=tk.LEFT, padx=(0, 6))
+        self.skills_load_sso_btn = ttk.Button(skills_ctrl, text="Load levels from SSO", command=self._skills_load_from_sso)
+        self.skills_load_sso_btn.pack(side=tk.LEFT)
+        self._skills_sso_char_map = {}  # label -> character_id
+        self._skills_refresh_sso_chars()
         # Price and type settings
         price_frame = ttk.LabelFrame(frame, text="Price, system cost and blueprint type (used for analysis)", padding=8)
         price_frame.pack(fill=tk.X, padx=10, pady=6)
@@ -1169,6 +1252,86 @@ class EVELauncher:
             sb = ttk.Spinbox(row_f, from_=0, to=5, width=4, textvariable=var)
             sb.pack(side=tk.LEFT)
         self.skills_analysis_status_var.set(f"Loaded {len(skills)} skills (levels restored from file). Set levels and click Run analysis.")
+
+    def _skills_refresh_sso_chars(self):
+        """Populate the SSO character dropdown from the sso_character table."""
+        labels = []
+        self._skills_sso_char_map = {}
+        try:
+            from eve_sso_sync import list_sso_characters, ensure_sso_tables
+            if Path(DATABASE_FILE).exists():
+                conn = sqlite3.connect(DATABASE_FILE, timeout=30)
+                try:
+                    ensure_sso_tables(conn)
+                    for r in list_sso_characters(conn):
+                        name = r.get("character_name") or str(r.get("character_id"))
+                        labels.append(name)
+                        self._skills_sso_char_map[name] = r["character_id"]
+                finally:
+                    conn.close()
+        except Exception:
+            pass
+        self.skills_sso_char_combo.config(values=labels)
+        if labels and not self.skills_sso_char_var.get():
+            self.skills_sso_char_var.set(labels[0])
+
+    def _skills_load_from_sso(self):
+        """Fetch the selected character's trained skill levels via ESI and set the spinboxes."""
+        label = self.skills_sso_char_var.get().strip()
+        char_id = self._skills_sso_char_map.get(label)
+        if not char_id:
+            messagebox.showwarning("Load from SSO", "Select a linked SSO character first (add one in the EVE SSO Sync tab).")
+            return
+        cid, secret = self._load_sso_credentials()
+        if not cid or not secret:
+            messagebox.showwarning("Load from SSO", "Set EVE SSO Client ID / Secret first (EVE SSO Sync tab).")
+            return
+        self.skills_load_sso_btn.config(state=tk.DISABLED)
+        self.skills_analysis_status_var.set(f"Loading skills for {label} from SSO...")
+        self.root.update_idletasks()
+
+        def worker():
+            try:
+                from eve_sso_sync import get_valid_access_token, fetch_character_skills
+                conn = sqlite3.connect(DATABASE_FILE, timeout=60)
+                conn.execute("PRAGMA busy_timeout=60000")
+                try:
+                    token = get_valid_access_token(conn, char_id, cid, secret)
+                finally:
+                    conn.close()
+                if not token:
+                    raise RuntimeError("No valid token; re-link this character in EVE SSO Sync.")
+                data = fetch_character_skills(char_id, token)
+                levels = {}
+                for s in data.get("skills", []):
+                    sid = s.get("skill_id")
+                    lvl = s.get("active_skill_level", s.get("trained_skill_level", 0))
+                    if sid is not None:
+                        levels[int(sid)] = max(0, min(5, int(lvl or 0)))
+                self.root.after(0, lambda: self._skills_apply_sso_levels(label, levels))
+            except Exception as e:
+                self.root.after(0, lambda msg=str(e): self._skills_sso_error(msg))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _skills_apply_sso_levels(self, label, levels):
+        """Set spinbox levels from a {skill_id: level} map; skills not trained -> 0."""
+        self.skills_load_sso_btn.config(state=tk.NORMAL)
+        matched = 0
+        for sid, var in self.skills_level_vars.items():
+            lvl = levels.get(int(sid), 0)
+            var.set(lvl)
+            if lvl > 0:
+                matched += 1
+        self._save_skills_prefs()
+        self.skills_analysis_status_var.set(
+            f"Loaded {matched} trained skills from {label} ({len(levels)} known to character). Click Run analysis."
+        )
+
+    def _skills_sso_error(self, msg):
+        self.skills_load_sso_btn.config(state=tk.NORMAL)
+        self.skills_analysis_status_var.set(f"SSO load failed: {msg}")
+        messagebox.showerror("Load from SSO", msg)
 
     def _run_skills_blueprints_analysis(self):
         """Gather skill levels, get available blueprints, run profitability, rank and show all by profit and return."""
@@ -1406,6 +1569,10 @@ class EVELauncher:
                     self.shopping_list.append(rec)
             self._shopping_list_refresh_tree()
             self._refresh_shopping_list_aggregate()
+            # The "Put in production" tab is built before this (deferred) load runs,
+            # so rebuild its rows now that the shopping list is populated.
+            if hasattr(self, "put_production_inner"):
+                self._put_in_production_rebuild_rows()
         except Exception:
             pass
 
@@ -1491,6 +1658,627 @@ class EVELauncher:
         sell_imm = sell_into_buy_order(buy_max) if buy_max and buy_max > 0 else None
         sell_off = sell_order_with_fees(sell_min) if sell_min and sell_min > 0 else None
         return (sell_imm, sell_off)
+
+    def _shopping_list_format_price_display(self, v):
+        """Format unit ISK for shopping list: no decimals when value > 1000."""
+        if v is None:
+            return "—"
+        try:
+            x = float(v)
+        except (TypeError, ValueError):
+            return "—"
+        if x <= 0:
+            return "—"
+        if x > 1000:
+            return f"{x:,.0f}"
+        return f"{x:,.2f}"
+
+    def _shopping_list_hist_7d_avg_price(self, conn, product_name):
+        """Mean of last-7-days daily `average` from market_history_daily (same region as volume)."""
+        bp = resolve_blueprint(conn, product_name)
+        if not bp:
+            return None
+        avg, _ = get_market_average_price_7d_avg(conn, MARKET_HISTORY_REGION_ID, int(bp["productTypeID"]))
+        return avg
+
+    def _shopping_list_refresh_market_history(self):
+        """Fetch EVE Tycoon market history for each distinct product on the list, then refresh the tree."""
+        if not self.shopping_list:
+            messagebox.showinfo("Shopping list", "The list is empty.")
+            return
+        if not Path(DATABASE_FILE).exists():
+            messagebox.showwarning("Shopping list", "Database not found.")
+            return
+        self.status_var.set("Refreshing market history for shopping list (API, may take a while)…")
+
+        def work():
+            err_msg = None
+            try:
+                clear_market_history_session_cache()
+                conn = sqlite3.connect(DATABASE_FILE)
+                try:
+                    seen_tid = set()
+                    for entry in self.shopping_list:
+                        name = (entry.get("product_name") or "").strip()
+                        if not name:
+                            continue
+                        bp = resolve_blueprint(conn, name)
+                        if not bp:
+                            continue
+                        tid = int(bp["productTypeID"])
+                        if tid in seen_tid:
+                            continue
+                        seen_tid.add(tid)
+                        refresh_market_history_for_type(conn, MARKET_HISTORY_REGION_ID, tid)
+                        time.sleep(0.12)
+                finally:
+                    conn.close()
+            except Exception as ex:
+                err_msg = str(ex)
+
+            def done():
+                if err_msg:
+                    messagebox.showerror("Market history", err_msg)
+                    self.status_var.set("Market history refresh failed.")
+                else:
+                    self._shopping_list_refresh_tree()
+                    self.status_var.set("Market history refreshed for shopping list products.")
+
+            self.root.after(0, done)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _shopping_list_refresh_market_history_selected(self):
+        """Fetch market history for the selected row's product only, then refresh the tree."""
+        sel = self.shopping_list_tree.selection()
+        if not sel:
+            messagebox.showinfo("Shopping list", "Select a blueprint row first.")
+            return
+        children = list(self.shopping_list_tree.get_children())
+        try:
+            idx = children.index(sel[0])
+        except ValueError:
+            return
+        if idx < 0 or idx >= len(self.shopping_list):
+            return
+        name = (self.shopping_list[idx].get("product_name") or "").strip()
+        if not name:
+            messagebox.showwarning("Shopping list", "Selected row has no product name.")
+            return
+        if not Path(DATABASE_FILE).exists():
+            messagebox.showwarning("Shopping list", "Database not found.")
+            return
+        self.status_var.set(f"Refreshing market history for {name[:48]}…")
+
+        def work():
+            err_msg = None
+            try:
+                conn = sqlite3.connect(DATABASE_FILE)
+                try:
+                    bp = resolve_blueprint(conn, name)
+                    if not bp:
+                        err_msg = f"Could not resolve blueprint/product: {name!r}"
+                    else:
+                        tid = int(bp["productTypeID"])
+                        discard_market_history_session_refresh(MARKET_HISTORY_REGION_ID, tid)
+                        refresh_market_history_for_type(conn, MARKET_HISTORY_REGION_ID, tid)
+                finally:
+                    conn.close()
+            except Exception as ex:
+                err_msg = str(ex)
+
+            def done():
+                if err_msg:
+                    messagebox.showerror("Market history", err_msg)
+                    self.status_var.set("Market history refresh failed.")
+                else:
+                    self._shopping_list_refresh_tree()
+                    self.status_var.set("Market history refreshed for selected product.")
+
+            self.root.after(0, done)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def create_put_in_production_tab(self):
+        """Track manufacturing and invention runs remaining per blueprint; persisted to JSON."""
+        frame = ttk.Frame(self.notebook)
+        self.notebook.add(frame, text="Put in production")
+        self.production_tracking_by_product = {}
+        self._load_production_tracking()
+        top = ttk.LabelFrame(frame, text="Runs remaining (shopping list plan; change dropdowns as you launch jobs)", padding=8)
+        top.pack(fill=tk.X, padx=10, pady=6)
+        ttk.Label(
+            top,
+            text="Plan columns: Research (streams Σ) and Runs (invention runs per stream) match the shopping list; "
+            "# prod (Σ BPCs) and Run/BPC match manufacturing; Prod. runs left = # prod × Run/BPC to deliver. "
+            "Inv. runs left = Research × Runs (unless Own BPC skips invention). "
+            "Sell @ prod and Breakeven are snapshotted (net sell-offer per item) the moment a row is put in production "
+            "and are NOT updated with the market — use 'Reset saved progress' to re-capture them. "
+            "Values are saved automatically.",
+            wraplength=920,
+            justify=tk.LEFT,
+        ).pack(anchor=tk.W)
+        btn_row = ttk.Frame(top)
+        btn_row.pack(fill=tk.X, pady=(6, 0))
+        ttk.Button(btn_row, text="Refresh rows from shopping list", command=self._put_in_production_rebuild_rows).pack(side=tk.LEFT, padx=4)
+        ttk.Button(btn_row, text="Reset saved progress", command=self._put_in_production_reset_progress).pack(side=tk.LEFT, padx=4)
+        scroll_wrap = ttk.LabelFrame(frame, text="Blueprints", padding=6)
+        scroll_wrap.pack(fill=tk.BOTH, expand=True, padx=10, pady=6)
+        canvas = tk.Canvas(scroll_wrap, highlightthickness=0)
+        vsb = ttk.Scrollbar(scroll_wrap, orient=tk.VERTICAL, command=canvas.yview)
+        self.put_production_inner = ttk.Frame(canvas)
+        self.put_production_inner.bind(
+            "<Configure>",
+            lambda e: canvas.configure(scrollregion=canvas.bbox("all")),
+        )
+        _put_cw = canvas.create_window((0, 0), window=self.put_production_inner, anchor=tk.NW)
+
+        def _put_canvas_configure(ev):
+            canvas.itemconfigure(_put_cw, width=ev.width)
+
+        canvas.bind("<Configure>", _put_canvas_configure)
+        canvas.configure(yscrollcommand=vsb.set)
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        vsb.pack(side=tk.RIGHT, fill=tk.Y)
+        self._put_in_production_rebuild_rows()
+
+    def _load_production_tracking(self):
+        self.production_tracking_by_product = {}
+        if not PRODUCTION_TRACKING_FILE.exists():
+            return
+        try:
+            with open(PRODUCTION_TRACKING_FILE, "r", encoding="utf-8") as f:
+                d = json.load(f)
+            if isinstance(d, dict) and isinstance(d.get("by_product"), dict):
+                for k, v in d["by_product"].items():
+                    if not isinstance(v, dict):
+                        continue
+                    try:
+                        pr = int(v.get("production_runs", 0))
+                        ir = int(v.get("invention_runs", 0))
+                        rec = {
+                            "production_runs": max(0, pr),
+                            "invention_runs": max(0, ir),
+                        }
+                        # Snapshot prices captured when first put in production.
+                        # Stored as-is; never refreshed from market until progress reset.
+                        if v.get("price_at_production") is not None:
+                            try:
+                                rec["price_at_production"] = float(v["price_at_production"])
+                            except (TypeError, ValueError):
+                                pass
+                        if v.get("breakeven_price") is not None:
+                            try:
+                                rec["breakeven_price"] = float(v["breakeven_price"])
+                            except (TypeError, ValueError):
+                                pass
+                        self.production_tracking_by_product[str(k)] = rec
+                    except (TypeError, ValueError):
+                        pass
+        except Exception:
+            pass
+
+    def _save_production_tracking(self):
+        try:
+            if not hasattr(self, "production_tracking_by_product"):
+                return
+            out = {"by_product": dict(self.production_tracking_by_product)}
+            with open(PRODUCTION_TRACKING_FILE, "w", encoding="utf-8") as f:
+                json.dump(out, f, indent=2)
+        except Exception:
+            pass
+
+    # ---- Portable data export / import -------------------------------------
+    # User-specific config that should travel between computers. The huge
+    # eve_manufacturing.db (SDE + market data) is NOT included; only the
+    # user's working state and per-blueprint bindings are bundled so a recent
+    # export can be dropped onto another install and stay functional.
+    EXPORT_DB_TABLES = (
+        "blueprint_material_override",
+        "blueprint_mfg_cost_binding",
+        "blueprint_datacore_bindings",
+        "invention_recipes",
+    )
+
+    def _export_dump_db_table(self, conn, table):
+        """Return {'columns': [...], 'rows': [[...], ...]} for a table, or None if absent."""
+        try:
+            cur = conn.execute(f"PRAGMA table_info({table})")
+            cols = [r[1] for r in cur.fetchall()]
+            if not cols:
+                return None
+            rows = conn.execute(f"SELECT {', '.join(cols)} FROM {table}").fetchall()
+            return {"columns": cols, "rows": [list(r) for r in rows]}
+        except Exception:
+            return None
+
+    def _build_export_bundle(self):
+        """Assemble the portable JSON bundle from in-memory state + DB bindings."""
+        from datetime import datetime as _dt
+        bundle = {
+            "format": "eve_launcher_export",
+            "version": 1,
+            "exported_at": _dt.now().isoformat(timespec="seconds"),
+            "shopping_list": list(getattr(self, "shopping_list", []) or []),
+            "production_tracking": {
+                "by_product": dict(getattr(self, "production_tracking_by_product", {}) or {})
+            },
+            "db_bindings": {},
+        }
+        if Path(DATABASE_FILE).exists():
+            try:
+                conn = sqlite3.connect(DATABASE_FILE, timeout=30)
+                try:
+                    self._ensure_material_override_table(conn)
+                    self._paste_mfg_ensure_binding_table(conn)
+                    self._ensure_blueprint_datacore_bindings_table(conn)
+                    self._ensure_invention_recipes_table(conn)
+                    for tbl in self.EXPORT_DB_TABLES:
+                        dumped = self._export_dump_db_table(conn, tbl)
+                        if dumped is not None:
+                            bundle["db_bindings"][tbl] = dumped
+                finally:
+                    conn.close()
+            except Exception:
+                pass
+        return bundle
+
+    def _export_state_to_file(self):
+        """Prompt for a location and write the portable JSON bundle."""
+        from datetime import datetime as _dt
+        default_name = f"eve_launcher_export_{_dt.now().strftime('%Y%m%d_%H%M%S')}.json"
+        path = filedialog.asksaveasfilename(
+            title="Export shopping list + production data",
+            defaultextension=".json",
+            initialfile=default_name,
+            filetypes=[("JSON files", "*.json"), ("All files", "*.*")],
+        )
+        if not path:
+            return
+        try:
+            bundle = self._build_export_bundle()
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(bundle, f, indent=2)
+        except Exception as e:
+            messagebox.showerror("Export failed", f"Could not write export file:\n{e}")
+            return
+        sl_n = len(bundle.get("shopping_list", []))
+        pt_n = len(bundle.get("production_tracking", {}).get("by_product", {}))
+        binds = bundle.get("db_bindings", {})
+        bind_n = sum(len(v.get("rows", [])) for v in binds.values())
+        self.status_var.set(f"Exported {sl_n} shopping-list items, {pt_n} production entries to {Path(path).name}")
+        messagebox.showinfo(
+            "Export complete",
+            f"Saved to:\n{path}\n\n"
+            f"Shopping list items: {sl_n}\n"
+            f"Production-tracking entries: {pt_n}\n"
+            f"Blueprint binding rows: {bind_n}\n\n"
+            "Copy this file to another computer and use 'Import data…' there.\n"
+            "Note: the large market/SDE database is not included — the other install "
+            "keeps using its own eve_manufacturing.db.",
+        )
+
+    def _import_apply_db_bindings(self, db_bindings):
+        """Restore per-blueprint binding tables from an export bundle."""
+        if not db_bindings or not Path(DATABASE_FILE).exists():
+            return
+        try:
+            conn = sqlite3.connect(DATABASE_FILE, timeout=30)
+        except Exception:
+            return
+        try:
+            self._ensure_material_override_table(conn)
+            self._paste_mfg_ensure_binding_table(conn)
+            self._ensure_blueprint_datacore_bindings_table(conn)
+            self._ensure_invention_recipes_table(conn)
+            for tbl in self.EXPORT_DB_TABLES:
+                payload = db_bindings.get(tbl)
+                if not isinstance(payload, dict):
+                    continue
+                cols = payload.get("columns") or []
+                rows = payload.get("rows") or []
+                if not cols or not rows:
+                    continue
+                # Only use columns that still exist in the current table schema.
+                cur = conn.execute(f"PRAGMA table_info({tbl})")
+                existing = {r[1] for r in cur.fetchall()}
+                use_idx = [i for i, c in enumerate(cols) if c in existing]
+                if not use_idx:
+                    continue
+                use_cols = [cols[i] for i in use_idx]
+                placeholders = ", ".join(["?"] * len(use_cols))
+                sql = f"INSERT OR REPLACE INTO {tbl} ({', '.join(use_cols)}) VALUES ({placeholders})"
+                to_insert = [[row[i] for i in use_idx] for row in rows if isinstance(row, list)]
+                conn.executemany(sql, to_insert)
+            conn.commit()
+        except Exception:
+            pass
+        finally:
+            conn.close()
+
+    def _import_state_from_file(self):
+        """Prompt for an export bundle and restore shopping list, production data, and bindings."""
+        path = filedialog.askopenfilename(
+            title="Import shopping list + production data",
+            filetypes=[("JSON files", "*.json"), ("All files", "*.*")],
+        )
+        if not path:
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                bundle = json.load(f)
+        except Exception as e:
+            messagebox.showerror("Import failed", f"Could not read file:\n{e}")
+            return
+        if not isinstance(bundle, dict) or bundle.get("format") != "eve_launcher_export":
+            messagebox.showerror("Import failed", "This file is not a valid EVE Launcher export.")
+            return
+
+        sl = bundle.get("shopping_list")
+        pt = bundle.get("production_tracking", {})
+        pt_by = pt.get("by_product", {}) if isinstance(pt, dict) else {}
+        sl_n = len(sl) if isinstance(sl, list) else 0
+        pt_n = len(pt_by) if isinstance(pt_by, dict) else 0
+        binds = bundle.get("db_bindings", {}) if isinstance(bundle.get("db_bindings"), dict) else {}
+        bind_n = sum(len(v.get("rows", [])) for v in binds.values() if isinstance(v, dict))
+
+        if not messagebox.askyesno(
+            "Confirm import",
+            f"Exported: {bundle.get('exported_at', 'unknown')}\n\n"
+            f"Shopping list items: {sl_n}\n"
+            f"Production-tracking entries: {pt_n}\n"
+            f"Blueprint binding rows: {bind_n}\n\n"
+            "This will REPLACE your current shopping list and production tracking, "
+            "and merge the blueprint bindings into this computer's database. Continue?",
+        ):
+            return
+
+        try:
+            if isinstance(sl, list):
+                with open(SHOPPING_LIST_FILE, "w", encoding="utf-8") as f:
+                    json.dump(sl, f, indent=2)
+            if isinstance(pt_by, dict):
+                with open(PRODUCTION_TRACKING_FILE, "w", encoding="utf-8") as f:
+                    json.dump({"by_product": pt_by}, f, indent=2)
+            self._import_apply_db_bindings(binds)
+        except Exception as e:
+            messagebox.showerror("Import failed", f"Error while applying import:\n{e}")
+            return
+
+        # Reload in-memory state and refresh the UI.
+        try:
+            self._load_shopping_list()
+            self._load_production_tracking()
+            if hasattr(self, "_shopping_list_refresh_tree"):
+                self._shopping_list_refresh_tree()
+            if hasattr(self, "_refresh_shopping_list_aggregate"):
+                self._refresh_shopping_list_aggregate()
+            if hasattr(self, "_put_in_production_rebuild_rows"):
+                self._put_in_production_rebuild_rows()
+        except Exception:
+            pass
+
+        self.status_var.set(f"Imported {sl_n} shopping-list items, {pt_n} production entries from {Path(path).name}")
+        messagebox.showinfo(
+            "Import complete",
+            f"Restored:\nShopping list items: {sl_n}\n"
+            f"Production-tracking entries: {pt_n}\n"
+            f"Blueprint binding rows merged: {bind_n}",
+        )
+
+    def _put_in_production_row_key(self, product_name, decryptor_name):
+        name = (product_name or "").strip()
+        d = (decryptor_name or "").strip()
+        if d in ("", "No decryptor"):
+            d = ""
+        return f"{name}{PUT_IN_PRODUCTION_ROW_SEP}{d}"
+
+    def _shopping_list_merged_production_plan(self):
+        """row_key -> plan fields incl. research_streams, runs_display, prod_bpcs_display, rpb_display."""
+        merged = {}
+        for entry in self.shopping_list:
+            name = (entry.get("product_name") or "").strip()
+            if not name:
+                continue
+            dec_raw = (entry.get("decryptor_name") or "").strip()
+            if dec_raw in ("", "No decryptor"):
+                dec_key = ""
+            else:
+                dec_key = dec_raw
+            key = self._put_in_production_row_key(name, dec_key)
+            skip_inv = bool(entry.get("bpc_owned_skip_invention"))
+            prod = self._sl_prod_runs(entry)
+            rpb = max(1, int(entry.get("runs_per_bpc") or 1))
+            plan_p = prod * rpb if prod > 0 else 0
+            plan_i = 0 if skip_inv else self._sl_total_attempts(entry)
+            if key not in merged:
+                merged[key] = {
+                    "product": name,
+                    "decryptor_label": dec_key if dec_key else "—",
+                    "plan_p": 0,
+                    "plan_i": 0,
+                    "research_streams": 0,
+                    "runs_values": set(),
+                    "prod_bpcs_sum": 0,
+                    "rpb_values": set(),
+                }
+            merged[key]["plan_p"] += plan_p
+            merged[key]["plan_i"] += plan_i
+            if "prod" in entry:
+                bpc_add = max(0, int(entry.get("prod") or 0))
+            else:
+                bpc_add = max(1, int(entry.get("quantity") or 1))
+            merged[key]["prod_bpcs_sum"] += bpc_add
+            if plan_p > 0:
+                merged[key]["rpb_values"].add(rpb)
+            if not skip_inv and self._sl_use_direct_attempts(entry):
+                merged[key]["research_streams"] += max(0, int(entry.get("research") or 0))
+                merged[key]["runs_values"].add(max(0, int(entry.get("runs_per_research") or 0)))
+        for v in merged.values():
+            runs_vals = sorted(v.pop("runs_values", set()))
+            plan_i = int(v.get("plan_i") or 0)
+            if not runs_vals:
+                v["runs_display"] = "—"
+            elif len(runs_vals) == 1:
+                v["runs_display"] = str(runs_vals[0])
+            else:
+                lo, hi = runs_vals[0], runs_vals[-1]
+                v["runs_display"] = f"{lo}–{hi}" if lo != hi else str(lo)
+            rs = int(v.get("research_streams") or 0)
+            v["research_display"] = str(rs) if rs > 0 else "—"
+            pb = int(v.get("prod_bpcs_sum") or 0)
+            v["prod_bpcs_display"] = str(pb) if pb > 0 else "—"
+            rpb_vals = sorted(v.pop("rpb_values", set()))
+            if not rpb_vals:
+                v["rpb_display"] = "—"
+            elif len(rpb_vals) == 1:
+                v["rpb_display"] = str(rpb_vals[0])
+            else:
+                lo, hi = rpb_vals[0], rpb_vals[-1]
+                v["rpb_display"] = f"{lo}–{hi}" if lo != hi else str(lo)
+        return merged
+
+    def _shopping_list_open_put_in_production(self):
+        for i in range(self.notebook.index("end")):
+            if self.notebook.tab(i, "text") == "Put in production":
+                self.notebook.select(i)
+                break
+        self._put_in_production_rebuild_rows()
+
+    def _put_in_production_on_change(self, row_key, field, var):
+        try:
+            v = int(var.get())
+        except (ValueError, tk.TclError):
+            return
+        if not hasattr(self, "production_tracking_by_product"):
+            self.production_tracking_by_product = {}
+        rec = self.production_tracking_by_product.setdefault(row_key, {})
+        rec[field] = max(0, v)
+        self._save_production_tracking()
+
+    def _put_in_production_rebuild_rows(self):
+        if not hasattr(self, "put_production_inner"):
+            return
+        for w in self.put_production_inner.winfo_children():
+            w.destroy()
+        merged = self._shopping_list_merged_production_plan()
+        row_keys = sorted(merged.keys(), key=lambda k: (merged[k]["product"].lower(), merged[k]["decryptor_label"].lower()))
+        row = 0
+        hdr = ("TkDefaultFont", 9, "bold")
+        ttk.Label(self.put_production_inner, text="Blueprint / product", font=hdr).grid(row=row, column=0, sticky=tk.W, padx=4, pady=2)
+        ttk.Label(self.put_production_inner, text="Research\n(streams Σ)", font=hdr).grid(row=row, column=1, sticky=tk.W, padx=4)
+        ttk.Label(self.put_production_inner, text="Runs\n(inv. / stream)", font=hdr).grid(row=row, column=2, sticky=tk.W, padx=4)
+        ttk.Label(self.put_production_inner, text="# prod\n(Σ BPCs)", font=hdr).grid(row=row, column=3, sticky=tk.W, padx=4)
+        ttk.Label(self.put_production_inner, text="Run\n/BPC", font=hdr).grid(row=row, column=4, sticky=tk.W, padx=4)
+        ttk.Label(self.put_production_inner, text="Prod. runs\nleft", font=hdr).grid(row=row, column=5, sticky=tk.W, padx=4)
+        ttk.Label(self.put_production_inner, text="Decryptor", font=hdr).grid(row=row, column=6, sticky=tk.W, padx=4)
+        ttk.Label(self.put_production_inner, text="Inv. runs\nleft", font=hdr).grid(row=row, column=7, sticky=tk.W, padx=4)
+        ttk.Label(self.put_production_inner, text="Sell @ prod\n(snapshot)", font=hdr).grid(row=row, column=8, sticky=tk.W, padx=4)
+        ttk.Label(self.put_production_inner, text="Breakeven\n(snapshot)", font=hdr).grid(row=row, column=9, sticky=tk.W, padx=4)
+        row += 1
+        if not row_keys:
+            ttk.Label(
+                self.put_production_inner,
+                text="Add blueprints with # prod > 0 or invention attempts (Research × Runs).",
+                wraplength=520,
+            ).grid(row=row, column=0, columnspan=10, sticky=tk.W, padx=4, pady=6)
+            return
+        pl_conn = sqlite3.connect(DATABASE_FILE) if Path(DATABASE_FILE).exists() else None
+        for rkey in row_keys:
+            info = merged[rkey]
+            name = info["product"]
+            dec_lbl = info["decryptor_label"]
+            plan_p = info["plan_p"]
+            plan_i = info["plan_i"]
+            res_disp = info.get("research_display", "—")
+            runs_disp = info.get("runs_display", "—")
+            prod_bpcs_disp = info.get("prod_bpcs_display", "—")
+            rpb_disp = info.get("rpb_display", "—")
+            if plan_p <= 0 and plan_i <= 0:
+                continue
+            saved = self.production_tracking_by_product.get(rkey)
+            if saved is None:
+                saved = self.production_tracking_by_product.get(name)
+            saved = saved or {}
+            try:
+                sp = int(saved.get("production_runs", plan_p))
+                si = int(saved.get("invention_runs", plan_i))
+            except (TypeError, ValueError):
+                sp, si = plan_p, plan_i
+            sp = max(0, min(sp, plan_p))
+            si = max(0, min(si, plan_i))
+            # Snapshot the market sell price and breakeven the first time this row is put
+            # in production. Once stored, they are kept verbatim (not refreshed from market);
+            # 'Reset saved progress' clears them so they are re-captured on the next rebuild.
+            price_snap = saved.get("price_at_production")
+            bev_snap = saved.get("breakeven_price")
+            if price_snap is None and bev_snap is None:
+                price_snap, bev_snap = self._put_in_production_snapshot_prices(pl_conn, rkey, name)
+            rec = {"production_runs": sp, "invention_runs": si}
+            if price_snap is not None:
+                rec["price_at_production"] = price_snap
+            if bev_snap is not None:
+                rec["breakeven_price"] = bev_snap
+            self.production_tracking_by_product[rkey] = rec
+            ttk.Label(self.put_production_inner, text=name, wraplength=260).grid(row=row, column=0, sticky=tk.W, padx=4, pady=2)
+            ttk.Label(self.put_production_inner, text=res_disp, width=7).grid(row=row, column=1, sticky=tk.W, padx=4, pady=2)
+            ttk.Label(self.put_production_inner, text=runs_disp, width=9).grid(row=row, column=2, sticky=tk.W, padx=4, pady=2)
+            ttk.Label(self.put_production_inner, text=prod_bpcs_disp, width=7).grid(row=row, column=3, sticky=tk.W, padx=4, pady=2)
+            ttk.Label(self.put_production_inner, text=rpb_disp, width=7).grid(row=row, column=4, sticky=tk.W, padx=4, pady=2)
+            if plan_p > 0:
+                pv = tk.StringVar(value=str(sp))
+                opts = [str(i) for i in range(0, plan_p + 1)]
+                cb = ttk.Combobox(self.put_production_inner, textvariable=pv, values=opts, state="readonly", width=9)
+                cb.grid(row=row, column=5, sticky=tk.W, padx=4, pady=2)
+                cb.bind(
+                    "<<ComboboxSelected>>",
+                    lambda _e, k=rkey, var=pv, f="production_runs": self._put_in_production_on_change(k, f, var),
+                )
+            else:
+                ttk.Label(self.put_production_inner, text="—").grid(row=row, column=5, sticky=tk.W, padx=4)
+            ttk.Label(self.put_production_inner, text=dec_lbl, wraplength=160).grid(row=row, column=6, sticky=tk.W, padx=4, pady=2)
+            if plan_i > 0:
+                iv = tk.StringVar(value=str(si))
+                iopts = [str(i) for i in range(0, plan_i + 1)]
+                cb2 = ttk.Combobox(self.put_production_inner, textvariable=iv, values=iopts, state="readonly", width=9)
+                cb2.grid(row=row, column=7, sticky=tk.W, padx=4, pady=2)
+                cb2.bind(
+                    "<<ComboboxSelected>>",
+                    lambda _e, k=rkey, var=iv, f="invention_runs": self._put_in_production_on_change(k, f, var),
+                )
+            else:
+                ttk.Label(self.put_production_inner, text="—").grid(row=row, column=7, sticky=tk.W, padx=4)
+            ttk.Label(
+                self.put_production_inner,
+                text=self._shopping_list_format_price_display(price_snap),
+                width=12,
+            ).grid(row=row, column=8, sticky=tk.E, padx=4, pady=2)
+            ttk.Label(
+                self.put_production_inner,
+                text=self._shopping_list_format_price_display(bev_snap),
+                width=12,
+            ).grid(row=row, column=9, sticky=tk.E, padx=4, pady=2)
+            row += 1
+        if pl_conn is not None:
+            pl_conn.close()
+        self._save_production_tracking()
+
+    def _put_in_production_reset_progress(self):
+        """Clear persisted remaining-runs selections and restore values to plan defaults."""
+        if not getattr(self, "production_tracking_by_product", None):
+            messagebox.showinfo("Put in production", "Nothing to reset.")
+            return
+        ok = messagebox.askyesno(
+            "Reset saved progress",
+            "Reset all saved Put in production values back to current plan totals?\n\n"
+            "This clears persisted progress across sessions.",
+        )
+        if not ok:
+            return
+        self.production_tracking_by_product = {}
+        self._save_production_tracking()
+        self._put_in_production_rebuild_rows()
+        self.status_var.set("Put in production progress reset to plan totals.")
 
     def _shopping_list_expected_profit_and_cost(self, entry, total_runs):
         """
@@ -2007,6 +2795,9 @@ class EVELauncher:
         if column == "Sell immediate":
             si, _ = self._shopping_list_unit_sell_prices(conn, entry["product_name"])
             return (0, float(si) if si is not None else float("-inf"))
+        if column == "Hist 7d avg":
+            h = self._shopping_list_hist_7d_avg_price(conn, entry["product_name"])
+            return (0, float(h) if h is not None else float("-inf"))
         if column == "Sell offer":
             _, so = self._shopping_list_unit_sell_prices(conn, entry["product_name"])
             return (0, float(so) if so is not None else float("-inf"))
@@ -2434,7 +3225,9 @@ class EVELauncher:
             profit_per_bpc = float(profit_per_bpc)
         except (TypeError, ValueError):
             return None
-        runs_per_bpc = self._sl_prod_runs(entry)
+        # Breakeven is a per-item threshold and should not depend on how many BPCs
+        # are currently scheduled in # prod.
+        runs_per_bpc = max(1, int(entry.get("runs_per_bpc") or 1))
         items_per_run = self._sl_items_per_run(conn, entry["product_name"])
         items_per_bpc = runs_per_bpc * items_per_run
         if items_per_bpc <= 0:
@@ -2445,6 +3238,45 @@ class EVELauncher:
         if sell_off_unit is None:
             return None
         return sell_off_unit - profit_per_item
+
+    def _put_in_production_snapshot_prices(self, conn, rkey, product_name):
+        """Snapshot (sell_offer_unit, breakeven_unit) for this row's product at the current market.
+
+        Captured once, when the row is first put in production; never refreshed from market
+        afterwards (only re-captured when saved progress is reset). sell_offer_unit is the
+        net realised sell-offer price per item; breakeven_unit is the per-item sell price at
+        which profit = 0, both consistent with the shopping list's columns.
+        """
+        if conn is None:
+            return (None, None)
+        entry = None
+        for e in self.shopping_list:
+            nm = (e.get("product_name") or "").strip()
+            if not nm:
+                continue
+            dec_raw = (e.get("decryptor_name") or "").strip()
+            dec_key = "" if dec_raw in ("", "No decryptor") else dec_raw
+            if self._put_in_production_row_key(nm, dec_key) == rkey:
+                entry = e
+                break
+        if entry is None:
+            target = (product_name or "").strip()
+            for e in self.shopping_list:
+                if (e.get("product_name") or "").strip() == target:
+                    entry = e
+                    break
+        sell_off = None
+        breakeven = None
+        try:
+            _, sell_off = self._shopping_list_unit_sell_prices(conn, product_name)
+        except Exception:
+            sell_off = None
+        if entry is not None:
+            try:
+                breakeven = self._shopping_list_breakeven_price(conn, entry, sell_off)
+            except Exception:
+                breakeven = None
+        return (sell_off, breakeven)
 
     def _shopping_list_refresh_tree(self):
         """Rebuild the Treeview from self.shopping_list.
@@ -2461,11 +3293,14 @@ class EVELauncher:
         try:
             conn = sqlite3.connect(DATABASE_FILE)
             try:
+                override_names = self._material_override_names(conn)
                 for entry in self.shopping_list:
                     decryptor_str = self._shopping_list_decryptor_display(entry)
                     sell_imm, sell_off = self._shopping_list_unit_sell_prices(conn, entry["product_name"])
-                    sell_imm_str = f"{sell_imm:,.2f}" if sell_imm is not None and sell_imm > 0 else "—"
-                    sell_off_str = f"{sell_off:,.2f}" if sell_off is not None and sell_off > 0 else "—"
+                    sell_imm_str = self._shopping_list_format_price_display(sell_imm)
+                    sell_off_str = self._shopping_list_format_price_display(sell_off)
+                    hist7 = self._shopping_list_hist_7d_avg_price(conn, entry["product_name"])
+                    hist7_str = self._shopping_list_format_price_display(hist7)
                     profit_str = self._shopping_list_profit_cell(conn, entry)
                     bev = self._shopping_list_breakeven_price(conn, entry, sell_off)
                     breakeven_str = f"{bev:,.2f}" if bev is not None else "—"
@@ -2481,10 +3316,15 @@ class EVELauncher:
                     rpb = max(1, int(entry.get("runs_per_bpc") or 1))
                     rpb_str = str(rpb) if prod_n > 0 else "—"
                     # E[research] = profit per BPC; E[prod] = total mfg profit for prod runs
-                    row_tags = ("manual_rpb",) if entry.get("manual_runs_per_bpc") else ()
+                    _tags = []
+                    if entry.get("manual_runs_per_bpc"):
+                        _tags.append("manual_rpb")
+                    if entry["product_name"] in override_names:
+                        _tags.append("mat_override")
+                    row_tags = tuple(_tags)
                     self.shopping_list_tree.insert(
                         "", tk.END,
-                        values=(entry["product_name"], res_str, runs_str, prod_str, decryptor_str, rpb_str, total_cost_str, sell_imm_str, sell_off_str, breakeven_str, profit_str, e_prod_str, e_prod_min_str),
+                        values=(entry["product_name"], res_str, runs_str, prod_str, decryptor_str, rpb_str, total_cost_str, sell_imm_str, hist7_str, sell_off_str, breakeven_str, profit_str, e_prod_str, e_prod_min_str),
                         tags=row_tags,
                     )
             finally:
@@ -2500,7 +3340,7 @@ class EVELauncher:
                 row_tags = ("manual_rpb",) if entry.get("manual_runs_per_bpc") else ()
                 self.shopping_list_tree.insert(
                     "", tk.END,
-                    values=(entry["product_name"], res_str, runs_str, prod_str, decryptor_str, rpb_str, "—", "—", "—", "—", profit_str, "—", "—"),
+                    values=(entry["product_name"], res_str, runs_str, prod_str, decryptor_str, rpb_str, "—", "—", "—", "—", "—", profit_str, "—", "—"),
                     tags=row_tags,
                 )
         self._sl_update_totals_bar()
@@ -2639,13 +3479,18 @@ class EVELauncher:
             ent["runs_per_bpc"] = 1
         product_name = ent["product_name"]
         sell_imm_str, sell_off_str, breakeven_str = "—", "—", "—"
+        hist7_str = "—"
         profit_str = ""
+        total_cost_str = f"{ent['_cached_total_cost']:,.0f}" if ent.get("_cached_total_cost") is not None else "—"
+        e_prod_str = f"{ent['_cached_exp_profit']:,.0f}" if ent.get("_cached_exp_profit") is not None else "—"
         try:
             conn = sqlite3.connect(DATABASE_FILE)
             try:
                 sell_imm, sell_off = self._shopping_list_unit_sell_prices(conn, product_name)
-                sell_imm_str = f"{sell_imm:,.2f}" if sell_imm is not None and sell_imm > 0 else "—"
-                sell_off_str = f"{sell_off:,.2f}" if sell_off is not None and sell_off > 0 else "—"
+                sell_imm_str = self._shopping_list_format_price_display(sell_imm)
+                sell_off_str = self._shopping_list_format_price_display(sell_off)
+                h7 = self._shopping_list_hist_7d_avg_price(conn, product_name)
+                hist7_str = self._shopping_list_format_price_display(h7)
                 profit_str = self._shopping_list_profit_cell(conn, ent)
                 bev = self._shopping_list_breakeven_price(conn, ent, sell_off)
                 breakeven_str = f"{bev:,.2f}" if bev is not None else "—"
@@ -2658,9 +3503,26 @@ class EVELauncher:
         prod_n = self._sl_prod_runs(ent)
         rpb = max(1, int(ent.get("runs_per_bpc") or 1))
         rpb_str = str(rpb) if prod_n > 0 else "—"
-        # E[research] = profit per BPC (col 10); E[prod] = total mfg profit (col 11); E[prod -min] = col 12
         e_prod_min_str = f"{ent['_cached_exp_profit_min']:,.0f}" if ent.get("_cached_exp_profit_min") is not None else "—"
-        self.shopping_list_tree.item(item, values=(product_name, res_str, runs_str, prod_str, decryptor_str, rpb_str, "—", sell_imm_str, sell_off_str, breakeven_str, profit_str, "—", e_prod_min_str))
+        self.shopping_list_tree.item(
+            item,
+            values=(
+                product_name,
+                res_str,
+                runs_str,
+                prod_str,
+                decryptor_str,
+                rpb_str,
+                total_cost_str,
+                sell_imm_str,
+                hist7_str,
+                sell_off_str,
+                breakeven_str,
+                profit_str,
+                e_prod_str,
+                e_prod_min_str,
+            ),
+        )
         self._refresh_shopping_list_aggregate()
         self._save_shopping_list()
         self.status_var.set(f"Quantities updated: research={research}, runs={runs_per_research}, prod={prod}. Click 'Refresh profitability' to update Expected profit / Total material cost.")
@@ -2688,6 +3550,33 @@ class EVELauncher:
         self._save_shopping_list()
         self.status_var.set(f"Prod set to 0 for {ent['product_name']}.")
 
+    def _shopping_list_reset_all_quantities_zero(self):
+        """Set Research/Runs/Prod to 0 for every shopping-list row (with confirmation)."""
+        if not self.shopping_list:
+            messagebox.showinfo("Shopping list", "The list is empty.")
+            return
+        ok = messagebox.askyesno(
+            "Confirm reset",
+            "Set Research, Runs, and # prod to 0 for ALL rows?\n\nThis cannot be undone automatically.",
+        )
+        if not ok:
+            return
+        for ent in self.shopping_list:
+            if not isinstance(ent, dict):
+                continue
+            ent["research"] = 0
+            ent["runs_per_research"] = 0
+            ent["prod"] = 0
+            # Keep legacy fields coherent and make row inactive in all code paths.
+            ent["quantity"] = 0
+        self.shopping_list_research_var.set("0")
+        self.shopping_list_runs_var.set("0")
+        self.shopping_list_prod_var.set("0")
+        self._shopping_list_refresh_tree()
+        self._refresh_shopping_list_aggregate()
+        self._save_shopping_list()
+        self.status_var.set("All shopping-list quantities reset to 0.")
+
     def _shopping_list_remove_selected(self):
         """Remove the selected row from the shopping list."""
         sel = self.shopping_list_tree.selection()
@@ -2706,6 +3595,182 @@ class EVELauncher:
         self._refresh_shopping_list_aggregate()
         self._save_shopping_list()
         self.status_var.set("Removed from shopping list.")
+
+    def _ensure_material_override_table(self, conn):
+        """Per-blueprint custom material list (per 1 run) — overrides ME-derived quantities."""
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS blueprint_material_override (
+                   blueprint_type_id INTEGER NOT NULL,
+                   material_type_id INTEGER NOT NULL,
+                   material_name TEXT NOT NULL,
+                   quantity INTEGER NOT NULL,
+                   PRIMARY KEY (blueprint_type_id, material_type_id)
+               )"""
+        )
+
+    def _get_material_override(self, conn, blueprint_type_id):
+        """Return [{materialTypeID, materialName, quantity}] (per run) for a blueprint, or None."""
+        self._ensure_material_override_table(conn)
+        rows = conn.execute(
+            "SELECT material_type_id, material_name, quantity FROM blueprint_material_override "
+            "WHERE blueprint_type_id = ? ORDER BY material_name",
+            (blueprint_type_id,),
+        ).fetchall()
+        if not rows:
+            return None
+        return [{"materialTypeID": r[0], "materialName": r[1], "quantity": int(r[2])} for r in rows]
+
+    def _set_material_override(self, conn, blueprint_type_id, materials):
+        """Replace the override for a blueprint. materials: iterable of (type_id, name, qty)."""
+        self._ensure_material_override_table(conn)
+        conn.execute("DELETE FROM blueprint_material_override WHERE blueprint_type_id = ?", (blueprint_type_id,))
+        conn.executemany(
+            "INSERT INTO blueprint_material_override (blueprint_type_id, material_type_id, material_name, quantity) "
+            "VALUES (?,?,?,?)",
+            [(int(blueprint_type_id), int(mt), str(mn), int(q)) for (mt, mn, q) in materials],
+        )
+        conn.commit()
+
+    def _clear_material_override(self, conn, blueprint_type_id):
+        """Remove any custom material list bound to a blueprint."""
+        self._ensure_material_override_table(conn)
+        conn.execute("DELETE FROM blueprint_material_override WHERE blueprint_type_id = ?", (blueprint_type_id,))
+        conn.commit()
+
+    def _material_override_names(self, conn):
+        """Return the set of product names that currently have a bound custom material list."""
+        self._ensure_material_override_table(conn)
+        try:
+            rows = conn.execute(
+                "SELECT DISTINCT b.productName FROM blueprint_material_override o "
+                "JOIN blueprints b ON o.blueprint_type_id = b.blueprintTypeID"
+            ).fetchall()
+            return {r[0] for r in rows if r[0]}
+        except Exception:
+            return set()
+
+    def _shopping_list_selected_entry(self):
+        """Return (index, entry) for the currently selected shopping-list row, or (None, None)."""
+        sel = self.shopping_list_tree.selection()
+        if not sel:
+            return None, None
+        children = list(self.shopping_list_tree.get_children())
+        try:
+            idx = children.index(sel[0])
+        except ValueError:
+            return None, None
+        if idx < 0 or idx >= len(self.shopping_list):
+            return None, None
+        return idx, self.shopping_list[idx]
+
+    def _shopping_list_edit_materials(self):
+        """Open an editor to bind a custom per-run material list to the selected blueprint.
+
+        Quantities are the materials consumed to produce ONE run (the blueprint's base
+        output). The aggregate multiplies these by total runs (# prod x Run per BPC).
+        Use this to capture null-sec / structure / rig material bonuses that differ from
+        the ME-implied amounts.
+        """
+        idx, entry = self._shopping_list_selected_entry()
+        if entry is None:
+            messagebox.showinfo("Edit material list", "Select a blueprint row in the list first.")
+            return
+        name = (entry.get("product_name") or "").strip()
+        if not Path(DATABASE_FILE).exists():
+            messagebox.showerror("Edit material list", "Database not found.")
+            return
+        conn = sqlite3.connect(DATABASE_FILE)
+        try:
+            bp = resolve_blueprint(conn, name)
+            if not bp:
+                messagebox.showerror("Edit material list", f"No blueprint found for '{name}'.")
+                return
+            bid = bp["blueprintTypeID"]
+            base = get_blueprint_materials(conn, bid)  # per-run, ME 0
+            override = self._get_material_override(conn, bid)
+        finally:
+            conn.close()
+        if not base:
+            messagebox.showinfo("Edit material list", f"'{name}' has no manufacturing materials to edit.")
+            return
+        ov_qty = {m["materialTypeID"]: m["quantity"] for m in (override or [])}
+
+        win = tk.Toplevel(self.root)
+        win.title(f"Material list per run — {name}")
+        win.geometry("520x560")
+        ttk.Label(
+            win,
+            text=(f"Materials to produce ONE run of {name} (output x{int(bp['outputQuantity'])}).\n"
+                  "Enter the amounts you actually consume in-game (e.g. at your null-sec structure) "
+                  "for a 1-run job. The shopping list multiplies these by total runs (# prod x Run per BPC).\n"
+                  "Defaults shown are the blueprint's ME 0 amounts."),
+            justify=tk.LEFT, wraplength=490,
+        ).pack(anchor=tk.W, padx=10, pady=(10, 6))
+        if override is not None:
+            ttk.Label(win, text="A custom list is currently bound to this blueprint.",
+                      foreground="#a06a00").pack(anchor=tk.W, padx=10)
+
+        body = ttk.Frame(win)
+        body.pack(fill=tk.BOTH, expand=True, padx=10, pady=6)
+        canvas = tk.Canvas(body, highlightthickness=0)
+        vsb = ttk.Scrollbar(body, orient=tk.VERTICAL, command=canvas.yview)
+        inner = ttk.Frame(canvas)
+        inner.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.create_window((0, 0), window=inner, anchor=tk.NW)
+        canvas.configure(yscrollcommand=vsb.set)
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        vsb.pack(side=tk.RIGHT, fill=tk.Y)
+
+        ttk.Label(inner, text="Material", font=("TkDefaultFont", 9, "bold")).grid(row=0, column=0, sticky=tk.W, padx=4, pady=2)
+        ttk.Label(inner, text="Qty / run", font=("TkDefaultFont", 9, "bold")).grid(row=0, column=1, sticky=tk.W, padx=4, pady=2)
+        ttk.Label(inner, text="(ME0)", font=("TkDefaultFont", 8)).grid(row=0, column=2, sticky=tk.W, padx=4, pady=2)
+        var_map = {}
+        for r, m in enumerate(base, start=1):
+            mt = m["materialTypeID"]
+            mname = m["materialName"]
+            base_q = int(m["quantity"])
+            cur_q = ov_qty.get(mt, base_q)
+            ttk.Label(inner, text=mname, wraplength=260).grid(row=r, column=0, sticky=tk.W, padx=4, pady=1)
+            var = tk.StringVar(value=str(cur_q))
+            ttk.Entry(inner, textvariable=var, width=12, justify=tk.RIGHT).grid(row=r, column=1, sticky=tk.W, padx=4, pady=1)
+            ttk.Label(inner, text=f"{base_q:,}").grid(row=r, column=2, sticky=tk.W, padx=4, pady=1)
+            var_map[mt] = (mname, var)
+
+        def save():
+            mats = []
+            for mt, (mname, var) in var_map.items():
+                try:
+                    q = int(float(str(var.get()).replace(",", "").strip()))
+                except (ValueError, TypeError):
+                    messagebox.showerror("Invalid quantity", f"'{mname}' has a non-numeric quantity.", parent=win)
+                    return
+                mats.append((mt, mname, max(0, q)))
+            c = sqlite3.connect(DATABASE_FILE)
+            try:
+                self._set_material_override(c, bid, mats)
+            finally:
+                c.close()
+            self._refresh_shopping_list_aggregate()
+            self._shopping_list_refresh_tree()
+            self.status_var.set(f"Bound custom material list to {name}.")
+            win.destroy()
+
+        def reset():
+            c = sqlite3.connect(DATABASE_FILE)
+            try:
+                self._clear_material_override(c, bid)
+            finally:
+                c.close()
+            self._refresh_shopping_list_aggregate()
+            self._shopping_list_refresh_tree()
+            self.status_var.set(f"Reset {name} to default (ME-derived) materials.")
+            win.destroy()
+
+        btns = ttk.Frame(win)
+        btns.pack(fill=tk.X, padx=10, pady=(0, 10))
+        ttk.Button(btns, text="Save (bind to blueprint)", command=save).pack(side=tk.LEFT, padx=4)
+        ttk.Button(btns, text="Reset to default", command=reset).pack(side=tk.LEFT, padx=4)
+        ttk.Button(btns, text="Cancel", command=win.destroy).pack(side=tk.RIGHT, padx=4)
 
     def _refresh_shopping_list_aggregate(self):
         """Compute aggregated materials (and datacores) from shopping_list and update the text. Stores result in self.shopping_list_aggregated for inventory comparison."""
@@ -2754,7 +3819,8 @@ class EVELauncher:
                         continue
                     bid = bp["blueprintTypeID"]
                     if total_runs > 0:
-                        materials = get_blueprint_materials(conn, bid)
+                        # Use a bound custom per-run material list if present, else the ME0 base.
+                        materials = self._get_material_override(conn, bid) or get_blueprint_materials(conn, bid)
                         for m in materials:
                             mat_name = m["materialName"]
                             need = m["quantity"] * total_runs
@@ -2853,22 +3919,29 @@ class EVELauncher:
         return name
 
     def _shopping_list_compare_inventory(self):
-        """Parse pasted inventory, compare to aggregated requirements, show shortfall (need − have) in the shortfall text."""
+        """Parse pasted inventory: shortfall, unused (not in plan), and excess (have − 3× need)."""
         self.shopping_list_shortfall_text.configure(state=tk.NORMAL)
         self.shopping_list_shortfall_text.delete(1.0, tk.END)
+        eu = getattr(self, "shopping_list_excess_unused_text", None)
+        if eu is not None:
+            eu.configure(state=tk.NORMAL)
+            eu.delete(1.0, tk.END)
         if not getattr(self, "shopping_list_aggregated", None):
             self._refresh_shopping_list_aggregate()
         aggregated = getattr(self, "shopping_list_aggregated", None) or {}
         if not aggregated:
             self.shopping_list_shortfall_text.insert(tk.END, "No required items (add blueprints and refresh list first).")
             self.shopping_list_shortfall_text.configure(state=tk.DISABLED)
+            if eu is not None:
+                eu.insert(tk.END, "No plan to compare.")
+                eu.configure(state=tk.DISABLED)
             return
         raw = self.shopping_list_inventory_text.get(1.0, tk.END)
         inventory = self._parse_inventory_paste(raw)
-        # Build inventory by normalized key (match to aggregated keys)
+        req_keys = set(aggregated.keys())
         have_by_key = {}
         for pasted_name, qty in inventory.items():
-            key = self._normalize_inventory_key(pasted_name, set(aggregated.keys()))
+            key = self._normalize_inventory_key(pasted_name, req_keys)
             if key in aggregated:
                 have_by_key[key] = have_by_key.get(key, 0) + qty
         shortfall = {}
@@ -2882,7 +3955,6 @@ class EVELauncher:
             lines = []
             for name in sorted(shortfall.keys()):
                 lines.append(f"{name}\t{shortfall[name]:,}")
-            # Compute total cost of shortfall items using sell_immediate (sell_min) prices
             total_cost = 0.0
             unpriced = []
             try:
@@ -2910,7 +3982,37 @@ class EVELauncher:
                 lines.append(f"(no price for: {', '.join(sorted(unpriced))})")
             self.shopping_list_shortfall_text.insert(tk.END, "\n".join(lines))
         self.shopping_list_shortfall_text.configure(state=tk.DISABLED)
-        self.status_var.set("Shortfall updated (required − pasted inventory).")
+        unused = {}
+        for pasted_name, qty in inventory.items():
+            key = self._normalize_inventory_key(pasted_name, req_keys)
+            if key not in aggregated:
+                unused[pasted_name] = unused.get(pasted_name, 0) + qty
+        excess = {}
+        for name, need in aggregated.items():
+            if need <= 0:
+                continue
+            have = have_by_key.get(name, 0)
+            cap = 3 * need
+            if have > cap:
+                excess[name] = have - cap
+        if eu is not None:
+            parts = []
+            if unused:
+                parts.append("UNUSED (not in plan)\n")
+                for name in sorted(unused.keys(), key=lambda x: x.lower()):
+                    parts.append(f"{name}\t{unused[name]:,}\n")
+            else:
+                parts.append("UNUSED (not in plan)\n(none — all pasted lines matched a plan item)\n")
+            parts.append("\n")
+            if excess:
+                parts.append("EXCESS (have − 3× need)\n")
+                for name in sorted(excess.keys()):
+                    parts.append(f"{name}\t{excess[name]:,}\n")
+            else:
+                parts.append("EXCESS (have − 3× need)\n(none)\n")
+            eu.insert(tk.END, "".join(parts))
+            eu.configure(state=tk.DISABLED)
+        self.status_var.set("Compared inventory: shortfall, unused, and excess updated.")
 
     def _shopping_list_copy_shortfall(self):
         """Copy the shortfall item list to clipboard, excluding the total-cost summary line."""
@@ -2950,15 +4052,18 @@ class EVELauncher:
         if not self.shopping_list:
             messagebox.showinfo("Copy plan", "Shopping list is empty.")
             return
-        lines = ["Blueprint / Product\tResearch\tRuns\t# prod\tDecryptor\tRun per BPC\tTotal material cost\tSell immediate\tSell offer\tBreakeven\tE[research]\tE[prod]\tE[prod -min]"]
+        lines = ["Blueprint / Product\tResearch\tRuns\t# prod\tDecryptor\tRun per BPC\tTotal material cost\tSell immediate\tHist 7d avg\tSell offer\tBreakeven\tE[research]\tE[prod]\tE[prod -min]"]
         try:
             conn = sqlite3.connect(DATABASE_FILE)
             try:
                 for entry in self.shopping_list:
                     decryptor_str = self._shopping_list_decryptor_display(entry)
                     sell_imm, sell_off = self._shopping_list_unit_sell_prices(conn, entry["product_name"])
-                    sell_imm_str = f"{sell_imm:,.2f}" if sell_imm is not None and sell_imm > 0 else "—"
-                    sell_off_str = f"{sell_off:,.2f}" if sell_off is not None and sell_off > 0 else "—"
+                    sell_imm_str = self._shopping_list_format_price_display(sell_imm)
+                    sell_off_str = self._shopping_list_format_price_display(sell_off)
+                    hist7_str = self._shopping_list_format_price_display(
+                        self._shopping_list_hist_7d_avg_price(conn, entry["product_name"])
+                    )
                     e_prod_str = f"{entry['_cached_exp_profit']:,.0f}" if entry.get("_cached_exp_profit") is not None else "—"
                     e_prod_min_str = f"{entry['_cached_exp_profit_min']:,.0f}" if entry.get("_cached_exp_profit_min") is not None else "—"
                     total_cost_str = f"{entry['_cached_total_cost']:,.0f}" if entry.get("_cached_total_cost") is not None else "—"
@@ -2969,7 +4074,7 @@ class EVELauncher:
                     prod_n = self._sl_prod_runs(entry)
                     rpb = max(1, int(entry.get("runs_per_bpc") or 1))
                     rpb_str = str(rpb) if prod_n > 0 else "—"
-                    lines.append(f"{entry['product_name']}\t{res_str}\t{runs_str}\t{prod_str}\t{decryptor_str}\t{rpb_str}\t{total_cost_str}\t{sell_imm_str}\t{sell_off_str}\t{breakeven_str}\t{e_research_str}\t{e_prod_str}\t{e_prod_min_str}")
+                    lines.append(f"{entry['product_name']}\t{res_str}\t{runs_str}\t{prod_str}\t{decryptor_str}\t{rpb_str}\t{total_cost_str}\t{sell_imm_str}\t{hist7_str}\t{sell_off_str}\t{breakeven_str}\t{e_research_str}\t{e_prod_str}\t{e_prod_min_str}")
             finally:
                 conn.close()
         except Exception:
@@ -2983,7 +4088,7 @@ class EVELauncher:
                 prod_n = self._sl_prod_runs(entry)
                 rpb = max(1, int(entry.get("runs_per_bpc") or 1))
                 rpb_str = str(rpb) if prod_n > 0 else "—"
-                lines.append(f"{entry['product_name']}\t{res_str}\t{runs_str}\t{prod_str}\t{decryptor_str}\t{rpb_str}\t{total_cost_str}\t—\t—\t—\t{e_research_str}\t{e_prod_str}\t{e_prod_min_str}")
+                lines.append(f"{entry['product_name']}\t{res_str}\t{runs_str}\t{prod_str}\t{decryptor_str}\t{rpb_str}\t{total_cost_str}\t—\t—\t—\t—\t{e_research_str}\t{e_prod_str}\t{e_prod_min_str}")
         text = "\n".join(lines)
         self.root.clipboard_clear()
         self.root.clipboard_append(text)
@@ -3054,9 +4159,11 @@ class EVELauncher:
         if dec.get("dc2_qty") is not None:
             self.decryptor_dc2_qty_var.set(str(int(dec["dc2_qty"])))
         sl = prefs.get("shopping_list") or {}
-        if sl.get("max_research_days") is not None:
+        # Shopping-list controls are created in create_shopping_list_tab(), which may run
+        # after this method depending on tab init order.
+        if hasattr(self, "sl_max_research_days_var") and sl.get("max_research_days") is not None:
             self.sl_max_research_days_var.set(str(sl["max_research_days"]))
-        if sl.get("max_research_hours") is not None:
+        if hasattr(self, "sl_max_research_hours_var") and sl.get("max_research_hours") is not None:
             self.sl_max_research_hours_var.set(str(sl["max_research_hours"]))
 
     def _save_decryptor_prefs(self):
@@ -3078,9 +4185,11 @@ class EVELauncher:
                 "dc2_qty": self.decryptor_dc2_qty_var.get().strip(),
             }
             # Persist shopping list global settings
+            max_days = self.sl_max_research_days_var.get().strip() if hasattr(self, "sl_max_research_days_var") else ""
+            max_hours = self.sl_max_research_hours_var.get().strip() if hasattr(self, "sl_max_research_hours_var") else ""
             prefs["shopping_list"] = {
-                "max_research_days": self.sl_max_research_days_var.get().strip(),
-                "max_research_hours": self.sl_max_research_hours_var.get().strip(),
+                "max_research_days": max_days,
+                "max_research_hours": max_hours,
             }
             with open(LAUNCHER_PREFS_FILE, "w", encoding="utf-8") as f:
                 json.dump(prefs, f, indent=2)
@@ -3547,74 +4656,6 @@ Price Update Options:
         self.price_update_log = scrolledtext.ScrolledText(log_frame, wrap=tk.WORD, height=20)
         self.price_update_log.pack(fill=tk.BOTH, expand=True)
     
-    def create_exclusions_tab(self):
-        """Create the Excluded Modules management tab"""
-        frame = ttk.Frame(self.notebook)
-        self.notebook.add(frame, text="Excluded Modules")
-        
-        # Info frame
-        info_frame = ttk.LabelFrame(frame, text="Information", padding=10)
-        info_frame.pack(fill=tk.X, padx=10, pady=10)
-        
-        info_text = """
-Excluded modules are filtered from Top 30 Analysis results based on search parameters.
-Each exclusion is tied to specific price ranges and price types, so a module excluded
-for one search may still appear in searches with different parameters.
-        """
-        ttk.Label(info_frame, text=info_text.strip(), justify=tk.LEFT, wraplength=700).pack(anchor=tk.W)
-        
-        # Buttons frame
-        buttons_frame = ttk.Frame(frame, padding=10)
-        buttons_frame.pack(fill=tk.X, padx=10, pady=5)
-        
-        refresh_btn = ttk.Button(buttons_frame, text="Refresh List", command=self.refresh_exclusions_list)
-        refresh_btn.pack(side=tk.LEFT, padx=5)
-        
-        clear_all_btn = ttk.Button(buttons_frame, text="Clear All Exclusions", command=self.clear_all_exclusions)
-        clear_all_btn.pack(side=tk.LEFT, padx=5)
-        
-        # Table frame
-        table_frame = ttk.LabelFrame(frame, text="Excluded Modules", padding=10)
-        table_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
-        
-        # Create treeview
-        columns = ('Module Name', 'Type ID', 'Min Price', 'Max Price', 'Module Price Type', 'Mineral Price Type', 'Excluded At')
-        self.exclusions_tree = ttk.Treeview(table_frame, columns=columns, show='headings', height=20)
-        
-        # Configure columns
-        self.exclusions_tree.heading('Module Name', text='Module Name')
-        self.exclusions_tree.heading('Type ID', text='Type ID')
-        self.exclusions_tree.heading('Min Price', text='Min Price')
-        self.exclusions_tree.heading('Max Price', text='Max Price')
-        self.exclusions_tree.heading('Module Price Type', text='Module Price Type')
-        self.exclusions_tree.heading('Mineral Price Type', text='Mineral Price Type')
-        self.exclusions_tree.heading('Excluded At', text='Excluded At')
-        
-        self.exclusions_tree.column('Module Name', width=250)
-        self.exclusions_tree.column('Type ID', width=80, anchor=tk.E)
-        self.exclusions_tree.column('Min Price', width=100, anchor=tk.E)
-        self.exclusions_tree.column('Max Price', width=100, anchor=tk.E)
-        self.exclusions_tree.column('Module Price Type', width=120)
-        self.exclusions_tree.column('Mineral Price Type', width=120)
-        self.exclusions_tree.column('Excluded At', width=150)
-        
-        # Scrollbar
-        scrollbar = ttk.Scrollbar(table_frame, orient=tk.VERTICAL, command=self.exclusions_tree.yview)
-        self.exclusions_tree.configure(yscrollcommand=scrollbar.set)
-        
-        self.exclusions_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-        
-        # Action buttons frame
-        action_frame = ttk.Frame(frame, padding=10)
-        action_frame.pack(fill=tk.X, padx=10, pady=5)
-        
-        remove_btn = ttk.Button(action_frame, text="Remove Selected", command=self.remove_selected_exclusion)
-        remove_btn.pack(side=tk.LEFT, padx=5)
-        
-        # Load exclusions on startup
-        self.refresh_exclusions_list()
-    
     def create_on_offer_tab(self):
         """Create the On Offer tab to track items with active orders"""
         frame = ttk.Frame(self.notebook)
@@ -3714,7 +4755,14 @@ for one search may still appear in searches with different parameters.
             "Paste in-game window content: one line per item, 'Name<Tab>Quantity' (quantity optional, default 1). "
             "For reprocessable items: if item value ≥ threshold we compare to lowest sell; else to lowest buy. "
             "Recommend Sell only when (sell value − reprocess value) × Qty ≥ 'Min ISK above reprocess to recommend Sell'. "
-            "For manufacturing: paste one blueprint or product name per line; system will compute profit for 1/10/100 runs at 0% and 10% ME."
+            "When C-N4OD compare is on, a ★ marks the most profitable of 'Reprocess Value/Item', 'Jita Landed' and "
+            "'C-N4OD Sell' per row ('Jita Landed' = Jita sell price minus shipping to move it there: 1,000 ISK/m3 + 0.6% of value; "
+            "'C-N4OD Sell' is the local sell price, no shipping). "
+            "For manufacturing: paste one blueprint or product name per line (duplicate names are shown once; click a column header to sort). The grid shows 1-run profit at ME 0, ME 5 and ME 10, "
+            "for output sold buy-now (into buy order) vs sell order, plus % return columns for ME 10. All prices are Jita and "
+            "include transport each way (1,000 ISK/m3 + 0.6% of value); green = profit, red = loss. Click any cell for the full "
+            "calculation breakdown, where you can override the manufacturing cost, recalculate, and bind that cost to the blueprint "
+            "(bound blueprints are marked [bound] and reuse the saved cost)."
         )
         ttk.Label(info_frame, text=info_text, justify=tk.LEFT, wraplength=900).pack(anchor=tk.W)
         
@@ -3744,18 +4792,33 @@ for one search may still appear in searches with different parameters.
         params_frame.pack(fill=tk.X, padx=10, pady=5)
         self.paste_compare_repro_params_frame = ttk.Frame(params_frame)
         self.paste_compare_repro_params_frame.pack(side=tk.LEFT)
-        ttk.Label(self.paste_compare_repro_params_frame, text="Threshold (ISK):").pack(side=tk.LEFT, padx=5)
-        self.paste_threshold_var = tk.StringVar(value="100000")
-        ttk.Entry(self.paste_compare_repro_params_frame, textvariable=self.paste_threshold_var, width=12).pack(side=tk.LEFT, padx=5)
-        ttk.Label(self.paste_compare_repro_params_frame, text="Min ISK above reprocess to recommend Sell:").pack(side=tk.LEFT, padx=5)
-        self.paste_sell_buffer_var = tk.StringVar(value="0")
-        ttk.Entry(self.paste_compare_repro_params_frame, textvariable=self.paste_sell_buffer_var, width=12).pack(side=tk.LEFT, padx=5)
-        ttk.Label(self.paste_compare_repro_params_frame, text="Yield %:").pack(side=tk.LEFT, padx=5)
+        repro_row1 = ttk.Frame(self.paste_compare_repro_params_frame)
+        repro_row1.pack(fill=tk.X, anchor=tk.W)
+        ttk.Label(repro_row1, text="Threshold (ISK):").pack(side=tk.LEFT, padx=5)
+        self.paste_threshold_var = tk.StringVar(value="400000")
+        ttk.Entry(repro_row1, textvariable=self.paste_threshold_var, width=12).pack(side=tk.LEFT, padx=5)
+        ttk.Label(repro_row1, text="Min ISK above reprocess to recommend Sell:").pack(side=tk.LEFT, padx=5)
+        self.paste_sell_buffer_var = tk.StringVar(value="20000")
+        ttk.Entry(repro_row1, textvariable=self.paste_sell_buffer_var, width=12).pack(side=tk.LEFT, padx=5)
+        ttk.Label(repro_row1, text="Yield %:").pack(side=tk.LEFT, padx=5)
         self.paste_yield_var = tk.StringVar(value="55.0")
-        ttk.Entry(self.paste_compare_repro_params_frame, textvariable=self.paste_yield_var, width=8).pack(side=tk.LEFT, padx=5)
-        ttk.Label(self.paste_compare_repro_params_frame, text="Reprocessing cost %:").pack(side=tk.LEFT, padx=5)
+        ttk.Entry(repro_row1, textvariable=self.paste_yield_var, width=8).pack(side=tk.LEFT, padx=5)
+        ttk.Label(repro_row1, text="Reprocessing cost %:").pack(side=tk.LEFT, padx=5)
         self.paste_repro_cost_var = tk.StringVar(value="3.37")
-        ttk.Entry(self.paste_compare_repro_params_frame, textvariable=self.paste_repro_cost_var, width=8).pack(side=tk.LEFT, padx=5)
+        ttk.Entry(repro_row1, textvariable=self.paste_repro_cost_var, width=8).pack(side=tk.LEFT, padx=5)
+        # C-N4OD arbitrage comparison (Jita sell + shipping vs C-N4OD sell) — on its own line
+        repro_row2 = ttk.Frame(self.paste_compare_repro_params_frame)
+        repro_row2.pack(fill=tk.X, anchor=tk.W, pady=(4, 0))
+        self.paste_cn_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(
+            repro_row2,
+            text="Compare C-N4OD (SSO)",
+            variable=self.paste_cn_var,
+        ).pack(side=tk.LEFT, padx=(5, 4))
+        ttk.Button(repro_row2, text="Refresh C-N prices", command=self._paste_refresh_cn_prices).pack(side=tk.LEFT, padx=2)
+        # Cached C-N4OD sell map for the session: {type_id: min_sell}
+        self._cn4od_sell_cache = None
+        self._cn4od_note = ""
         
         compare_btn = ttk.Button(params_frame, text="Compare", command=self.run_paste_compare)
         compare_btn.pack(side=tk.LEFT, padx=15)
@@ -3764,35 +4827,54 @@ for one search may still appear in searches with different parameters.
         results_frame = ttk.LabelFrame(frame, text="Results", padding=10)
         results_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
         # Reprocessing tree
-        self.paste_compare_columns = ('Item Name', 'Qty', 'Sell Min', 'Buy Max', 'Reprocess Value/Item', 'Recommendation')
+        self.paste_compare_columns = ('Item Name', 'Qty', 'Sell Min', 'Buy Max', 'Reprocess Value/Item', 'Recommendation', 'Jita Landed', 'C-N4OD Sell', 'C-N Margin %')
         self.paste_compare_tree = ttk.Treeview(results_frame, columns=self.paste_compare_columns, show='headings', height=20, selectmode='browse')
         self.paste_compare_sort_column = None
         self.paste_compare_sort_reverse = False
         for col in self.paste_compare_columns:
             self.paste_compare_tree.heading(col, text=col, command=lambda c=col: self.sort_paste_compare_by(c))
-        self.paste_compare_tree.column('Item Name', width=320, anchor=tk.W)
+        self.paste_compare_tree.column('Item Name', width=280, anchor=tk.W)
         self.paste_compare_tree.column('Qty', width=50, anchor=tk.E)
-        self.paste_compare_tree.column('Sell Min', width=100, anchor=tk.E)
-        self.paste_compare_tree.column('Buy Max', width=100, anchor=tk.E)
-        self.paste_compare_tree.column('Reprocess Value/Item', width=140, anchor=tk.E)
-        self.paste_compare_tree.column('Recommendation', width=120, anchor=tk.W)
+        self.paste_compare_tree.column('Sell Min', width=95, anchor=tk.E)
+        self.paste_compare_tree.column('Buy Max', width=95, anchor=tk.E)
+        self.paste_compare_tree.column('Reprocess Value/Item', width=130, anchor=tk.E)
+        self.paste_compare_tree.column('Recommendation', width=110, anchor=tk.W)
+        self.paste_compare_tree.column('Jita Landed', width=100, anchor=tk.E)
+        self.paste_compare_tree.column('C-N4OD Sell', width=100, anchor=tk.E)
+        self.paste_compare_tree.column('C-N Margin %', width=90, anchor=tk.E)
         self.paste_compare_scrollbar_repro = ttk.Scrollbar(results_frame, orient=tk.VERTICAL, command=self.paste_compare_tree.yview)
         self.paste_compare_tree.configure(yscrollcommand=self.paste_compare_scrollbar_repro.set)
         self.paste_compare_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         self.paste_compare_scrollbar_repro.pack(side=tk.RIGHT, fill=tk.Y)
-        # Manufacturing tree (same frame, shown when mode=manufacturing)
-        self.paste_compare_columns_mfg = ('Blueprint', 'Profit 1r ME0', 'Profit 1r ME10', 'Profit 10r ME0', 'Profit 10r ME10', 'Profit 100r ME0', 'Profit 100r ME10')
-        self.paste_compare_tree_mfg = ttk.Treeview(results_frame, columns=self.paste_compare_columns_mfg, show='headings', height=20, selectmode='browse')
-        for col in self.paste_compare_columns_mfg:
-            self.paste_compare_tree_mfg.heading(col, text=col)
-        self.paste_compare_tree_mfg.column('Blueprint', width=280, anchor=tk.W)
-        for c in self.paste_compare_columns_mfg[1:]:
-            self.paste_compare_tree_mfg.column(c, width=100, anchor=tk.E)
-        self.paste_compare_scrollbar_mfg = ttk.Scrollbar(results_frame, orient=tk.VERTICAL, command=self.paste_compare_tree_mfg.yview)
-        self.paste_compare_tree_mfg.configure(yscrollcommand=self.paste_compare_scrollbar_mfg.set)
-        # Initially hide mfg tree (repro is visible)
-        self.paste_compare_tree_mfg.pack_forget()
-        self.paste_compare_scrollbar_mfg.pack_forget()
+        # Manufacturing results: custom grid so each profit cell can be colored (red/green) and clicked for details.
+        # (header text, scenario key or None for name column, is_pct)
+        self._paste_mfg_col_specs = [
+            ("Blueprint", None, False),
+            ("ME0 buy-now\n(profit ISK)", "me0_bn", False),
+            ("ME0 sell\n(profit ISK)", "me0_sell", False),
+            ("ME5 buy-now\n(profit ISK)", "me5_bn", False),
+            ("ME5 sell\n(profit ISK)", "me5_sell", False),
+            ("ME10 buy-now\n(profit ISK)", "me10_bn", False),
+            ("ME10 sell\n(profit ISK)", "me10_sell", False),
+            ("ME10 buy-now\n(return %)", "me10_bn", True),
+            ("ME10 sell\n(return %)", "me10_sell", True),
+        ]
+        self._paste_mfg_grid_rows = []
+        self._paste_mfg_sort_col = None
+        self._paste_mfg_sort_reverse = False
+        self.paste_mfg_container = ttk.Frame(results_frame)
+        self.paste_mfg_canvas = tk.Canvas(self.paste_mfg_container, highlightthickness=0)
+        self.paste_mfg_vsb = ttk.Scrollbar(self.paste_mfg_container, orient=tk.VERTICAL, command=self.paste_mfg_canvas.yview)
+        self.paste_mfg_grid = ttk.Frame(self.paste_mfg_canvas)
+        self.paste_mfg_grid.bind(
+            "<Configure>",
+            lambda e: self.paste_mfg_canvas.configure(scrollregion=self.paste_mfg_canvas.bbox("all")),
+        )
+        self.paste_mfg_canvas.create_window((0, 0), window=self.paste_mfg_grid, anchor=tk.NW)
+        self.paste_mfg_canvas.configure(yscrollcommand=self.paste_mfg_vsb.set)
+        self.paste_mfg_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self.paste_mfg_vsb.pack(side=tk.RIGHT, fill=tk.Y)
+        self._paste_mfg_message("Paste blueprints and click Compare.")
         # Sync visibility with mode (hide mfg params initially since default is reprocessing)
         self._paste_compare_switch_mode()
     
@@ -3803,16 +4885,55 @@ for one search may still appear in searches with different parameters.
             self.paste_compare_repro_params_frame.pack_forget()
             self.paste_compare_tree.pack_forget()
             self.paste_compare_scrollbar_repro.pack_forget()
-            self.paste_compare_tree_mfg.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-            self.paste_compare_scrollbar_mfg.pack(side=tk.RIGHT, fill=tk.Y)
+            self.paste_mfg_container.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         else:
             self.paste_compare_mfg_params_frame.pack_forget()
             self.paste_compare_repro_params_frame.pack(side=tk.LEFT)
-            self.paste_compare_tree_mfg.pack_forget()
-            self.paste_compare_scrollbar_mfg.pack_forget()
+            self.paste_mfg_container.pack_forget()
             self.paste_compare_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
             self.paste_compare_scrollbar_repro.pack(side=tk.RIGHT, fill=tk.Y)
     
+    @staticmethod
+    def _paste_parse_num(s):
+        """Parse a formatted ISK string (commas, ★ marker) into a float, or None."""
+        try:
+            return float(str(s).replace("★", "").replace(",", "").strip())
+        except (ValueError, TypeError):
+            return None
+
+    def _paste_mark_winner(self, repro_str, jita_str, cn_str, repro_val):
+        """Prefix the most profitable of (Reprocess Value/Item, Jita Landed, C-N4OD Sell) with ★.
+
+        ttk.Treeview cannot bold a single cell, so ★ marks the winning value per row so it
+        stands out at a glance. All three options are per-item proceeds and directly comparable:
+        Reprocess Value, Jita Landed (Jita sell minus shipping), and C-N4OD Sell (sell locally).
+        Returns (repro_str, jita_str, cn_str), with at most one marked.
+        """
+        WIN = "★ "
+        jita_val = self._paste_parse_num(jita_str)
+        cn_val = self._paste_parse_num(cn_str)
+        try:
+            rv = float(repro_val)
+        except (TypeError, ValueError):
+            rv = None
+
+        options = []  # (value, tag)
+        if rv is not None and rv > 0:
+            options.append((rv, "repro"))
+        if jita_val is not None and jita_val > 0:
+            options.append((jita_val, "jita"))
+        if cn_val is not None and cn_val > 0:
+            options.append((cn_val, "cn"))
+        if not options:
+            return repro_str, jita_str, cn_str
+
+        winner = max(options, key=lambda o: o[0])[1]
+        if winner == "repro":
+            return WIN + repro_str, jita_str, cn_str
+        if winner == "jita":
+            return repro_str, WIN + jita_str, cn_str
+        return repro_str, jita_str, WIN + cn_str
+
     def _paste_compare_sort_key(self, values, col_index):
         """Return a sort key for a row (tuple of values) for the given column index."""
         if col_index >= len(values):
@@ -3829,9 +4950,14 @@ for one search may still appear in searches with different parameters.
                 return (0, int(s))
             except ValueError:
                 return (1, s)
-        if col_index in (2, 3, 4):  # Sell Min, Buy Max, Reprocess Value/Item - numeric
+        if col_index in (2, 3, 4, 6, 7):  # Sell Min, Buy Max, Reprocess, Jita Landed, C-N4OD Sell - numeric
             try:
-                return (0, float(s.replace(",", "")))
+                return (0, float(s.replace("★", "").replace(",", "").strip()))
+            except ValueError:
+                return (1, s)
+        if col_index == 8:  # C-N Margin % - numeric (strip %)
+            try:
+                return (0, float(s.replace("%", "").replace(",", "")))
             except ValueError:
                 return (1, s)
         return (0, s)
@@ -3876,14 +5002,12 @@ for one search may still appear in searches with different parameters.
         is_mfg = self.paste_compare_mode_var.get() == "manufacturing"
         if is_mfg:
             self.status_var.set("Calculating manufacturing profit...")
-            for item in self.paste_compare_tree_mfg.get_children():
-                self.paste_compare_tree_mfg.delete(item)
-            self.paste_compare_tree_mfg.insert('', tk.END, values=("", "Calculating...", "", "", "", "", ""))
+            self._paste_mfg_message("Calculating...")
         else:
             self.status_var.set("Comparing items...")
             for item in self.paste_compare_tree.get_children():
                 self.paste_compare_tree.delete(item)
-            self.paste_compare_tree.insert('', tk.END, values=("", "Comparing...", "", "", "", ""))
+            self.paste_compare_tree.insert('', tk.END, values=("", "Comparing...", "", "", "", "", "", "", ""))
         self.root.update()
         
         def do_compare():
@@ -3892,9 +5016,7 @@ for one search may still appear in searches with different parameters.
                     try:
                         self._run_paste_compare_manufacturing(lines)
                     except Exception as e:
-                        for item in self.paste_compare_tree_mfg.get_children():
-                            self.paste_compare_tree_mfg.delete(item)
-                        self.paste_compare_tree_mfg.insert('', tk.END, values=("", f"Error: {str(e)}", "", "", "", "", ""))
+                        self.root.after(0, lambda err=e: self._paste_mfg_message(f"Error: {err}"))
                         self.status_var.set("Error occurred")
                         messagebox.showerror("Error", f"An error occurred:\n{str(e)}")
                     return
@@ -3904,7 +5026,32 @@ for one search may still appear in searches with different parameters.
                     sell_buffer_isk = 0.0
                 yield_pct = self.get_float(self.paste_yield_var, 55.0)
                 repro_cost_pct = self.get_float(self.paste_repro_cost_var, 3.37)
-                
+
+                cn_enabled = bool(self.paste_cn_var.get())
+                cn_map = {}
+                if cn_enabled:
+                    cn_map, cn_note = self._ensure_cn4od_prices()
+                    if not cn_map:
+                        self.root.after(0, lambda n=cn_note: self.status_var.set(f"C-N4OD unavailable: {n}"))
+
+                def cn_fields(tid, jita_sell, vol):
+                    """(Jita Landed, C-N4OD Sell, C-N Margin %) strings.
+
+                    Jita Landed = net realized selling in Jita after shipping the item there
+                    from C-N: jita_sell - shipping, where shipping = 1,000 ISK/m3 + 0.6% of value.
+                    """
+                    if not cn_enabled:
+                        return ("", "", "")
+                    cn = cn_map.get(tid, 0.0)
+                    if jita_sell <= 0:
+                        return ("", f"{cn:,.2f}" if cn else "N/A", "")
+                    shipping = 1000.0 * (vol or 0.0) + 0.006 * jita_sell
+                    landed = jita_sell - shipping
+                    if cn <= 0:
+                        return (f"{landed:,.2f}", "N/A", "")
+                    margin = (cn - landed) / jita_sell
+                    return (f"{landed:,.2f}", f"{cn:,.2f}", f"{margin * 100:.1f}%")
+
                 rows = []
                 for line in lines:
                     parts = line.split('\t')
@@ -3919,12 +5066,13 @@ for one search may still appear in searches with different parameters.
                     
                     conn = sqlite3.connect(DATABASE_FILE)
                     try:
-                        cursor = conn.execute("SELECT typeID FROM items WHERE typeName = ?", (name,))
+                        cursor = conn.execute("SELECT typeID, packaged_volume FROM items WHERE typeName = ?", (name,))
                         row_item = cursor.fetchone()
                         if not row_item:
-                            rows.append((name, str(qty), "N/A", "N/A", "N/A", "Not in DB"))
+                            rows.append((name, str(qty), "N/A", "N/A", "N/A", "Not in DB", "", "", ""))
                             continue
                         type_id = row_item[0]
+                        volume_m3 = float(row_item[1]) if row_item[1] is not None else 0.0
                         
                         cursor = conn.execute("SELECT buy_max, sell_min FROM prices WHERE typeID = ?", (type_id,))
                         price_row = cursor.fetchone()
@@ -3944,7 +5092,8 @@ for one search may still appear in searches with different parameters.
                     )
                     
                     if 'error' in result:
-                        rows.append((name, str(qty), f"{sell_min:,.2f}" if sell_min else "N/A", f"{buy_max:,.2f}" if buy_max else "N/A", "N/A", "Not reprocessable"))
+                        cn1, cn2, cn3 = cn_fields(type_id, sell_min, volume_m3)
+                        rows.append((name, str(qty), f"{sell_min:,.2f}" if sell_min else "N/A", f"{buy_max:,.2f}" if buy_max else "N/A", "N/A", "Not reprocessable", cn1, cn2, cn3))
                         continue
                     
                     total_mineral = result['total_mineral_value_per_job_after_costs']
@@ -3976,57 +5125,437 @@ for one search may still appear in searches with different parameters.
                     sell_str = f"{sell_min:,.2f}" if sell_min else "N/A"
                     buy_str = f"{buy_max:,.2f}" if buy_max else "N/A"
                     repro_str = f"{reprocess_value_per_item:,.2f}"
-                    rows.append((name, str(qty), sell_str, buy_str, repro_str, rec))
+                    cn1, cn2, cn3 = cn_fields(type_id, sell_min, volume_m3)
+                    # ★-mark the most profitable of Reprocess Value vs Jita Landed vs C-N4OD Sell
+                    repro_str, cn1, cn2 = self._paste_mark_winner(repro_str, cn1, cn2, reprocess_value_per_item)
+                    rows.append((name, str(qty), sell_str, buy_str, repro_str, rec, cn1, cn2, cn3))
                 
                 for item in self.paste_compare_tree.get_children():
                     self.paste_compare_tree.delete(item)
                 for r in rows:
                     self.paste_compare_tree.insert('', tk.END, values=r)
-                self.status_var.set("Compare complete.")
+                if cn_enabled and cn_map:
+                    self.status_var.set(f"Compare complete. {self._cn4od_note}")
+                else:
+                    self.status_var.set("Compare complete.")
             except Exception as e:
                 for item in self.paste_compare_tree.get_children():
                     self.paste_compare_tree.delete(item)
-                self.paste_compare_tree.insert('', tk.END, values=("", f"Error: {str(e)}", "", "", "", ""))
+                self.paste_compare_tree.insert('', tk.END, values=("", f"Error: {str(e)}", "", "", "", "", "", "", ""))
                 self.status_var.set("Error occurred")
                 messagebox.showerror("Error", f"An error occurred:\n{str(e)}")
         
         thread = threading.Thread(target=do_compare, daemon=True)
         thread.start()
-    
+
+    def _ensure_cn4od_prices(self):
+        """Return ({type_id: C-N4OD min sell}, note), fetching once per session via SSO."""
+        if self._cn4od_sell_cache is not None:
+            return self._cn4od_sell_cache, self._cn4od_note
+        cid, secret = self._load_sso_credentials()
+        if not cid or not secret:
+            self._cn4od_sell_cache = {}
+            self._cn4od_note = "No SSO credentials (set them in EVE SSO Sync tab)."
+            return self._cn4od_sell_cache, self._cn4od_note
+        try:
+            import arbitrage_finder as af
+            conn = sqlite3.connect(DATABASE_FILE, timeout=60)
+            conn.execute("PRAGMA busy_timeout=60000")
+            try:
+                def prog(msg):
+                    self.root.after(0, lambda m=msg: self.status_var.set(m))
+                prices, note = af.load_cn4od_sell_prices(conn, cid, secret, progress=prog)
+            finally:
+                conn.close()
+            self._cn4od_sell_cache = prices
+            self._cn4od_note = note
+        except Exception as e:
+            self._cn4od_sell_cache = {}
+            self._cn4od_note = f"C-N4OD fetch failed: {e}"
+        return self._cn4od_sell_cache, self._cn4od_note
+
+    def _paste_refresh_cn_prices(self):
+        """Clear cached C-N4OD prices and re-run the comparison with C-N4OD enabled."""
+        self._cn4od_sell_cache = None
+        self._cn4od_note = ""
+        self.paste_cn_var.set(True)
+        self.run_paste_compare()
+
+    def _paste_mfg_ensure_binding_table(self, conn):
+        """Create the per-blueprint manufacturing-cost override table if missing."""
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS blueprint_mfg_cost_binding (
+                   product_type_id INTEGER PRIMARY KEY,
+                   product_name TEXT,
+                   manufacturing_cost REAL,
+                   updated_at TEXT
+               )"""
+        )
+
+    def _paste_mfg_load_bindings(self):
+        """Return {product_type_id: manufacturing_cost} for all bound blueprints."""
+        try:
+            conn = sqlite3.connect(DATABASE_FILE, timeout=30)
+            try:
+                self._paste_mfg_ensure_binding_table(conn)
+                rows = conn.execute(
+                    "SELECT product_type_id, manufacturing_cost FROM blueprint_mfg_cost_binding"
+                ).fetchall()
+            finally:
+                conn.close()
+            return {int(r[0]): float(r[1]) for r in rows if r[0] is not None and r[1] is not None}
+        except Exception:
+            return {}
+
+    def _paste_mfg_set_binding(self, product_type_id, product_name, manufacturing_cost):
+        """Persist (or clear, if manufacturing_cost is None) a per-blueprint manufacturing cost."""
+        if not product_type_id:
+            return
+        conn = sqlite3.connect(DATABASE_FILE, timeout=30)
+        try:
+            self._paste_mfg_ensure_binding_table(conn)
+            if manufacturing_cost is None:
+                conn.execute(
+                    "DELETE FROM blueprint_mfg_cost_binding WHERE product_type_id = ?",
+                    (int(product_type_id),),
+                )
+            else:
+                conn.execute(
+                    """INSERT INTO blueprint_mfg_cost_binding (product_type_id, product_name, manufacturing_cost, updated_at)
+                       VALUES (?, ?, ?, datetime('now'))
+                       ON CONFLICT(product_type_id) DO UPDATE SET
+                           product_name = excluded.product_name,
+                           manufacturing_cost = excluded.manufacturing_cost,
+                           updated_at = excluded.updated_at""",
+                    (int(product_type_id), product_name, float(manufacturing_cost)),
+                )
+            conn.commit()
+        finally:
+            conn.close()
+
     def _run_paste_compare_manufacturing(self, lines):
-        """Run manufacturing profitability for each pasted blueprint; 1/10/100 runs at ME 0 and 10%. Runs in caller's thread (do_compare)."""
+        """Manufacturing profit grid for each pasted blueprint (1 run).
+
+        Columns: ME0/ME5/ME10 buy-now and sell (profit ISK), plus ME10 buy-now /
+        ME10 sell as % return. Inputs are bought at Jita sell price; output is sold
+        at Jita buy-now (into buy order) or sell order. Both input and output include
+        transport to C-N (1000 ISK/m3). Duplicate blueprint names are shown once.
+        Runs in do_compare's thread.
+        """
         system_cost_pct = self.get_float(self.paste_compare_system_cost_var, 8.61)
         if system_cost_pct < 0:
             system_cost_pct = 0.0
         region_id = MARKET_HISTORY_REGION_ID
-        scenarios = [(1, 0), (1, 10), (10, 0), (10, 10), (100, 0), (100, 10)]  # (runs, me_percent)
-        rows = []
+        bindings = self._paste_mfg_load_bindings()
+        # scenario key -> (material_efficiency, output_price_type)
+        scenarios = {
+            "me0_bn": (0, "sell_immediate"),
+            "me0_sell": (0, "sell_offer"),
+            "me5_bn": (5, "sell_immediate"),
+            "me5_sell": (5, "sell_offer"),
+            "me10_bn": (10, "sell_immediate"),
+            "me10_sell": (10, "sell_offer"),
+        }
+        grid_rows = []
+        seen_names = set()
         for line in lines:
             name = line.split('\t')[0].strip() if line else ""
             if not name:
                 continue
-            profits = []
-            for runs, me in scenarios:
+            key_name = name.casefold()
+            if key_name in seen_names:  # collapse duplicate blueprint lines
+                continue
+            seen_names.add(key_name)
+            cells = {}
+            row_bound = False
+            for key, (me, out_type) in scenarios.items():
                 result = calculate_blueprint_profitability(
                     blueprint_name_or_product=name,
                     input_price_type="buy_immediate",
-                    output_price_type="sell_immediate",
+                    output_price_type=out_type,
                     system_cost_percent=system_cost_pct,
                     material_efficiency=me,
-                    number_of_runs=runs,
+                    number_of_runs=1,
                     region_id=region_id,
                     db_file=DATABASE_FILE,
                 )
-                if "error" in result:
-                    profits.append("N/A")
-                else:
-                    profits.append(f"{result['profit']:,.0f}")
-            rows.append((name,) + tuple(profits))
-        for item in self.paste_compare_tree_mfg.get_children():
-            self.paste_compare_tree_mfg.delete(item)
-        for r in rows:
-            self.paste_compare_tree_mfg.insert('', tk.END, values=r)
+                ptid = result.get("productTypeID") if isinstance(result, dict) else None
+                binding_cost = bindings.get(ptid) if ptid is not None else None
+                if binding_cost is not None:
+                    row_bound = True
+                cells[key] = self._paste_mfg_derive(result, me, out_type, binding_cost=binding_cost)
+            grid_rows.append({"name": name, "cells": cells, "bound": row_bound})
+        self.root.after(0, lambda: self._paste_mfg_populate_grid(grid_rows))
         self.status_var.set("Manufacturing compare complete.")
+
+    def _paste_mfg_derive(self, result, me, out_type, binding_cost=None):
+        """Turn a calculate_blueprint_profitability result into a cell dict with a
+        transport-to-C-N adjusted profit and a detail breakdown for the popup."""
+        if not result or "error" in result:
+            return {"error": (result or {}).get("error", "N/A"), "profit": None, "return_pct": None, "detail": None}
+        input_cost = float(result.get("total_input_cost") or 0.0)
+        calc_system_cost = float(result.get("system_cost") or 0.0)
+        bound = binding_cost is not None
+        system_cost = float(binding_cost) if bound else calc_system_cost
+        input_volume = float(result.get("total_input_volume_m3") or 0.0)
+        output_volume = float(result.get("output_total_volume_m3") or 0.0)
+        out_qty = float(result.get("output_total_quantity") or 0.0)
+        if out_type == "sell_immediate":
+            gross_unit = float(result.get("output_buy_max") or 0.0)
+            out_mode = "buy-now (sell into buy order)"
+        else:
+            gross_unit = float(result.get("output_sell_min") or 0.0)
+            out_mode = "sell order"
+        gross_revenue = gross_unit * out_qty
+        # Transport each way = 1,000 ISK/m3 + 0.6% of the goods' value (Jita value).
+        input_transport = 1000.0 * input_volume + 0.006 * input_cost
+        output_transport = 1000.0 * output_volume + 0.006 * gross_revenue
+        # Selling cost = fees on the Jita sell price (always a positive deduction).
+        #   Buy-now (sell into buy order): sales tax only.
+        #   Sell order: broker + sales tax + relisting fees (RELIST_DISCOUNT is a % discount).
+        from assumptions import BROKER_FEE, SALES_TAX, LISTING_RELIST, RELIST_DISCOUNT
+        if out_type == "sell_immediate":
+            selling_cost = gross_revenue * (SALES_TAX / 100.0)
+        else:
+            broker = gross_revenue * (BROKER_FEE / 100.0)
+            tax = gross_revenue * (SALES_TAX / 100.0)
+            relist = gross_revenue * (BROKER_FEE / 100.0) * (1.0 - RELIST_DISCOUNT / 100.0) * LISTING_RELIST
+            selling_cost = broker + tax + relist
+        landed_sale = gross_revenue - selling_cost - output_transport
+        # Cost basis (per user's format): materials + manufacturing + input transport.
+        cost = input_cost + system_cost + input_transport
+        profit = landed_sale - cost
+        return_pct = (profit / cost * 100.0) if cost > 0 else None
+        detail = {
+            "product": result.get("productName", ""),
+            "product_type_id": result.get("productTypeID"),
+            "me": me,
+            "out_mode": out_mode,
+            "materials": result.get("input_materials", []),
+            "total_input_cost": input_cost,
+            "system_cost": system_cost,
+            "calc_system_cost": calc_system_cost,
+            "bound": bound,
+            "system_cost_percent": float(result.get("system_cost_percent") or 0.0),
+            "input_transport": input_transport,
+            "input_volume": float(result.get("total_input_volume_m3") or 0.0),
+            "cost": cost,
+            "out_qty": out_qty,
+            "gross_unit": gross_unit,
+            "gross_revenue": gross_revenue,
+            "selling_cost": selling_cost,
+            "output_transport": output_transport,
+            "output_volume": float(result.get("output_total_volume_m3") or 0.0),
+            "net_revenue": gross_revenue - selling_cost,
+            "landed_sale": landed_sale,
+            "profit": profit,
+            "return_pct": return_pct,
+        }
+        return {"error": None, "profit": profit, "return_pct": return_pct, "detail": detail}
+
+    def _paste_mfg_clear(self):
+        """Remove all widgets from the manufacturing grid."""
+        for child in self.paste_mfg_grid.winfo_children():
+            child.destroy()
+
+    def _paste_mfg_message(self, msg):
+        """Show a single status/message line in the manufacturing grid."""
+        self._paste_mfg_clear()
+        tk.Label(self.paste_mfg_grid, text=msg, anchor=tk.W, justify=tk.LEFT, padx=8, pady=8).grid(row=0, column=0, sticky="w")
+
+    def _paste_mfg_cell(self, row, col, value, is_pct=False, detail=None):
+        """Create one colored, clickable profit/return cell in the grid."""
+        if value is None:
+            text, bg = "N/A", "#f0f0f0"
+        else:
+            text = f"{value:,.1f}%" if is_pct else f"{value:,.0f}"
+            bg = "#ccffcc" if value >= 0 else "#ffcccc"
+        lbl = tk.Label(self.paste_mfg_grid, text=text, bg=bg, anchor=tk.E,
+                       relief=tk.SOLID, borderwidth=1, padx=6, pady=3, width=14)
+        lbl.grid(row=row, column=col, sticky="nsew", padx=1, pady=1)
+        if detail is not None:
+            lbl.configure(cursor="hand2")
+            lbl.bind("<Button-1>", lambda e, d=detail: self._paste_mfg_show_detail(d))
+        return lbl
+
+    def _paste_mfg_populate_grid(self, grid_rows):
+        """Store rows and render the manufacturing profit grid (called on the main thread)."""
+        self._paste_mfg_grid_rows = grid_rows or []
+        self._paste_mfg_sort_col = None
+        self._paste_mfg_sort_reverse = False
+        self._paste_mfg_render_grid()
+
+    def _paste_mfg_cell_value(self, rowdata, col_index):
+        """Return the sortable value for a row at a given column index."""
+        header, key, is_pct = self._paste_mfg_col_specs[col_index]
+        if key is None:
+            return rowdata.get("name", "").casefold()
+        cell = rowdata.get("cells", {}).get(key, {})
+        return cell.get("return_pct") if is_pct else cell.get("profit")
+
+    def _paste_mfg_sort_by(self, col_index):
+        """Sort the grid rows by the clicked column (toggle direction) and re-render."""
+        if self._paste_mfg_sort_col == col_index:
+            self._paste_mfg_sort_reverse = not self._paste_mfg_sort_reverse
+        else:
+            self._paste_mfg_sort_col = col_index
+            self._paste_mfg_sort_reverse = (col_index != 0)  # numbers default high->low, names A->Z
+        is_name = col_index == 0
+        reverse = self._paste_mfg_sort_reverse
+
+        def sort_key(rowdata):
+            v = self._paste_mfg_cell_value(rowdata, col_index)
+            if is_name:
+                return (0, v)
+            # None (N/A) always sorts to the bottom regardless of direction
+            if v is None:
+                return (1, 0.0) if not reverse else (-1, 0.0)
+            return (0, v)
+
+        self._paste_mfg_grid_rows.sort(key=sort_key, reverse=reverse)
+        self._paste_mfg_render_grid()
+
+    def _paste_mfg_render_grid(self):
+        """Draw headers (clickable to sort) and the current (sorted) rows."""
+        self._paste_mfg_clear()
+        grid_rows = self._paste_mfg_grid_rows
+        if not grid_rows:
+            self._paste_mfg_message("No blueprints found.")
+            return
+        for c, (header, _key, _is_pct) in enumerate(self._paste_mfg_col_specs):
+            text = header
+            if self._paste_mfg_sort_col == c:
+                text = header + ("  v" if self._paste_mfg_sort_reverse else "  ^")
+            anchor = tk.W if c == 0 else tk.CENTER
+            hlbl = tk.Label(self.paste_mfg_grid, text=text, font=("TkDefaultFont", 9, "bold"),
+                            anchor=anchor, justify=tk.CENTER, relief=tk.SOLID, borderwidth=1,
+                            padx=6, pady=3, bg="#e8e8e8", cursor="hand2")
+            hlbl.grid(row=0, column=c, sticky="nsew", padx=1, pady=1)
+            hlbl.bind("<Button-1>", lambda e, ci=c: self._paste_mfg_sort_by(ci))
+        for r, rowdata in enumerate(grid_rows, start=1):
+            label = ("[bound] " + rowdata["name"]) if rowdata.get("bound") else rowdata["name"]
+            name_bg = "#fff2cc" if rowdata.get("bound") else None
+            tk.Label(self.paste_mfg_grid, text=label, anchor=tk.W, bg=name_bg,
+                     relief=tk.SOLID, borderwidth=1, padx=6, pady=3, width=34).grid(
+                row=r, column=0, sticky="nsew", padx=1, pady=1)
+            cells = rowdata["cells"]
+            for ci, (header, key, is_pct) in enumerate(self._paste_mfg_col_specs):
+                if key is None:
+                    continue
+                cell = cells.get(key, {})
+                value = cell.get("return_pct") if is_pct else cell.get("profit")
+                self._paste_mfg_cell(r, ci, value, is_pct=is_pct, detail=cell.get("detail"))
+
+    @staticmethod
+    def _paste_mfg_detail_lines(d):
+        """Build the text breakdown lines for a manufacturing scenario detail dict."""
+        def f(x):
+            return f"{x:,.2f}"
+
+        mfg_label = "Manufacturing (bound override)" if d.get("bound") else \
+            f"Manufacturing (system cost {d['system_cost_percent']:.2f}% of EIV)"
+        lines = []
+        lines.append(f"{d['product']}  —  ME {d['me']}, 1 run,  output: {d['out_mode']}")
+        lines.append("All prices are Jita; transport each way = 1,000 ISK/m3 + 0.6% of value.")
+        lines.append("")
+        lines.append("COST")
+        lines.append("-" * 60)
+        for m in d["materials"]:
+            lines.append(
+                f"  {m['quantity']:>10,d} x {m['materialName']} @ {f(m['unit_price'])} = {f(m['total_cost'])}"
+            )
+        lines.append("-" * 60)
+        lines.append(f"  Materials subtotal{'':>21}= {f(d['total_input_cost'])}")
+        lines.append(f"  + {mfg_label} = {f(d['system_cost'])}")
+        lines.append(f"  + Transport of inputs ({d['input_volume']:,.1f} m3 + 0.6% of {f(d['total_input_cost'])}) = {f(d['input_transport'])}")
+        lines.append(f"  = COST{'':>32}= {f(d['cost'])}")
+        lines.append("")
+        lines.append("SALE")
+        lines.append("-" * 60)
+        lines.append(f"  Sell {d['out_qty']:,.0f} @ {f(d['gross_unit'])} (Jita)   = {f(d['gross_revenue'])}")
+        lines.append(f"  - Selling cost (broker/tax){'':>7}= {f(d['selling_cost'])}")
+        lines.append(f"  - Transport ({d['output_volume']:,.1f} m3 + 0.6% of {f(d['gross_revenue'])}) = {f(d['output_transport'])}")
+        lines.append(f"  = LANDED SALE{'':>19}= {f(d['landed_sale'])}")
+        lines.append("")
+        lines.append("PROFIT")
+        lines.append("-" * 60)
+        lines.append(f"  Landed sale - cost = {f(d['landed_sale'])} - {f(d['cost'])} = {f(d['profit'])}")
+        if d["return_pct"] is not None:
+            lines.append(f"  Return = profit / cost = {d['return_pct']:,.1f}%")
+        return lines
+
+    def _paste_mfg_show_detail(self, d):
+        """Popup with the full cost/sale/profit breakdown for one blueprint scenario,
+        plus an override box + Recalculate/Bind controls for the manufacturing cost."""
+        if not d:
+            return
+        win = tk.Toplevel(self.root)
+        win.title(f"{d['product']} — ME{d['me']}, 1 run")
+        win.geometry("660x600")
+        txt = scrolledtext.ScrolledText(win, wrap=tk.WORD, font=("Consolas", 9))
+        txt.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
+
+        def render():
+            txt.configure(state=tk.NORMAL)
+            txt.delete(1.0, tk.END)
+            txt.insert(tk.END, "\n".join(self._paste_mfg_detail_lines(d)))
+            txt.configure(state=tk.DISABLED)
+
+        ctrl = ttk.Frame(win)
+        ctrl.pack(fill=tk.X, padx=8, pady=(0, 4))
+        ttk.Label(ctrl, text="Manufacturing cost (ISK):").pack(side=tk.LEFT)
+        cost_var = tk.StringVar(value=f"{d['system_cost']:,.0f}")
+        ttk.Entry(ctrl, textvariable=cost_var, width=16).pack(side=tk.LEFT, padx=4)
+
+        def apply_override(value):
+            d["system_cost"] = value
+            d["bound"] = True
+            d["cost"] = d["total_input_cost"] + value + d["input_transport"]
+            d["profit"] = d["landed_sale"] - d["cost"]
+            d["return_pct"] = (d["profit"] / d["cost"] * 100.0) if d["cost"] > 0 else None
+
+        def parse_cost():
+            try:
+                return float(cost_var.get().replace(",", "").strip())
+            except (ValueError, TypeError):
+                messagebox.showerror("Invalid value", "Enter a numeric manufacturing cost (ISK).", parent=win)
+                return None
+
+        def recalc():
+            v = parse_cost()
+            if v is None:
+                return
+            apply_override(v)
+            render()
+
+        def bind_cost():
+            v = parse_cost()
+            if v is None:
+                return
+            if not d.get("product_type_id"):
+                messagebox.showerror("Cannot bind", "This blueprint has no product type id to bind to.", parent=win)
+                return
+            apply_override(v)
+            render()
+            self._paste_mfg_set_binding(d["product_type_id"], d["product"], v)
+            self.status_var.set(f"Bound manufacturing cost {v:,.0f} ISK to {d['product']}.")
+            self.run_paste_compare()
+
+        def clear_binding():
+            if not d.get("product_type_id"):
+                return
+            self._paste_mfg_set_binding(d["product_type_id"], d["product"], None)
+            self.status_var.set(f"Cleared bound manufacturing cost for {d['product']}.")
+            self.run_paste_compare()
+            win.destroy()
+
+        ttk.Button(ctrl, text="Recalculate", command=recalc).pack(side=tk.LEFT, padx=2)
+        ttk.Button(ctrl, text="Bind to blueprint", command=bind_cost).pack(side=tk.LEFT, padx=2)
+        ttk.Button(ctrl, text="Clear binding", command=clear_binding).pack(side=tk.LEFT, padx=2)
+
+        render()
+        ttk.Button(win, text="Close", command=win.destroy).pack(pady=(0, 8))
+
     
     def clear_paste_compare_text(self):
         """Clear the paste content text area so you can paste new content."""
@@ -4055,7 +5584,7 @@ for one search may still appear in searches with different parameters.
         ttk.Label(btn_row, textvariable=self.planning_status_var).pack(side=tk.LEFT, padx=10)
         results_frame = ttk.LabelFrame(frame, text="Results (sort by clicking column headers)", padding=10)
         results_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
-        cols = ("Blueprint", "Tech", "T1 profit ISK/run", "T1 profit %", "T2 product", "T2 decryptor", "T2 profit ISK/run", "T2 profit %", "Notes")
+        cols = ("Blueprint", "Tech", "T1 profit/run (sell)", "T1 profit (imm)", "T1 profit %", "T2 product", "T2 decryptor", "T2 profit ISK/run", "T2 profit %", "Notes")
         self.planning_tree = ttk.Treeview(results_frame, columns=cols, show="headings", height=14, selectmode="extended")
         self.planning_sort_column = None
         self.planning_sort_reverse = False
@@ -4113,7 +5642,7 @@ for one search may still appear in searches with different parameters.
         children = list(tree.get_children(""))
         if not children:
             return
-        cols = ("Blueprint", "Tech", "T1 profit ISK/run", "T1 profit %", "T2 product", "T2 decryptor", "T2 profit ISK/run", "T2 profit %", "Notes")
+        cols = ("Blueprint", "Tech", "T1 profit/run (sell)", "T1 profit (imm)", "T1 profit %", "T2 product", "T2 decryptor", "T2 profit ISK/run", "T2 profit %", "Notes")
         if column not in cols:
             return
         if self.planning_sort_column == column:
@@ -4128,7 +5657,7 @@ for one search may still appear in searches with different parameters.
                 return (0, "")
             v = vals[col_index]
             s = str(v).strip().replace(",", "")
-            if col_index in (2, 3, 6, 7):  # numeric
+            if col_index in (2, 3, 4, 7, 8):  # numeric
                 try:
                     return (0, float(s) if s else 0.0)
                 except ValueError:
@@ -4173,7 +5702,7 @@ for one search may still appear in searches with different parameters.
         self.planning_status_var.set("Analyzing...")
         for item in self.planning_tree.get_children():
             self.planning_tree.delete(item)
-        self.planning_tree.insert("", tk.END, values=("", "Analyzing...", "", "", "", "", "", "", ""))
+        self.planning_tree.insert("", tk.END, values=("", "Analyzing...", "", "", "", "", "", "", "", ""))
         self.root.update()
 
         def do_analysis():
@@ -4181,7 +5710,8 @@ for one search may still appear in searches with different parameters.
                 result = self._planning_analyze_blueprints(lines)
                 self.root.after(0, lambda: self._planning_apply_results(result))
             except Exception as e:
-                self.root.after(0, lambda: self._planning_apply_error(str(e)))
+                err = str(e)
+                self.root.after(0, lambda msg=err: self._planning_apply_error(msg))
 
         threading.Thread(target=do_analysis, daemon=True).start()
 
@@ -4189,7 +5719,7 @@ for one search may still appear in searches with different parameters.
         """Apply error state to planning UI."""
         for item in self.planning_tree.get_children():
             self.planning_tree.delete(item)
-        self.planning_tree.insert("", tk.END, values=("", f"Error: {err_msg}", "", "", "", "", "", "", ""))
+        self.planning_tree.insert("", tk.END, values=("", f"Error: {err_msg}", "", "", "", "", "", "", "", ""))
         self._planning_row_data = []
         self.planning_status_var.set("Error occurred.")
 
@@ -4199,14 +5729,16 @@ for one search may still appear in searches with different parameters.
             self.planning_tree.delete(item)
         self._planning_row_data = rows
         for r in rows:
-            t1_isk = f"{r.get('t1_profit_isk') or 0:,.0f}" if r.get('t1_profit_isk') is not None else "—"
+            t1_sell_isk = f"{r.get('t1_profit_sell_isk') or 0:,.0f}" if r.get('t1_profit_sell_isk') is not None else "—"
+            t1_imm_isk = f"{r.get('t1_profit_imm_isk') or 0:,.0f}" if r.get('t1_profit_imm_isk') is not None else "—"
             t1_pct = f"{r.get('t1_profit_pct') or 0:.1f}%" if r.get('t1_profit_pct') is not None else "—"
             t2_isk = f"{r.get('t2_profit_isk') or 0:,.0f}" if r.get('t2_profit_isk') is not None else "—"
             t2_pct = f"{r.get('t2_profit_pct') or 0:.1f}%" if r.get('t2_profit_pct') is not None else "—"
             self.planning_tree.insert("", tk.END, values=(
                 r.get("t1_name") or "—",
                 r.get("tech") or "—",
-                t1_isk,
+                t1_sell_isk,
+                t1_imm_isk,
                 t1_pct,
                 r.get("t2_product") or "—",
                 r.get("t2_decryptor") or "—",
@@ -4235,7 +5767,7 @@ for one search may still appear in searches with different parameters.
                 name = line.split("\t")[0].strip() if line else ""
                 if not name:
                     continue
-                row_data = {"t1_name": name, "tech": "—", "t1_profit_isk": None, "t1_profit_pct": None,
+                row_data = {"t1_name": name, "tech": "—", "t1_profit_sell_isk": None, "t1_profit_imm_isk": None, "t1_profit_pct": None,
                             "t2_product": None, "t2_decryptor": None, "t2_decryptor_type_id": None,
                             "t2_profit_isk": None, "t2_profit_pct": None, "notes": "",
                             "t1_bp_id": None, "t2_bp_id": None, "best_decryptor_row": None, "runs_per_bpc": 10}
@@ -4260,9 +5792,21 @@ for one search may still appear in searches with different parameters.
                     row_data["notes"] = t1_result["error"]
                     rows.append(row_data)
                     continue
-                row_data["t1_profit_isk"] = t1_result["profit"]
+                row_data["t1_profit_sell_isk"] = t1_result["profit"]
                 total_cost = t1_result["total_input_cost"] + t1_result["system_cost"]
                 row_data["t1_profit_pct"] = (t1_result["profit"] / total_cost * 100.0) if total_cost and total_cost > 0 else 0.0
+                t1_result_imm = calculate_blueprint_profitability(
+                    blueprint_name_or_product=product_name,
+                    input_price_type=input_price,
+                    output_price_type="sell_immediate",
+                    system_cost_percent=system_cost_pct,
+                    material_efficiency=0,
+                    number_of_runs=1,
+                    region_id=region_id,
+                    db_file=DATABASE_FILE,
+                )
+                if "error" not in t1_result_imm:
+                    row_data["t1_profit_imm_isk"] = t1_result_imm.get("profit")
                 try:
                     tech = conn.execute(
                         "SELECT techLevel, isFaction FROM items WHERE typeID = (SELECT productTypeID FROM blueprints WHERE blueprintTypeID = ?)",
@@ -4543,7 +6087,8 @@ for one search may still appear in searches with different parameters.
                     text += err
                 self.root.after(0, lambda: self._market_patterns_apply_result(text, result.returncode))
             except Exception as e:
-                self.root.after(0, lambda: self._market_patterns_apply_result(f"Error: {e}", 1))
+                err = f"Error: {e}"
+                self.root.after(0, lambda msg=err: self._market_patterns_apply_result(msg, 1))
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -4554,6 +6099,325 @@ for one search may still appear in searches with different parameters.
             self.market_patterns_status_var.set("Market patterns analysis completed.")
         else:
             self.market_patterns_status_var.set("Market patterns analysis failed (see output).")
+
+    def create_arbitrage_tab(self):
+        """Jita -> C-N4OD arbitrage scanner (uses arbitrage_finder.py + EVE SSO)."""
+        frame = ttk.Frame(self.notebook)
+        self.notebook.add(frame, text="Arbitrage C-N4OD")
+
+        info = ttk.LabelFrame(frame, text="Jita -> C-N4OD resell opportunities", padding=10)
+        info.pack(fill=tk.X, padx=10, pady=10)
+        ttk.Label(
+            info,
+            text="Ranks high-volume Jita items and compares Jita sell + landed cost "
+                 "(jita*1.1 + 1000 ISK/m3) against the cheapest C-N4OD sell order.\n"
+                 "Margin = (C-N4OD sell - landed) / Jita sell. Requires an EVE SSO character "
+                 "with docking access to the C-N4OD market structure.",
+            justify=tk.LEFT, wraplength=900,
+        ).pack(anchor=tk.W)
+
+        ctrl = ttk.Frame(frame)
+        ctrl.pack(fill=tk.X, padx=10, pady=5)
+        ttk.Label(ctrl, text="Top items:").pack(side=tk.LEFT, padx=(5, 2))
+        self.arb_top_var = tk.StringVar(value="500")
+        ttk.Entry(ctrl, textvariable=self.arb_top_var, width=6).pack(side=tk.LEFT)
+        ttk.Label(ctrl, text="Rank by:").pack(side=tk.LEFT, padx=(10, 2))
+        self.arb_rank_var = tk.StringVar(value="isk")
+        ttk.Combobox(ctrl, textvariable=self.arb_rank_var, values=["isk", "units"],
+                     width=7, state="readonly").pack(side=tk.LEFT)
+        ttk.Label(ctrl, text="Min margin %:").pack(side=tk.LEFT, padx=(10, 2))
+        self.arb_min_margin_var = tk.StringVar(value="0")
+        ttk.Entry(ctrl, textvariable=self.arb_min_margin_var, width=6).pack(side=tk.LEFT)
+        ttk.Label(ctrl, text="History days:").pack(side=tk.LEFT, padx=(10, 2))
+        self.arb_days_var = tk.StringVar(value="365")
+        ttk.Entry(ctrl, textvariable=self.arb_days_var, width=6).pack(side=tk.LEFT)
+
+        btn_row = ttk.Frame(frame)
+        btn_row.pack(fill=tk.X, padx=10, pady=5)
+        self.arb_run_btn = ttk.Button(btn_row, text="Run scan", command=self._run_arbitrage_scan)
+        self.arb_run_btn.pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_row, text="Discover structures",
+                   command=lambda: self._run_arbitrage_scan(discover=True)).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_row, text="Open CSV", command=self._arbitrage_open_csv).pack(side=tk.LEFT, padx=5)
+        self.arb_status_var = tk.StringVar(value="Ready.")
+        ttk.Label(btn_row, textvariable=self.arb_status_var).pack(side=tk.LEFT, padx=10)
+
+        tree_frame = ttk.LabelFrame(frame, text="Opportunities", padding=5)
+        tree_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
+        cols = ("name", "jita_sell", "cn4od_sell", "landed_price",
+                "profit_per_unit", "margin", "volume_m3", "jita_avg_isk_day")
+        headers = {
+            "name": "Item", "jita_sell": "Jita sell", "cn4od_sell": "C-N4OD sell",
+            "landed_price": "Landed", "profit_per_unit": "Profit/unit", "margin": "Margin %",
+            "volume_m3": "m3", "jita_avg_isk_day": "Jita ISK/day",
+        }
+        self.arb_tree = ttk.Treeview(tree_frame, columns=cols, show="headings", height=16)
+        for c in cols:
+            self.arb_tree.heading(c, text=headers[c])
+            self.arb_tree.column(c, width=110, anchor=(tk.W if c == "name" else tk.E))
+        self.arb_tree.column("name", width=250, anchor=tk.W)
+        self.arb_tree.bind("<Double-1>", self._arbitrage_copy_name)
+        vsb = ttk.Scrollbar(tree_frame, orient="vertical", command=self.arb_tree.yview)
+        self.arb_tree.configure(yscrollcommand=vsb.set)
+        self.arb_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        vsb.pack(side=tk.RIGHT, fill=tk.Y)
+
+        log_frame = ttk.LabelFrame(frame, text="Log", padding=5)
+        log_frame.pack(fill=tk.X, padx=10, pady=5)
+        self.arb_log = scrolledtext.ScrolledText(log_frame, wrap=tk.WORD, height=6)
+        self.arb_log.pack(fill=tk.BOTH, expand=True)
+
+    def _run_arbitrage_scan(self, discover=False):
+        """Run arbitrage_finder.py in a background thread; load its CSV into the tree."""
+        try:
+            top = int(self.arb_top_var.get())
+            days = int(self.arb_days_var.get())
+            rank = self.arb_rank_var.get()
+            min_margin = float(self.arb_min_margin_var.get()) / 100.0
+        except ValueError:
+            messagebox.showwarning("Arbitrage", "Enter valid numbers for Top / days / min margin.")
+            return
+
+        out_path = str(Path(__file__).resolve().parent / "arbitrage_cn4od.csv")
+        self._arb_out_path = out_path
+        args = [sys.executable, "arbitrage_finder.py"]
+        if discover:
+            args.append("--discover")
+        else:
+            args += ["--top", str(top), "--rank", rank, "--days", str(days),
+                     "--min-margin", str(min_margin), "--out", out_path]
+
+        self.arb_status_var.set("Discovering structures..." if discover else "Running scan (this can take ~30s)...")
+        self.arb_run_btn.config(state=tk.DISABLED)
+        self.arb_log.delete(1.0, tk.END)
+        self.arb_log.insert(tk.END, " ".join(args) + "\n\n")
+        self.root.update_idletasks()
+
+        def worker():
+            try:
+                result = subprocess.run(
+                    args, cwd=Path(__file__).resolve().parent,
+                    capture_output=True, text=True, timeout=900,
+                )
+                text = result.stdout or ""
+                if result.stderr:
+                    text += "\n--- stderr ---\n" + result.stderr
+                self.root.after(0, lambda: self._arbitrage_apply_result(text, result.returncode, discover))
+            except Exception as e:
+                self.root.after(0, lambda msg=f"Error: {e}": self._arbitrage_apply_result(msg, 1, discover))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _arbitrage_apply_result(self, text, returncode, discover):
+        self.arb_run_btn.config(state=tk.NORMAL)
+        self.arb_log.delete(1.0, tk.END)
+        self.arb_log.insert(tk.END, text or "(no output)")
+        if returncode != 0:
+            self.arb_status_var.set("Failed (see log).")
+            return
+        if discover:
+            self.arb_status_var.set("Discovery complete (see log).")
+            return
+        n = self._arbitrage_load_csv(getattr(self, "_arb_out_path", None))
+        self.arb_status_var.set(f"Done. {n} opportunities loaded.")
+
+    def _arbitrage_load_csv(self, path):
+        import csv
+        for i in self.arb_tree.get_children():
+            self.arb_tree.delete(i)
+        if not path or not Path(path).exists():
+            return 0
+        count = 0
+        with open(path, encoding="utf-8", newline="") as f:
+            for row in csv.DictReader(f):
+                try:
+                    self.arb_tree.insert("", tk.END, values=(
+                        row["name"],
+                        f'{float(row["jita_sell"]):,.0f}',
+                        f'{float(row["cn4od_sell"]):,.0f}',
+                        f'{float(row["landed_price"]):,.0f}',
+                        f'{float(row["profit_per_unit"]):,.0f}',
+                        f'{float(row["margin"]) * 100:.1f}',
+                        row["volume_m3"],
+                        f'{float(row["jita_avg_isk_day"]):,.0f}',
+                    ))
+                    count += 1
+                except Exception:
+                    continue
+        return count
+
+    def _arbitrage_copy_name(self, event):
+        """Double-click a row to copy the item name to the clipboard."""
+        row_id = self.arb_tree.identify_row(event.y)
+        if not row_id:
+            return
+        values = self.arb_tree.item(row_id, "values")
+        if not values:
+            return
+        name = values[0]
+        self.root.clipboard_clear()
+        self.root.clipboard_append(name)
+        self.arb_status_var.set(f"Copied: {name}")
+
+    def _arbitrage_open_csv(self):
+        import os
+        path = getattr(self, "_arb_out_path",
+                       str(Path(__file__).resolve().parent / "arbitrage_cn4od.csv"))
+        if Path(path).exists():
+            try:
+                os.startfile(path)
+            except Exception as e:
+                messagebox.showerror("Arbitrage", str(e))
+        else:
+            messagebox.showinfo("Arbitrage", "No CSV yet. Run a scan first.")
+
+    def create_remap_planner_tab(self):
+        """Skill-queue attribute (neural remap) planner across all SSO characters."""
+        frame = ttk.Frame(self.notebook)
+        self.notebook.add(frame, text="Remap Planner")
+
+        info = ttk.LabelFrame(frame, text="Skill-queue attribute totals", padding=10)
+        info.pack(fill=tk.X, padx=10, pady=10)
+        ttk.Label(
+            info,
+            text="Reads each character's training queue. For every queued skill, its SP is added to "
+                 "the PRIMARY attribute total and SP/2 to the SECONDARY attribute total.\n"
+                 "The highest totals indicate the best neural remap for the queued training.",
+            justify=tk.LEFT, wraplength=900,
+        ).pack(anchor=tk.W)
+
+        ctrl = ttk.Frame(frame)
+        ctrl.pack(fill=tk.X, padx=10, pady=5)
+        ttk.Label(ctrl, text="SP mode:").pack(side=tk.LEFT, padx=(5, 2))
+        self.remap_sp_mode_var = tk.StringVar(value="remaining")
+        ttk.Radiobutton(ctrl, text="Remaining (SP left to train)", value="remaining",
+                        variable=self.remap_sp_mode_var).pack(side=tk.LEFT, padx=4)
+        ttk.Radiobutton(ctrl, text="Full level SP", value="level",
+                        variable=self.remap_sp_mode_var).pack(side=tk.LEFT, padx=4)
+        self.remap_compute_btn = ttk.Button(ctrl, text="Compute", command=self._run_remap_planner)
+        self.remap_compute_btn.pack(side=tk.LEFT, padx=10)
+        self.remap_status_var = tk.StringVar(value="Ready.")
+        ttk.Label(ctrl, textvariable=self.remap_status_var).pack(side=tk.LEFT, padx=10)
+
+        attrs = ("Perception", "Memory", "Willpower", "Intelligence", "Charisma")
+        self._remap_attrs = attrs
+        # Column widths for the monospaced grid (per-cell coloring needs a Text widget)
+        self._remap_name_w = 22
+        self._remap_col_w = 15
+        legend = ttk.Frame(frame)
+        legend.pack(fill=tk.X, padx=12)
+        tk.Label(legend, text="  largest  ", bg="#5fbf5f").pack(side=tk.LEFT)
+        tk.Label(legend, text="  2nd largest  ", bg="#bfe8bf").pack(side=tk.LEFT, padx=(6, 0))
+        grid_frame = ttk.LabelFrame(frame, text="Attribute SP totals (per character: largest in green, 2nd in light green)", padding=5)
+        grid_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
+        self.remap_grid = tk.Text(grid_frame, wrap=tk.NONE, height=14,
+                                  font=("Consolas", 10), state=tk.DISABLED, cursor="arrow")
+        vsb = ttk.Scrollbar(grid_frame, orient="vertical", command=self.remap_grid.yview)
+        self.remap_grid.configure(yscrollcommand=vsb.set)
+        self.remap_grid.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        vsb.pack(side=tk.RIGHT, fill=tk.Y)
+        self.remap_grid.tag_configure("green", background="#5fbf5f")
+        self.remap_grid.tag_configure("lightgreen", background="#bfe8bf")
+        self.remap_grid.tag_configure("header", font=("Consolas", 10, "bold"))
+        self.remap_grid.tag_configure("total", font=("Consolas", 10, "bold"), background="#e8e8e8")
+
+        self.remap_priority_var = tk.StringVar(value="")
+        ttk.Label(frame, textvariable=self.remap_priority_var,
+                  font=("", 10, "bold")).pack(anchor=tk.W, padx=12, pady=(0, 5))
+
+        log_frame = ttk.LabelFrame(frame, text="Notes", padding=5)
+        log_frame.pack(fill=tk.X, padx=10, pady=5)
+        self.remap_log = scrolledtext.ScrolledText(log_frame, wrap=tk.WORD, height=5)
+        self.remap_log.pack(fill=tk.BOTH, expand=True)
+
+    def _run_remap_planner(self):
+        """Compute attribute totals in a background thread (first run fetches skill attrs via ESI)."""
+        cid, secret = self._load_sso_credentials()
+        if not cid or not secret:
+            messagebox.showwarning("Remap Planner", "Set EVE SSO Client ID / Secret first (EVE SSO Sync tab).")
+            return
+        sp_mode = self.remap_sp_mode_var.get()
+        self.remap_compute_btn.config(state=tk.DISABLED)
+        self.remap_status_var.set("Computing (first run may take ~60s to cache skill attributes)...")
+        self.remap_log.delete(1.0, tk.END)
+        self.root.update_idletasks()
+
+        def worker():
+            try:
+                import skill_queue_attributes as sqa
+                conn = sqlite3.connect(DATABASE_FILE, timeout=60)
+                conn.execute("PRAGMA busy_timeout=60000")
+                try:
+                    result = sqa.compute_attribute_totals(conn, cid, secret, sp_mode)
+                finally:
+                    conn.close()
+                self.root.after(0, lambda: self._remap_apply_result(result))
+            except Exception as e:
+                self.root.after(0, lambda msg=f"Error: {e}": self._remap_apply_error(msg))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _remap_apply_error(self, msg):
+        self.remap_compute_btn.config(state=tk.NORMAL)
+        self.remap_status_var.set("Failed (see notes).")
+        self.remap_log.delete(1.0, tk.END)
+        self.remap_log.insert(tk.END, msg)
+
+    def _remap_grid_row(self, name, values, line_idx, *, row_tag=None, highlight=True):
+        """Insert one grid row; color the largest cell green and 2nd largest light green."""
+        nw, cw = self._remap_name_w, self._remap_col_w
+        text = name[:nw - 1].ljust(nw) + "".join(f"{v:,.0f}".rjust(cw) for v in values)
+        self.remap_grid.insert(tk.END, text + "\n", (row_tag,) if row_tag else ())
+
+        if highlight and any(values):
+            order = sorted(range(len(values)), key=lambda i: values[i], reverse=True)
+            top = [i for i in order if values[i] > 0][:2]
+            for rank, ci in enumerate(top):
+                start_col = nw + ci * cw
+                end_col = start_col + cw
+                tag = "green" if rank == 0 else "lightgreen"
+                self.remap_grid.tag_add(tag, f"{line_idx}.{start_col}", f"{line_idx}.{end_col}")
+
+    def _remap_apply_result(self, result):
+        self.remap_compute_btn.config(state=tk.NORMAL)
+        attrs = self._remap_attrs
+        nw, cw = self._remap_name_w, self._remap_col_w
+
+        self.remap_grid.config(state=tk.NORMAL)
+        self.remap_grid.delete(1.0, tk.END)
+
+        header = "Character".ljust(nw) + "".join(a[:cw - 1].rjust(cw) for a in attrs)
+        self.remap_grid.insert(tk.END, header + "\n", ("header",))
+        self.remap_grid.insert(tk.END, "-" * len(header) + "\n")
+
+        line = 3  # header=1, separator=2, first data row=3
+        for name, ct in result.get("per_char", {}).items():
+            vals = [ct.get(a, 0) for a in attrs]
+            self._remap_grid_row(name, vals, line)
+            line += 1
+
+        self.remap_grid.insert(tk.END, "-" * len(header) + "\n")
+        line += 1
+        totals = result.get("totals", {})
+        self._remap_grid_row("TOTAL", [totals.get(a, 0) for a in attrs], line,
+                             row_tag="total", highlight=False)
+        self.remap_grid.config(state=tk.DISABLED)
+
+        if totals:
+            ranked = sorted(attrs, key=lambda a: totals.get(a, 0), reverse=True)
+            self.remap_priority_var.set("Suggested fleet remap priority:  " + "  >  ".join(ranked))
+        self.remap_status_var.set(f"Done ({result.get('sp_mode')} SP).")
+
+        notes = []
+        errs = result.get("errors", {})
+        if errs:
+            notes.append("Characters skipped:")
+            for name, msg in errs.items():
+                notes.append(f"  {name}: {msg}")
+        else:
+            notes.append("All characters processed successfully.")
+        self.remap_log.delete(1.0, tk.END)
+        self.remap_log.insert(tk.END, "\n".join(notes))
 
     def launch_overview_alert(self):
         """Launch overview_alert.py in a separate process (uses same Python executable)."""
@@ -4566,73 +6430,184 @@ for one search may still appear in searches with different parameters.
         except Exception as e:
             messagebox.showerror("Overview Alert", f"Failed to launch overview_alert.py:\n{e}")
 
-    def create_sso_sync_tab(self):
-        """EVE SSO sync tab: login and sync wallet transactions, journal, industry jobs for profitability tracking."""
+    def _load_sso_credentials(self):
+        """Return (client_id, client_secret) preferring env vars, then SSO_CREDENTIALS_FILE."""
         import os
+        cid = os.environ.get("EVE_SSO_CLIENT_ID", "").strip()
+        secret = os.environ.get("EVE_SSO_CLIENT_SECRET", "").strip()
+        if not cid or not secret:
+            try:
+                if SSO_CREDENTIALS_FILE.exists():
+                    data = json.loads(SSO_CREDENTIALS_FILE.read_text(encoding="utf-8"))
+                    cid = cid or str(data.get("client_id", "")).strip()
+                    secret = secret or str(data.get("client_secret", "")).strip()
+            except Exception:
+                pass
+        return cid, secret
+
+    def _save_sso_credentials(self, *_args):
+        """Persist Client ID/Secret to SSO_CREDENTIALS_FILE (gitignored)."""
+        try:
+            cid = self.sso_client_id_var.get().strip()
+            secret = self.sso_client_secret_var.get().strip()
+            data = {
+                "client_id": cid,
+                "client_secret": secret,
+                "callback_url": "http://localhost:8765/callback/",
+            }
+            SSO_CREDENTIALS_FILE.write_text(
+                json.dumps(data, indent=2), encoding="utf-8"
+            )
+        except Exception:
+            pass
+
+    def create_sso_sync_tab(self):
+        """EVE SSO sync tab: manage multiple linked characters and sync their data."""
+        from eve_sso_sync import DEFAULT_SCOPES
         frame = ttk.Frame(self.notebook)
         self.notebook.add(frame, text="EVE SSO Sync")
         info = ttk.LabelFrame(frame, text="Instructions", padding=10)
         info.pack(fill=tk.X, padx=10, pady=10)
+        scope_lines = ", ".join(DEFAULT_SCOPES.split())
         ttk.Label(
             info,
-            text="Create an SSO application at https://developers.eveonline.com/ with callback URL: http://localhost:8765/callback/\n"
-                 "Request scopes: esi-wallet.read_character_wallet.v1 and esi-industry.read_character_jobs.v1",
-            justify=tk.LEFT, wraplength=900
+            text=(
+                "Create an SSO application at https://developers.eveonline.com/ with callback URL "
+                "http://localhost:8765/callback/.\n"
+                "Enable the scopes listed below on the dev portal (must match exactly).\n"
+                "To link multiple characters: click 'Add character (Login)', log in, repeat for each. "
+                "If EVE auto-redirects without prompting, click 'Log Out' on the EVE login page first.\n"
+                f"Scopes ({len(DEFAULT_SCOPES.split())}): {scope_lines}"
+            ),
+            justify=tk.LEFT, wraplength=1100
         ).pack(anchor=tk.W)
-        creds = ttk.LabelFrame(frame, text="SSO credentials", padding=10)
+
+        creds = ttk.LabelFrame(frame, text="SSO credentials (saved locally to eve_sso_credentials.json - gitignored)", padding=10)
         creds.pack(fill=tk.X, padx=10, pady=5)
+        cid_default, secret_default = self._load_sso_credentials()
         ttk.Label(creds, text="Client ID:").pack(side=tk.LEFT, padx=5)
-        self.sso_client_id_var = tk.StringVar(value=os.environ.get("EVE_SSO_CLIENT_ID", ""))
-        ttk.Entry(creds, textvariable=self.sso_client_id_var, width=24).pack(side=tk.LEFT, padx=5)
+        self.sso_client_id_var = tk.StringVar(value=cid_default)
+        ttk.Entry(creds, textvariable=self.sso_client_id_var, width=36).pack(side=tk.LEFT, padx=5)
         ttk.Label(creds, text="Client Secret:").pack(side=tk.LEFT, padx=5)
-        self.sso_client_secret_var = tk.StringVar(value=os.environ.get("EVE_SSO_CLIENT_SECRET", ""))
-        ttk.Entry(creds, textvariable=self.sso_client_secret_var, width=32, show="*").pack(side=tk.LEFT, padx=5)
-        btn_row = ttk.Frame(frame)
-        btn_row.pack(fill=tk.X, padx=10, pady=5)
-        ttk.Button(btn_row, text="Login with EVE SSO", command=self.sso_login).pack(side=tk.LEFT, padx=5)
-        ttk.Button(btn_row, text="Sync wallet & industry jobs", command=self.sso_sync).pack(side=tk.LEFT, padx=5)
-        self.sso_status_var = tk.StringVar(value="Not logged in.")
+        self.sso_client_secret_var = tk.StringVar(value=secret_default)
+        ttk.Entry(creds, textvariable=self.sso_client_secret_var, width=44, show="*").pack(side=tk.LEFT, padx=5)
+        try:
+            self.sso_client_id_var.trace_add("write", self._save_sso_credentials)
+            self.sso_client_secret_var.trace_add("write", self._save_sso_credentials)
+        except Exception:
+            pass
+
+        chars_frame = ttk.LabelFrame(frame, text="Linked characters", padding=10)
+        chars_frame.pack(fill=tk.BOTH, expand=False, padx=10, pady=5)
+        btn_row = ttk.Frame(chars_frame)
+        btn_row.pack(fill=tk.X, pady=(0, 5))
+        ttk.Button(btn_row, text="Add character (Login)", command=self.sso_login).pack(side=tk.LEFT, padx=2)
+        ttk.Button(btn_row, text="Sync selected", command=self.sso_sync_selected).pack(side=tk.LEFT, padx=2)
+        ttk.Button(btn_row, text="Sync all", command=self.sso_sync_all).pack(side=tk.LEFT, padx=2)
+        ttk.Button(btn_row, text="Remove selected", command=self.sso_remove_selected).pack(side=tk.LEFT, padx=2)
+        ttk.Button(btn_row, text="Refresh list", command=self._refresh_sso_chars_tree).pack(side=tk.LEFT, padx=2)
+
+        cols = ("name", "char_id", "corp", "token_in", "last_sync", "updated")
+        self.sso_chars_tree = ttk.Treeview(chars_frame, columns=cols, show="headings", height=8, selectmode="extended")
+        headings = {
+            "name": ("Character", 220),
+            "char_id": ("Character ID", 110),
+            "corp": ("Corporation", 220),
+            "token_in": ("Token expires in", 130),
+            "last_sync": ("Last synced", 160),
+            "updated": ("Updated", 160),
+        }
+        for c, (h, w) in headings.items():
+            self.sso_chars_tree.heading(c, text=h)
+            self.sso_chars_tree.column(c, width=w, anchor=tk.W, stretch=(c in ("name", "corp")))
+        ysb = ttk.Scrollbar(chars_frame, orient="vertical", command=self.sso_chars_tree.yview)
+        self.sso_chars_tree.configure(yscrollcommand=ysb.set)
+        self.sso_chars_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        ysb.pack(side=tk.RIGHT, fill=tk.Y)
+
+        self.sso_status_var = tk.StringVar(value="")
         ttk.Label(frame, textvariable=self.sso_status_var).pack(anchor=tk.W, padx=10, pady=2)
         log_frame = ttk.LabelFrame(frame, text="Log", padding=10)
         log_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
-        self.sso_log_text = scrolledtext.ScrolledText(log_frame, wrap=tk.WORD, height=12, width=80)
+        self.sso_log_text = scrolledtext.ScrolledText(log_frame, wrap=tk.WORD, height=10, width=80)
         self.sso_log_text.pack(fill=tk.BOTH, expand=True)
-    
-    def _sso_log(self, msg: str):
-        self.sso_log_text.insert(tk.END, msg + "\n")
-        self.sso_log_text.see(tk.END)
-        self.root.update_idletasks()
-    
-    def sso_login(self):
-        """Run EVE SSO login flow (open browser, callback server, store tokens)."""
-        from eve_sso_sync import login_flow
-        cid = self.sso_client_id_var.get().strip()
-        secret = self.sso_client_secret_var.get().strip()
-        if not cid or not secret:
-            messagebox.showwarning("SSO", "Enter Client ID and Client Secret (or set EVE_SSO_CLIENT_ID and EVE_SSO_CLIENT_SECRET).")
+        self._refresh_sso_chars_tree()
+
+    def _format_token_remaining(self, expires_at) -> str:
+        if not expires_at:
+            return "—"
+        try:
+            remaining = float(expires_at) - time.time()
+        except (TypeError, ValueError):
+            return "—"
+        if remaining <= 0:
+            return "expired (refresh on use)"
+        if remaining < 60:
+            return f"{int(remaining)}s"
+        if remaining < 3600:
+            return f"{int(remaining // 60)}m {int(remaining % 60)}s"
+        h = int(remaining // 3600)
+        m = int((remaining % 3600) // 60)
+        return f"{h}h {m}m"
+
+    def _refresh_sso_chars_tree(self):
+        """Reload the linked-characters Treeview from the database."""
+        if not hasattr(self, "sso_chars_tree"):
             return
-        self.sso_status_var.set("Opening browser for EVE login...")
-        self._sso_log("Starting SSO login...")
-        def run():
+        from eve_sso_sync import list_sso_characters, ensure_sso_tables
+        try:
+            for iid in self.sso_chars_tree.get_children():
+                self.sso_chars_tree.delete(iid)
+            if not Path(DATABASE_FILE).exists():
+                self.sso_status_var.set("Database not found.")
+                return
+            conn = sqlite3.connect(DATABASE_FILE)
             try:
-                result = login_flow(cid, secret, DATABASE_FILE)
-                if "error" in result:
-                    self.sso_status_var.set("Login failed.")
-                    self._sso_log("Error: " + result["error"])
-                    messagebox.showerror("SSO Login", result["error"])
-                else:
-                    name = result.get("character_name") or f"Character {result.get('character_id')}"
-                    self.sso_status_var.set(f"Logged in: {name}")
-                    self._sso_log(f"Logged in: {name} (character_id={result.get('character_id')})")
-            except Exception as e:
-                self.sso_status_var.set("Login failed.")
-                self._sso_log("Error: " + str(e))
-                messagebox.showerror("SSO Login", str(e))
-        threading.Thread(target=run, daemon=True).start()
-    
-    def sso_sync(self):
-        """Sync wallet transactions, journal, and industry jobs for the stored character."""
+                ensure_sso_tables(conn)
+                rows = list_sso_characters(conn)
+            finally:
+                conn.close()
+            for r in rows:
+                self.sso_chars_tree.insert(
+                    "", tk.END,
+                    iid=str(r["character_id"]),
+                    values=(
+                        r["character_name"] or "?",
+                        r["character_id"],
+                        r["corporation_name"] or (str(r["corporation_id"]) if r["corporation_id"] else "—"),
+                        self._format_token_remaining(r["access_token_expires_at"]),
+                        r["last_synced_at"] or "—",
+                        r["updated_at"] or "—",
+                    ),
+                )
+            n = len(rows)
+            self.sso_status_var.set(f"{n} linked character{'s' if n != 1 else ''}.")
+        except Exception as e:
+            self._sso_log(f"Refresh list error: {e}")
+            self.sso_status_var.set("Error loading characters.")
+
+    def _selected_sso_character_ids(self) -> list[int]:
+        if not hasattr(self, "sso_chars_tree"):
+            return []
+        out = []
+        for iid in self.sso_chars_tree.selection():
+            try:
+                out.append(int(iid))
+            except ValueError:
+                pass
+        return out
+
+    def _sso_sync_one(self, character_id: int, cid: str, secret: str) -> dict:
         from eve_sso_sync import run_full_sync, ensure_sso_tables
+        conn = sqlite3.connect(DATABASE_FILE)
+        try:
+            ensure_sso_tables(conn)
+            return run_full_sync(conn, character_id, cid, secret)
+        finally:
+            conn.close()
+
+    def sso_sync_selected(self):
+        """Sync wallet/journal/industry jobs for currently selected characters."""
         cid = self.sso_client_id_var.get().strip()
         secret = self.sso_client_secret_var.get().strip()
         if not cid or not secret:
@@ -4641,44 +6616,645 @@ for one search may still appear in searches with different parameters.
         if not Path(DATABASE_FILE).exists():
             messagebox.showwarning("SSO", "Database not found. Create it first (e.g. build_database).")
             return
-        self.sso_status_var.set("Syncing...")
-        self._sso_log("Starting sync...")
-        def run():
+        ids = self._selected_sso_character_ids()
+        if not ids:
+            messagebox.showinfo("SSO", "Select one or more characters in the list first.")
+            return
+        self._sso_run_bulk_sync(ids, cid, secret)
+
+    def sso_sync_all(self):
+        """Sync every linked character."""
+        from eve_sso_sync import list_sso_characters, ensure_sso_tables
+        cid = self.sso_client_id_var.get().strip()
+        secret = self.sso_client_secret_var.get().strip()
+        if not cid or not secret:
+            messagebox.showwarning("SSO", "Enter Client ID and Client Secret first.")
+            return
+        if not Path(DATABASE_FILE).exists():
+            messagebox.showwarning("SSO", "Database not found. Create it first (e.g. build_database).")
+            return
+        try:
+            conn = sqlite3.connect(DATABASE_FILE)
             try:
+                ensure_sso_tables(conn)
+                ids = [r["character_id"] for r in list_sso_characters(conn)]
+            finally:
+                conn.close()
+        except Exception as e:
+            messagebox.showerror("SSO", f"Could not read characters: {e}")
+            return
+        if not ids:
+            messagebox.showinfo("SSO", "No linked characters yet. Click 'Add character (Login)' first.")
+            return
+        self._sso_run_bulk_sync(ids, cid, secret)
+
+    def _sso_run_bulk_sync(self, character_ids: list[int], cid: str, secret: str):
+        """Run sync for a list of character IDs in a background thread."""
+        self.sso_status_var.set(f"Syncing {len(character_ids)} character(s)...")
+        self._sso_log(f"Sync starting for {len(character_ids)} character(s)...")
+        def run():
+            ok = 0
+            errs = 0
+            for char_id in character_ids:
+                try:
+                    result = self._sso_sync_one(char_id, cid, secret)
+                    if result.get("error") and not (
+                        result.get("tx") or result.get("journal")
+                        or result.get("jobs") or result.get("corp_jobs")
+                        or result.get("corp_wallet_tx")
+                    ):
+                        errs += 1
+                        self._sso_log(f"  [{char_id}] FAILED: {result['error']}")
+                    else:
+                        ok += 1
+                        line = (
+                            f"  [{char_id}] tx={result.get('tx', 0)}, "
+                            f"journal={result.get('journal', 0)}, "
+                            f"char_jobs={result.get('jobs', 0)}, "
+                            f"corp_jobs={result.get('corp_jobs', 0)}, "
+                            f"corp_wallet_tx={result.get('corp_wallet_tx', 0)}"
+                        )
+                        if result.get("corp_jobs_note"):
+                            line += f" — {result['corp_jobs_note']}"
+                        if result.get("corp_wallet_note"):
+                            line += f" — {result['corp_wallet_note']}"
+                        if result.get("error"):
+                            line += f" (note: {result['error']})"
+                        self._sso_log(line)
+                except Exception as e:
+                    errs += 1
+                    err_text = str(e)
+                    self._sso_log(f"  [{char_id}] EXCEPTION: {err_text}")
+            self.sso_status_var.set(f"Sync done: {ok} ok, {errs} failed.")
+            self._sso_log(f"Sync finished: {ok} ok, {errs} failed.")
+            self.root.after(0, self._refresh_sso_chars_tree)
+        threading.Thread(target=run, daemon=True).start()
+
+    def sso_remove_selected(self):
+        """Remove selected characters and their synced ESI rows from the DB."""
+        from eve_sso_sync import delete_sso_character, ensure_sso_tables
+        ids = self._selected_sso_character_ids()
+        if not ids:
+            messagebox.showinfo("SSO", "Select one or more characters in the list first.")
+            return
+        if not messagebox.askyesno(
+            "Remove characters",
+            f"Remove {len(ids)} character(s) and all their synced wallet/journal/industry rows from the local DB?\n"
+            "(EVE permissions on the dev portal are unchanged.)",
+        ):
+            return
+        try:
+            conn = sqlite3.connect(DATABASE_FILE)
+            try:
+                ensure_sso_tables(conn)
+                for char_id in ids:
+                    delete_sso_character(conn, char_id)
+            finally:
+                conn.close()
+        except Exception as e:
+            messagebox.showerror("SSO", f"Could not remove: {e}")
+            return
+        self._sso_log(f"Removed {len(ids)} character(s).")
+        self._refresh_sso_chars_tree()
+
+    def create_profitability_tab(self):
+        """Production P/L per industry job, computed FIFO from ESI wallet + industry data."""
+        frame = ttk.Frame(self.notebook)
+        self.notebook.add(frame, text="Profitability")
+
+        info = ttk.LabelFrame(frame, text="Production P/L (FIFO cost basis)", padding=10)
+        info.pack(fill=tk.X, padx=10, pady=10)
+        ttk.Label(
+            info,
+            text=(
+                "Per-job profit/loss for completed manufacturing & reactions, computed by replaying "
+                "your ESI wallet transactions and industry jobs chronologically with FIFO matching. "
+                "For a corporation entity, completed jobs come from corp industry; buys and sells "
+                "are replayed from every SSO-linked character in that corp's personal wallet (and "
+                "from any linked character who installed a corp job for that corp, in case "
+                "corporation_id on a character row is missing), plus corp wallet market transactions "
+                "if synced—one shared timeline, so if manufacturing "
+                "is on the corp but the seller lists orders from a character wallet, those sell "
+                "transactions still count here as long as that seller is linked in EVE SSO Sync. "
+                "Use the character-only row only for personal jobs; use the '(corp)' row when jobs "
+                "are corporation jobs even if products are sold from characters. "
+                "T2 manufacturing jobs also include expected invention cost per BPC (from the "
+                "Decryptor tab / blueprint_datacore_bindings, same as shopping-list research) "
+                "and optional production cost per run, amortized by manufacturing runs on the BPC. "
+                "When a material has no historical buy lot, we capture a stable fallback price "
+                "(market_history.average for the job date if available, else current sell_min, "
+                "else buy_max) - stored once per (item, date), so future rebuilds give the same numbers. "
+                "Click 'Rebuild ledger' after a fresh SSO sync. Use View to switch between each job "
+                "or jobs grouped by product and ISO week. Double-click a row for a detailed breakdown "
+                "(weekly groups include all jobs in that week). ⚠ flag = no buy lot AND "
+                "no market data either (truly unknown). Use 'Clear price snapshots' to force a re-capture."
+            ),
+            justify=tk.LEFT, wraplength=1100,
+        ).pack(anchor=tk.W)
+
+        ctrl = ttk.Frame(frame)
+        ctrl.pack(fill=tk.X, padx=10, pady=4)
+        ttk.Label(ctrl, text="Character:").pack(side=tk.LEFT, padx=2)
+        self.pl_character_var = tk.StringVar(value="(All)")
+        self.pl_character_combo = ttk.Combobox(
+            ctrl, textvariable=self.pl_character_var, state="readonly", width=28, values=["(All)"]
+        )
+        self.pl_character_combo.pack(side=tk.LEFT, padx=2)
+        self.pl_character_combo.bind("<<ComboboxSelected>>", lambda _e: self._refresh_pl_view())
+        ttk.Label(ctrl, text="Default ME%:").pack(side=tk.LEFT, padx=(15, 2))
+        self.pl_me_var = tk.StringVar(value="10")
+        ttk.Spinbox(ctrl, from_=0, to=10, textvariable=self.pl_me_var, width=4, increment=1).pack(side=tk.LEFT, padx=2)
+        self.pl_market_fallback_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(
+            ctrl,
+            text="Use current sell_min for missing material lots",
+            variable=self.pl_market_fallback_var,
+        ).pack(side=tk.LEFT, padx=(15, 2))
+        ttk.Label(ctrl, text="Search:").pack(side=tk.LEFT, padx=(15, 2))
+        self.pl_search_var = tk.StringVar()
+        ent = ttk.Entry(ctrl, textvariable=self.pl_search_var, width=22)
+        ent.pack(side=tk.LEFT, padx=2)
+        ent.bind("<KeyRelease>", lambda _e: self._refresh_pl_view())
+        ttk.Label(ctrl, text="View:").pack(side=tk.LEFT, padx=(12, 2))
+        self.pl_view_var = tk.StringVar(value="Per job")
+        pl_view = ttk.Combobox(
+            ctrl, textvariable=self.pl_view_var, state="readonly", width=14,
+            values=["Per job", "Per week (grouped)"],
+        )
+        pl_view.pack(side=tk.LEFT, padx=2)
+        pl_view.bind("<<ComboboxSelected>>", lambda _e: self._refresh_pl_view())
+        ttk.Button(ctrl, text="Rebuild ledger", command=self.profitability_rebuild).pack(side=tk.LEFT, padx=10)
+        ttk.Button(ctrl, text="Refresh view", command=self._refresh_pl_view).pack(side=tk.LEFT, padx=2)
+        ttk.Button(ctrl, text="Clear price snapshots", command=self.profitability_clear_snapshots).pack(side=tk.LEFT, padx=2)
+
+        summary = ttk.Frame(frame)
+        summary.pack(fill=tk.X, padx=10, pady=2)
+        self.pl_summary_var = tk.StringVar(value="")
+        ttk.Label(summary, textvariable=self.pl_summary_var, font=("TkDefaultFont", 9, "bold")).pack(anchor=tk.W)
+
+        self.pl_tree_frame = ttk.LabelFrame(frame, text="Per-job P/L", padding=6)
+        self.pl_tree_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=6)
+        self.pl_row_meta: dict[str, dict] = {}
+        cols = (
+            "completed", "char", "product", "jobs", "runs", "out_qty", "job_fee",
+            "mat_cost", "inv_cost", "total_cost", "unit_cost", "sold", "revenue",
+            "realized", "unsold", "unrealized", "total_pl", "flag",
+        )
+        headings = {
+            "completed": ("Completed", 145),
+            "char": ("Character", 130),
+            "product": ("Product", 200),
+            "jobs": ("Jobs", 52),
+            "runs": ("Runs", 60),
+            "out_qty": ("Output", 80),
+            "job_fee": ("Job fee", 90),
+            "mat_cost": ("Materials", 110),
+            "inv_cost": ("Invention", 95),
+            "total_cost": ("Total cost", 110),
+            "unit_cost": ("Unit cost", 95),
+            "sold": ("Sold", 80),
+            "revenue": ("Revenue", 110),
+            "realized": ("Realized P/L", 110),
+            "unsold": ("Unsold", 70),
+            "unrealized": ("Unrealized", 110),
+            "total_pl": ("Total est. P/L", 120),
+            "flag": ("⚠", 30),
+        }
+        self.pl_tree = ttk.Treeview(self.pl_tree_frame, columns=cols, show="headings", height=18)
+        for c, (h, w) in headings.items():
+            self.pl_tree.heading(c, text=h, command=lambda _c=c: self._pl_sort_by(_c))
+            anchor = tk.W if c in ("completed", "char", "product") else tk.E
+            self.pl_tree.column(c, width=w, anchor=anchor, stretch=(c == "product"))
+        ysb = ttk.Scrollbar(self.pl_tree_frame, orient="vertical", command=self.pl_tree.yview)
+        xsb = ttk.Scrollbar(self.pl_tree_frame, orient="horizontal", command=self.pl_tree.xview)
+        self.pl_tree.configure(yscrollcommand=ysb.set, xscrollcommand=xsb.set)
+        self.pl_tree.tag_configure("loss", foreground="#a02020")
+        self.pl_tree.tag_configure("gain", foreground="#106010")
+        self.pl_tree.tag_configure("flagged", background="#fff5e0")
+        self.pl_tree.bind("<Double-1>", self._pl_show_job_breakdown)
+        self.pl_tree.grid(row=0, column=0, sticky="nsew")
+        ysb.grid(row=0, column=1, sticky="ns")
+        xsb.grid(row=1, column=0, sticky="ew")
+        self.pl_tree_frame.rowconfigure(0, weight=1)
+        self.pl_tree_frame.columnconfigure(0, weight=1)
+
+        log_frame = ttk.LabelFrame(frame, text="Log", padding=6)
+        log_frame.pack(fill=tk.X, padx=10, pady=(2, 8))
+        self.pl_log_text = scrolledtext.ScrolledText(log_frame, wrap=tk.WORD, height=5)
+        self.pl_log_text.pack(fill=tk.BOTH, expand=True)
+
+        self._pl_sort_state = {"col": "completed", "reverse": True}
+        self._refresh_pl_character_choices()
+        self._refresh_pl_view()
+
+    def _pl_log(self, msg: str):
+        if not hasattr(self, "pl_log_text"):
+            return
+        self.pl_log_text.insert(tk.END, msg + "\n")
+        self.pl_log_text.see(tk.END)
+        self.root.update_idletasks()
+
+    def _refresh_pl_character_choices(self):
+        if not hasattr(self, "pl_character_combo"):
+            return
+        opts = ["(All)"]
+        try:
+            if Path(DATABASE_FILE).exists():
                 conn = sqlite3.connect(DATABASE_FILE)
                 try:
-                    ensure_sso_tables(conn)
-                    row = conn.execute("SELECT character_id FROM sso_character LIMIT 1").fetchone()
-                    if not row:
-                        self.sso_status_var.set("Not logged in.")
-                        self._sso_log("No character found. Log in with EVE SSO first.")
-                        return
-                    character_id = row[0]
-                    result = run_full_sync(conn, character_id, cid, secret)
+                    char_rows = conn.execute(
+                        "SELECT character_id, character_name FROM sso_character "
+                        "ORDER BY character_name COLLATE NOCASE"
+                    ).fetchall()
+                    corp_rows = conn.execute(
+                        """
+                        SELECT corporation_id, MAX(corporation_name)
+                          FROM sso_character
+                         WHERE corporation_id IS NOT NULL
+                         GROUP BY corporation_id
+                         ORDER BY MAX(corporation_name) COLLATE NOCASE
+                        """
+                    ).fetchall()
+                finally:
                     conn.close()
-                except Exception:
-                    conn.close()
-                    raise
-                if "error" in result and result.get("tx", 0) == 0 and result.get("journal", 0) == 0 and result.get("jobs", 0) == 0:
-                    self.sso_status_var.set("Sync failed.")
-                    self._sso_log("Error: " + result["error"])
-                    messagebox.showerror("SSO Sync", result["error"])
+                for r in char_rows:
+                    name = r[1] or f"Char {r[0]}"
+                    opts.append(f"char | {name} ({r[0]})")
+                for r in corp_rows:
+                    name = r[1] or f"Corp {r[0]}"
+                    opts.append(f"corp | {name} ({r[0]})")
+        except Exception:
+            pass
+        cur = self.pl_character_var.get()
+        self.pl_character_combo["values"] = opts
+        if cur not in opts:
+            self.pl_character_var.set("(All)")
+
+    def _selected_pl_entity(self) -> tuple[Optional[int], Optional[str]]:
+        """Parse the combobox selection into (entity_id, entity_kind)."""
+        sel = self.pl_character_var.get()
+        if not sel or sel == "(All)":
+            return None, None
+        kind = "character"
+        if sel.startswith("corp | "):
+            kind = "corporation"
+        if "(" in sel and sel.endswith(")"):
+            try:
+                return int(sel.rsplit("(", 1)[1].rstrip(")")), kind
+            except ValueError:
+                return None, None
+        return None, None
+
+    def _selected_pl_character_id(self) -> Optional[int]:
+        eid, kind = self._selected_pl_entity()
+        if kind == "character":
+            return eid
+        return None
+
+    def profitability_clear_snapshots(self):
+        """Wipe the captured market-fallback price snapshots."""
+        from profitability_tracking import clear_price_snapshots
+        if not Path(DATABASE_FILE).exists():
+            messagebox.showwarning("Profitability", "Database not found.")
+            return
+        if not messagebox.askyesno(
+            "Clear price snapshots",
+            "This deletes all stored fallback prices. The next 'Rebuild ledger' "
+            "will re-resolve them (preferring market history at the job date). Continue?",
+        ):
+            return
+        try:
+            conn = sqlite3.connect(DATABASE_FILE)
+            try:
+                n = clear_price_snapshots(conn)
+            finally:
+                conn.close()
+        except Exception as e:
+            self._pl_log(f"Clear snapshots failed: {e}")
+            messagebox.showerror("Profitability", str(e))
+            return
+        self._pl_log(f"Cleared {n} price snapshot(s).")
+
+    def profitability_rebuild(self):
+        """Rebuild the FIFO ledger for the selected entity, or all linked entities."""
+        from profitability_tracking import rebuild_ledger, ensure_profitability_tables
+        from eve_sso_sync import ensure_sso_tables
+        try:
+            me_pct = float(self.pl_me_var.get() or 10)
+        except (TypeError, ValueError):
+            me_pct = 10.0
+        if not Path(DATABASE_FILE).exists():
+            messagebox.showwarning("Profitability", "Database not found.")
+            return
+        entity_id, entity_kind = self._selected_pl_entity()
+        try:
+            conn = sqlite3.connect(DATABASE_FILE)
+            try:
+                ensure_profitability_tables(conn)
+                ensure_sso_tables(conn)
+                targets: list[tuple[int, str, str]] = []  # (id, kind, label)
+                if entity_id is None:
+                    char_rows = conn.execute(
+                        "SELECT character_id, character_name FROM sso_character"
+                    ).fetchall()
+                    corp_rows = conn.execute(
+                        "SELECT corporation_id, MAX(corporation_name) FROM sso_character "
+                        "WHERE corporation_id IS NOT NULL GROUP BY corporation_id"
+                    ).fetchall()
+                    for cid, cname in char_rows:
+                        targets.append((int(cid), "character", cname or f"Char {cid}"))
+                    for kid, kname in corp_rows:
+                        targets.append((int(kid), "corporation", (kname or f"Corp {kid}") + " (corp)"))
+                elif entity_kind == "corporation":
+                    row = conn.execute(
+                        "SELECT MAX(corporation_name) FROM sso_character WHERE corporation_id = ?",
+                        (int(entity_id),),
+                    ).fetchone()
+                    targets.append((int(entity_id), "corporation",
+                                    ((row[0] if row else None) or f"Corp {entity_id}") + " (corp)"))
                 else:
-                    self.sso_status_var.set("Sync complete.")
-                    self._sso_log(f"Synced: {result.get('tx', 0)} transactions, {result.get('journal', 0)} journal entries, {result.get('jobs', 0)} industry jobs.")
-                    if result.get("error"):
-                        self._sso_log("Note: " + result["error"])
+                    row = conn.execute(
+                        "SELECT character_name FROM sso_character WHERE character_id = ?",
+                        (int(entity_id),),
+                    ).fetchone()
+                    targets.append((int(entity_id), "character", (row[0] if row else None) or f"Char {entity_id}"))
+                if not targets:
+                    self._pl_log("No linked SSO characters. Add one in the EVE SSO Sync tab.")
+                    self.pl_summary_var.set("No linked characters.")
+                    return
+                use_mkt = bool(self.pl_market_fallback_var.get())
+                self._pl_log(
+                    f"Rebuilding ledger (ME={int(me_pct)}%, "
+                    f"market-fallback={'on' if use_mkt else 'off'}) for {len(targets)} entity(ies)..."
+                )
+                for eid, ekind, label in targets:
+                    self._pl_log(f"  [{ekind}: {label}]")
+                    rebuild_ledger(
+                        conn, eid, default_me_percent=me_pct,
+                        log=self._pl_log, entity_kind=ekind,
+                        use_market_fallback=use_mkt,
+                    )
+            finally:
+                conn.close()
+        except Exception as e:
+            self._pl_log(f"Rebuild failed: {e}")
+            messagebox.showerror("Profitability", str(e))
+            return
+        self._refresh_pl_view()
+
+    def _refresh_pl_view(self):
+        if not hasattr(self, "pl_tree"):
+            return
+        from profitability_tracking import list_production_pl, list_production_pl_weekly
+        weekly = (getattr(self, "pl_view_var", None) and self.pl_view_var.get() == "Per week (grouped)")
+        try:
+            for iid in self.pl_tree.get_children():
+                self.pl_tree.delete(iid)
+            self.pl_row_meta = {}
+            if not Path(DATABASE_FILE).exists():
+                self.pl_summary_var.set("Database not found.")
+                return
+            entity_id, entity_kind = self._selected_pl_entity()
+            search = self.pl_search_var.get().strip() or None
+            conn = sqlite3.connect(DATABASE_FILE)
+            try:
+                if weekly:
+                    rows = list_production_pl_weekly(
+                        conn, entity_id=entity_id, entity_kind=entity_kind,
+                        search=search, limit=2000,
+                    )
+                else:
+                    rows = list_production_pl(
+                        conn, entity_id=entity_id, entity_kind=entity_kind,
+                        search=search, limit=2000,
+                    )
+            finally:
+                conn.close()
+        except Exception as e:
+            self._pl_log(f"View error: {e}")
+            return
+        if hasattr(self, "pl_tree_frame"):
+            self.pl_tree_frame.configure(
+                text="Weekly grouped P/L" if weekly else "Per-job P/L"
+            )
+        self.pl_tree.heading("completed", text="Week" if weekly else "Completed")
+        sort_col = self._pl_sort_state["col"]
+        reverse = self._pl_sort_state["reverse"]
+        sort_keys = {
+            "completed": lambda r: r.get("end_date_max") or r.get("end_date_utc") or "",
+            "char": lambda r: (r["character_name"] or "").lower(),
+            "product": lambda r: (r["product_name"] or "").lower(),
+            "jobs": lambda r: r.get("job_count") or 1,
+            "runs": lambda r: r["runs"],
+            "out_qty": lambda r: r["output_qty"],
+            "job_fee": lambda r: r["job_fee"],
+            "mat_cost": lambda r: r["materials_cost"],
+            "inv_cost": lambda r: (r.get("invention_cost") or 0) + (r.get("facility_cost") or 0),
+            "total_cost": lambda r: r["total_cost"],
+            "unit_cost": lambda r: r["unit_cost"],
+            "sold": lambda r: r["sold_qty"],
+            "revenue": lambda r: r["revenue"],
+            "realized": lambda r: r["realized_profit"],
+            "unsold": lambda r: r["unsold_qty"],
+            "unrealized": lambda r: r["unrealized_value"],
+            "total_pl": lambda r: r["total_estimated_pl"],
+            "flag": lambda r: r["materials_unknown_qty"],
+        }
+        try:
+            rows.sort(key=sort_keys.get(sort_col, sort_keys["completed"]), reverse=reverse)
+        except Exception:
+            pass
+
+        def fmt_isk(v):
+            try:
+                return f"{float(v):,.2f}"
+            except (TypeError, ValueError):
+                return "0.00"
+
+        total_cost = 0.0
+        total_revenue = 0.0
+        total_realized = 0.0
+        total_unrealized = 0.0
+        for r in rows:
+            tags = []
+            pl = r["total_estimated_pl"]
+            if pl > 0:
+                tags.append("gain")
+            elif pl < 0:
+                tags.append("loss")
+            if r["materials_unknown_qty"] > 0:
+                tags.append("flagged")
+            inv_display = float(r.get("invention_cost") or 0) + float(r.get("facility_cost") or 0)
+            if (r.get("note") or "").find("no invention binding") >= 0:
+                tags.append("flagged")
+            job_count = int(r.get("job_count") or 1)
+            if weekly:
+                pt = r.get("product_type_id")
+                pt_key = str(pt) if pt is not None else "n:" + (r.get("product_name") or "?")
+                pl_iid = f"week|{r['entity_kind']}|{r['entity_id']}|{r.get('week_key', '')}|{pt_key}"
+                completed_disp = r.get("week_key") or "?"
+                if r.get("end_date_min") and r.get("end_date_max"):
+                    completed_disp += f" ({(r['end_date_min'] or '')[:10]} – {(r['end_date_max'] or '')[:10]})"
+            else:
+                pl_iid = f"job|{r['entity_kind']}|{r['entity_id']}|{r['job_id']}"
+                completed_disp = (r["end_date_utc"] or "")[:16].replace("T", " ")
+            self.pl_row_meta[pl_iid] = r
+            self.pl_tree.insert(
+                "", tk.END, iid=pl_iid,
+                values=(
+                    completed_disp,
+                    r["character_name"],
+                    r["product_name"],
+                    f"{job_count:,}",
+                    f"{r['runs']:,}",
+                    f"{r['output_qty']:,}",
+                    fmt_isk(r["job_fee"]),
+                    fmt_isk(r["materials_cost"]),
+                    fmt_isk(inv_display),
+                    fmt_isk(r["total_cost"]),
+                    fmt_isk(r["unit_cost"]),
+                    f"{r['sold_qty']:,}",
+                    fmt_isk(r["revenue"]),
+                    fmt_isk(r["realized_profit"]),
+                    f"{r['unsold_qty']:,}",
+                    fmt_isk(r["unrealized_value"]),
+                    fmt_isk(r["total_estimated_pl"]),
+                    "⚠" if r["materials_unknown_qty"] > 0 else "",
+                ),
+                tags=tuple(tags),
+            )
+            total_cost += r["total_cost"]
+            total_revenue += r["revenue"]
+            total_realized += r["realized_profit"]
+            total_unrealized += r["unrealized_value"]
+        n = len(rows)
+        if weekly:
+            n_jobs = sum(int(r.get("job_count") or 0) for r in rows)
+            row_label = f"{n} group(s) ({n_jobs} jobs)"
+        else:
+            row_label = f"{n} job(s)"
+        self.pl_summary_var.set(
+            f"{row_label}  |  cost {fmt_isk(total_cost)}  |  revenue {fmt_isk(total_revenue)}  |  "
+            f"realized P/L {fmt_isk(total_realized)}  |  unrealized {fmt_isk(total_unrealized)}  |  "
+            f"est. total P/L {fmt_isk(total_realized + total_unrealized)}"
+        )
+
+    def _pl_sort_by(self, col: str):
+        st = self._pl_sort_state
+        if st["col"] == col:
+            st["reverse"] = not st["reverse"]
+        else:
+            st["col"] = col
+            st["reverse"] = True
+        self._refresh_pl_view()
+
+    def _pl_show_job_breakdown(self, _event=None):
+        """Open a window with FIFO cost/sale provenance for the double-clicked row (job or weekly group)."""
+        if not hasattr(self, "pl_tree"):
+            return
+        sel = self.pl_tree.selection()
+        if not sel:
+            return
+        iid = sel[0]
+        meta = getattr(self, "pl_row_meta", {}).get(iid)
+        if not Path(DATABASE_FILE).exists():
+            messagebox.showwarning("Job breakdown", "Database not found.")
+            return
+        from profitability_tracking import get_group_pl_breakdown, get_job_pl_breakdown
+        try:
+            conn = sqlite3.connect(DATABASE_FILE)
+            try:
+                if str(iid).startswith("week|") and meta:
+                    text = get_group_pl_breakdown(
+                        conn,
+                        int(meta["entity_id"]),
+                        meta["entity_kind"],
+                        meta.get("job_ids") or [],
+                        meta.get("product_name") or "?",
+                        meta.get("week_key") or "?",
+                    )
+                    title_suffix = f"{meta.get('week_key')} ({meta.get('job_count', 0)} jobs)"
+                elif str(iid).startswith("job|"):
+                    parts = str(iid).split("|")
+                    if len(parts) != 4:
+                        raise ValueError("Invalid job row key")
+                    entity_kind, entity_id, job_id = parts[1], int(parts[2]), int(parts[3])
+                    text = get_job_pl_breakdown(conn, entity_id, entity_kind, job_id)
+                    title_suffix = f"job {job_id}"
+                else:
+                    parts = str(iid).split("|")
+                    if len(parts) != 3:
+                        messagebox.showinfo(
+                            "Job breakdown",
+                            "Rebuild the ledger and try again — this row has no job key stored.",
+                        )
+                        return
+                    entity_kind, entity_id, job_id = parts[0], int(parts[1]), int(parts[2])
+                    text = get_job_pl_breakdown(conn, entity_id, entity_kind, job_id)
+                    title_suffix = f"job {job_id}"
+            finally:
+                conn.close()
+        except Exception as e:
+            messagebox.showerror("Job breakdown", str(e))
+            return
+        win = tk.Toplevel(self.root)
+        product = self.pl_tree.item(iid, "values")
+        title_product = product[2] if len(product) > 2 else "?"
+        win.title(f"P/L breakdown — {title_product} ({title_suffix})")
+        win.geometry("920x640")
+        txt = scrolledtext.ScrolledText(win, wrap=tk.WORD, font=("Consolas", 10))
+        txt.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
+        txt.insert(tk.END, text)
+        txt.configure(state=tk.DISABLED)
+        ttk.Button(win, text="Close", command=win.destroy).pack(pady=(0, 8))
+
+    def _sso_log(self, msg: str):
+        self.sso_log_text.insert(tk.END, msg + "\n")
+        self.sso_log_text.see(tk.END)
+        self.root.update_idletasks()
+    
+    def sso_login(self):
+        """Run EVE SSO login flow (open browser, callback server, store tokens). Adds/updates a character."""
+        from eve_sso_sync import login_flow
+        cid = self.sso_client_id_var.get().strip()
+        secret = self.sso_client_secret_var.get().strip()
+        if not cid or not secret:
+            messagebox.showwarning("SSO", "Enter Client ID and Client Secret (or set EVE_SSO_CLIENT_ID and EVE_SSO_CLIENT_SECRET).")
+            return
+        self.sso_status_var.set("Opening browser for EVE login...")
+        self._sso_log("Starting SSO login (log in with the EVE character you want to add)...")
+        def run():
+            try:
+                result = login_flow(cid, secret, DATABASE_FILE)
+                if "error" in result:
+                    self.sso_status_var.set("Login failed.")
+                    err_text = result["error"]
+                    self._sso_log("Error: " + err_text)
+                    self.root.after(0, lambda msg=err_text: messagebox.showerror("SSO Login", msg))
+                else:
+                    name = result.get("character_name") or f"Character {result.get('character_id')}"
+                    corp = result.get("corporation_name") or ""
+                    self.sso_status_var.set(f"Linked: {name}{' / ' + corp if corp else ''}")
+                    self._sso_log(
+                        f"Linked: {name} (character_id={result.get('character_id')}"
+                        + (f", corp={corp}" if corp else "")
+                        + ")"
+                    )
+                    self.root.after(0, self._refresh_sso_chars_tree)
             except Exception as e:
-                self.sso_status_var.set("Sync failed.")
-                self._sso_log("Error: " + str(e))
-                messagebox.showerror("SSO Sync", str(e))
+                err_text = str(e)
+                self.sso_status_var.set("Login failed.")
+                self._sso_log("Error: " + err_text)
+                self.root.after(0, lambda msg=err_text: messagebox.showerror("SSO Login", msg))
         threading.Thread(target=run, daemon=True).start()
     
     def refresh_exclusions_list(self):
-        """Refresh the excluded modules list"""
-        # Clear existing items
-        for item in self.exclusions_tree.get_children():
-            self.exclusions_tree.delete(item)
+        """Refresh the excluded modules list (no UI tab; no-op if tree was never created)."""
+        tree = getattr(self, "exclusions_tree", None)
+        if tree is None:
+            return
+        for item in tree.get_children():
+            tree.delete(item)
         
         if not Path(DATABASE_FILE).exists():
             return
@@ -4705,7 +7281,7 @@ for one search may still appear in searches with different parameters.
                         excluded_at_str = f"{d.day:02d}/{d.month:02d}"
                     except Exception:
                         excluded_at_str = str(excluded_at)
-                self.exclusions_tree.insert('', tk.END, values=(
+                tree.insert('', tk.END, values=(
                     module_name,
                     module_type_id,
                     f"{min_price:,.2f}",
@@ -4719,7 +7295,10 @@ for one search may still appear in searches with different parameters.
     
     def remove_selected_exclusion(self):
         """Remove selected exclusion(s)"""
-        selected = self.exclusions_tree.selection()
+        tree = getattr(self, "exclusions_tree", None)
+        if tree is None:
+            return
+        selected = tree.selection()
         if not selected:
             messagebox.showwarning("Warning", "Please select an exclusion to remove")
             return
@@ -4735,7 +7314,7 @@ for one search may still appear in searches with different parameters.
         try:
             cursor = conn.cursor()
             for item in selected:
-                values = self.exclusions_tree.item(item, 'values')
+                values = tree.item(item, 'values')
                 module_type_id = int(values[1])
                 min_price = float(values[2].replace(',', ''))
                 max_price = float(values[3].replace(',', ''))
@@ -4758,6 +7337,8 @@ for one search may still appear in searches with different parameters.
     
     def clear_all_exclusions(self):
         """Clear all exclusions"""
+        if getattr(self, "exclusions_tree", None) is None:
+            return
         if not messagebox.askyesno("Confirm", "Clear ALL exclusions? This cannot be undone."):
             return
         
@@ -5507,6 +8088,32 @@ for one search may still appear in searches with different parameters.
         ttk.Button(buttons_frame, text="Recalculate Costs", command=recalculate).pack(side=tk.LEFT, padx=5)
         ttk.Button(buttons_frame, text="Cancel", command=edit_window.destroy).pack(side=tk.LEFT, padx=5)
     
+    def _make_price_update_log_handler(self) -> logging.Handler:
+        """Logging handler that appends to the Price Updates tab log on the Tk main thread (thread-safe)."""
+        fmt = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
+        tw = self.price_update_log
+        root = self.root
+
+        class _PriceUpdateTkHandler(logging.Handler):
+            def emit(self, record):
+                try:
+                    msg = fmt.format(record) + "\n"
+                except Exception:
+                    msg = (record.getMessage() or "") + "\n"
+
+                def _append():
+                    try:
+                        tw.insert(tk.END, msg)
+                        tw.see(tk.END)
+                    except tk.TclError:
+                        pass
+
+                root.after(0, _append)
+
+        h = _PriceUpdateTkHandler()
+        h.setLevel(logging.INFO)
+        return h
+
     def update_all_prices(self):
         """Update all prices in a separate thread"""
         if not messagebox.askyesno("Confirm", "Update all prices? This may take several minutes."):
@@ -5519,32 +8126,33 @@ for one search may still appear in searches with different parameters.
         self.root.update()
         
         def update():
+            root_logger = logging.getLogger()
+            h = self._make_price_update_log_handler()
+            root_logger.addHandler(h)
             try:
-                # Redirect logging to our text widget
-                import logging
-                from io import StringIO
-                
-                log_capture = StringIO()
-                handler = logging.StreamHandler(log_capture)
-                handler.setLevel(logging.INFO)
-                logger = logging.getLogger()
-                logger.addHandler(handler)
-                
                 update_prices()
-                
-                logger.removeHandler(handler)
-                output = log_capture.getvalue()
-                
-                self.price_update_log.insert(tk.END, output)
-                self.price_update_log.insert(tk.END, "\n\nUpdate complete!\n")
-                self.status_var.set("Price update complete!")
-                messagebox.showinfo("Success", "All prices updated successfully!")
-                
             except Exception as e:
-                self.price_update_log.insert(tk.END, f"\nError: {str(e)}\n")
-                self.status_var.set("Error occurred")
-                messagebox.showerror("Error", f"An error occurred:\n{str(e)}")
-        
+                err = str(e)
+
+                def err_ui():
+                    self.price_update_log.insert(tk.END, f"\nError: {err}\n")
+                    self.price_update_log.see(tk.END)
+                    self.status_var.set("Error occurred")
+                    messagebox.showerror("Error", f"An error occurred:\n{err}")
+
+                self.root.after(0, err_ui)
+            else:
+
+                def ok_ui():
+                    self.price_update_log.insert(tk.END, "\n\nUpdate complete!\n")
+                    self.price_update_log.see(tk.END)
+                    self.status_var.set("Price update complete!")
+                    messagebox.showinfo("Success", "All prices updated successfully!")
+
+                self.root.after(0, ok_ui)
+            finally:
+                root_logger.removeHandler(h)
+
         thread = threading.Thread(target=update, daemon=True)
         thread.start()
     
@@ -5574,36 +8182,33 @@ for one search may still appear in searches with different parameters.
             pass
 
         def update():
+            root_logger = logging.getLogger()
+            h = self._make_price_update_log_handler()
+            root_logger.addHandler(h)
             try:
-                import logging
-                from io import StringIO
-
-                log_capture = StringIO()
-                handler = logging.StreamHandler(log_capture)
-                handler.setLevel(logging.INFO)
-                root_logger = logging.getLogger()
-                root_logger.addHandler(handler)
-
                 comparison = update_mineral_prices(extra_type_ids=extra_type_ids if extra_type_ids else None)
+            except Exception as e:
+                err = str(e)
 
-                root_logger.removeHandler(handler)
-                output = log_capture.getvalue()
+                def err_ui():
+                    self.price_update_log.insert(tk.END, f"\nError: {err}\n")
+                    self.price_update_log.see(tk.END)
+                    self.status_var.set("Error occurred")
+                    messagebox.showerror("Error", f"An error occurred:\n{err}")
+
+                self.root.after(0, err_ui)
+            else:
 
                 def done():
-                    self.price_update_log.insert(tk.END, output)
                     self.price_update_log.insert(tk.END, "\nMineral price update complete!\n")
+                    self.price_update_log.see(tk.END)
                     self.status_var.set("Mineral price update complete!")
                     if comparison:
                         self._show_price_comparison_popup(comparison)
 
                 self.root.after(0, done)
-
-            except Exception as e:
-                def err():
-                    self.price_update_log.insert(tk.END, f"\nError: {str(e)}\n")
-                    self.status_var.set("Error occurred")
-                    messagebox.showerror("Error", f"An error occurred:\n{str(e)}")
-                self.root.after(0, err)
+            finally:
+                root_logger.removeHandler(h)
 
         threading.Thread(target=update, daemon=True).start()
 
@@ -5711,8 +8316,12 @@ for one search may still appear in searches with different parameters.
                     type_ids = [row[0] for row in cursor.fetchall()]
                     
                     if not type_ids:
-                        self.price_update_log.insert(tk.END, "No items with blueprint source found in database.\n")
-                        self.status_var.set("No blueprint items found")
+                        def no_items():
+                            self.price_update_log.insert(tk.END, "No items with blueprint source found in database.\n")
+                            self.price_update_log.see(tk.END)
+                            self.status_var.set("No blueprint items found")
+
+                        self.root.after(0, no_items)
                         return
                     
                     self.price_update_log.insert(tk.END, f"Found {len(type_ids)} items with blueprint source.\n")
@@ -5722,30 +8331,33 @@ for one search may still appear in searches with different parameters.
                 finally:
                     conn.close()
                 
-                # Redirect logging to our text widget
-                import logging
-                from io import StringIO
-                
-                log_capture = StringIO()
-                handler = logging.StreamHandler(log_capture)
-                handler.setLevel(logging.INFO)
-                logger = logging.getLogger()
-                logger.addHandler(handler)
-                
-                update_prices_by_type_ids(type_ids, f"blueprint items (source='blueprint')")
-                
-                logger.removeHandler(handler)
-                output = log_capture.getvalue()
-                
-                self.price_update_log.insert(tk.END, output)
-                self.price_update_log.insert(tk.END, "\n\nBlueprint price update complete!\n")
-                self.status_var.set("Blueprint price update complete!")
-                messagebox.showinfo("Success", f"Updated prices for {len(type_ids)} blueprint items successfully!")
-                
+                # Stream logs to Update Log on main thread
+                root_logger = logging.getLogger()
+                h = self._make_price_update_log_handler()
+                root_logger.addHandler(h)
+                try:
+                    update_prices_by_type_ids(type_ids, f"blueprint items (source='blueprint')")
+                finally:
+                    root_logger.removeHandler(h)
+
+                def ok_ui():
+                    self.price_update_log.insert(tk.END, "\n\nBlueprint price update complete!\n")
+                    self.price_update_log.see(tk.END)
+                    self.status_var.set("Blueprint price update complete!")
+                    messagebox.showinfo("Success", f"Updated prices for {len(type_ids)} blueprint items successfully!")
+
+                self.root.after(0, ok_ui)
+
             except Exception as e:
-                self.price_update_log.insert(tk.END, f"\nError: {str(e)}\n")
-                self.status_var.set("Error occurred")
-                messagebox.showerror("Error", f"An error occurred:\n{str(e)}")
+                err = str(e)
+
+                def err_ui():
+                    self.price_update_log.insert(tk.END, f"\nError: {err}\n")
+                    self.price_update_log.see(tk.END)
+                    self.status_var.set("Error occurred")
+                    messagebox.showerror("Error", f"An error occurred:\n{err}")
+
+                self.root.after(0, err_ui)
         
         thread = threading.Thread(target=update, daemon=True)
         thread.start()
@@ -5772,8 +8384,12 @@ for one search may still appear in searches with different parameters.
                     type_ids = [row[0] for row in cursor.fetchall()]
                     
                     if not type_ids:
-                        self.price_update_log.insert(tk.END, "No items with group consensus source found in database.\n")
-                        self.status_var.set("No group consensus items found")
+                        def no_items():
+                            self.price_update_log.insert(tk.END, "No items with group consensus source found in database.\n")
+                            self.price_update_log.see(tk.END)
+                            self.status_var.set("No group consensus items found")
+
+                        self.root.after(0, no_items)
                         return
                     
                     self.price_update_log.insert(tk.END, f"Found {len(type_ids)} items with group consensus source.\n")
@@ -5783,30 +8399,32 @@ for one search may still appear in searches with different parameters.
                 finally:
                     conn.close()
                 
-                # Redirect logging to our text widget
-                import logging
-                from io import StringIO
-                
-                log_capture = StringIO()
-                handler = logging.StreamHandler(log_capture)
-                handler.setLevel(logging.INFO)
-                logger = logging.getLogger()
-                logger.addHandler(handler)
-                
-                update_prices_by_type_ids(type_ids, f"group consensus items (source='group_consensus')")
-                
-                logger.removeHandler(handler)
-                output = log_capture.getvalue()
-                
-                self.price_update_log.insert(tk.END, output)
-                self.price_update_log.insert(tk.END, "\n\nGroup consensus price update complete!\n")
-                self.status_var.set("Group consensus price update complete!")
-                messagebox.showinfo("Success", f"Updated prices for {len(type_ids)} group consensus items successfully!")
-                
+                root_logger = logging.getLogger()
+                h = self._make_price_update_log_handler()
+                root_logger.addHandler(h)
+                try:
+                    update_prices_by_type_ids(type_ids, f"group consensus items (source='group_consensus')")
+                finally:
+                    root_logger.removeHandler(h)
+
+                def ok_ui():
+                    self.price_update_log.insert(tk.END, "\n\nGroup consensus price update complete!\n")
+                    self.price_update_log.see(tk.END)
+                    self.status_var.set("Group consensus price update complete!")
+                    messagebox.showinfo("Success", f"Updated prices for {len(type_ids)} group consensus items successfully!")
+
+                self.root.after(0, ok_ui)
+
             except Exception as e:
-                self.price_update_log.insert(tk.END, f"\nError: {str(e)}\n")
-                self.status_var.set("Error occurred")
-                messagebox.showerror("Error", f"An error occurred:\n{str(e)}")
+                err = str(e)
+
+                def err_ui():
+                    self.price_update_log.insert(tk.END, f"\nError: {err}\n")
+                    self.price_update_log.see(tk.END)
+                    self.status_var.set("Error occurred")
+                    messagebox.showerror("Error", f"An error occurred:\n{err}")
+
+                self.root.after(0, err_ui)
         
         thread = threading.Thread(target=update, daemon=True)
         thread.start()
@@ -5823,33 +8441,39 @@ for one search may still appear in searches with different parameters.
         self.root.update()
         
         def run():
+            root_logger = logging.getLogger()
+            h = self._make_price_update_log_handler()
+            root_logger.addHandler(h)
             try:
-                import logging
-                from io import StringIO
-                log_capture = StringIO()
-                handler = logging.StreamHandler(log_capture)
-                handler.setLevel(logging.INFO)
-                root_logger = logging.getLogger()
-                root_logger.addHandler(handler)
-                try:
-                    run_fetch(
-                        region_id=MARKET_HISTORY_REGION_ID,
-                        all_items=True,
-                        scope="prices",
-                        delay_seconds=1.0,
-                        progress_interval=50,
-                    )
-                finally:
-                    root_logger.removeHandler(handler)
-                output = log_capture.getvalue()
-                self.price_update_log.insert(tk.END, output)
-                self.price_update_log.insert(tk.END, "\n\nMarket history fetch complete!\n")
-                self.status_var.set("Market history fetch complete!")
-                messagebox.showinfo("Success", "Market history fetch complete!")
+                run_fetch(
+                    region_id=MARKET_HISTORY_REGION_ID,
+                    all_items=True,
+                    scope="prices",
+                    delay_seconds=1.0,
+                    progress_interval=50,
+                )
             except Exception as e:
-                self.price_update_log.insert(tk.END, f"\nError: {str(e)}\n")
-                self.status_var.set("Error occurred")
-                messagebox.showerror("Error", f"An error occurred:\n{str(e)}")
+                err = str(e)
+
+                def err_ui():
+                    self.price_update_log.insert(tk.END, f"\nError: {err}\n")
+                    self.price_update_log.see(tk.END)
+                    self.status_var.set("Error occurred")
+                    messagebox.showerror("Error", f"An error occurred:\n{err}")
+
+                self.root.after(0, err_ui)
+            else:
+
+                def ok_ui():
+                    self.price_update_log.insert(tk.END, "\n\nMarket history fetch complete!\n")
+                    self.price_update_log.see(tk.END)
+                    self.status_var.set("Market history fetch complete!")
+                    messagebox.showinfo("Success", "Market history fetch complete!")
+
+                self.root.after(0, ok_ui)
+            finally:
+                root_logger.removeHandler(h)
+
         threading.Thread(target=run, daemon=True).start()
     
     def refresh_volume_no_or_zero_data(self):
@@ -5872,30 +8496,64 @@ for one search may still appear in searches with different parameters.
                 finally:
                     conn.close()
                 if not to_refresh:
-                    self.price_update_log.insert(tk.END, "No items need refresh (all have volume data).\n")
-                    self.status_var.set("No items to refresh")
-                    messagebox.showinfo("Info", "No items with missing/zero volume data found.")
+                    def no_refresh():
+                        self.price_update_log.insert(tk.END, "No items need refresh (all have volume data).\n")
+                        self.price_update_log.see(tk.END)
+                        self.status_var.set("No items to refresh")
+                        messagebox.showinfo("Info", "No items with missing/zero volume data found.")
+
+                    self.root.after(0, no_refresh)
                     return
-                self.price_update_log.insert(tk.END, f"Found {len(to_refresh)} items to refresh. Calling API...\n\n")
-                self.root.update()
+
+                cnt = len(to_refresh)
+
+                def found_msg():
+                    self.price_update_log.insert(tk.END, f"Found {cnt} items to refresh. Calling API...\n\n")
+                    self.price_update_log.see(tk.END)
+                    self.root.update_idletasks()
+
+                self.root.after(0, found_msg)
                 conn = sqlite3.connect(DATABASE_FILE)
                 try:
                     done = 0
+                    n_last = 0
                     for i, type_id in enumerate(to_refresh):
-                        n = refresh_market_history_for_type(conn, MARKET_HISTORY_REGION_ID, type_id)
+                        n_last = refresh_market_history_for_type(conn, MARKET_HISTORY_REGION_ID, type_id)
                         done += 1
                         if (i + 1) % 50 == 0:
-                            self.price_update_log.insert(tk.END, f"  Refreshed {i + 1}/{len(to_refresh)} (last: type_id={type_id}, {n} days)\n")
-                            self.root.update()
-                    self.price_update_log.insert(tk.END, f"\nRefreshed {done} items.\n")
-                    self.status_var.set("Volume refresh complete!")
-                    messagebox.showinfo("Success", f"Refreshed market history for {done} items.")
+                            cur_i = i + 1
+                            total = len(to_refresh)
+                            tid = type_id
+                            n = n_last
+
+                            def _prog(ci=cur_i, tot=total, t=tid, nd=n):
+                                self.price_update_log.insert(
+                                    tk.END,
+                                    f"  Refreshed {ci}/{tot} (last: type_id={t}, {nd} days)\n",
+                                )
+                                self.price_update_log.see(tk.END)
+                                self.root.update_idletasks()
+
+                            self.root.after(0, _prog)
+                    self.root.after(
+                        0,
+                        lambda d=done: self.price_update_log.insert(tk.END, f"\nRefreshed {d} items.\n"),
+                    )
+                    self.root.after(0, lambda: self.price_update_log.see(tk.END))
+                    self.root.after(0, lambda: self.status_var.set("Volume refresh complete!"))
+                    self.root.after(0, lambda d=done: messagebox.showinfo("Success", f"Refreshed market history for {d} items."))
                 finally:
                     conn.close()
             except Exception as e:
-                self.price_update_log.insert(tk.END, f"\nError: {str(e)}\n")
-                self.status_var.set("Error occurred")
-                messagebox.showerror("Error", f"An error occurred:\n{str(e)}")
+                err = str(e)
+
+                def err_ui():
+                    self.price_update_log.insert(tk.END, f"\nError: {err}\n")
+                    self.price_update_log.see(tk.END)
+                    self.status_var.set("Error occurred")
+                    messagebox.showerror("Error", f"An error occurred:\n{err}")
+
+                self.root.after(0, err_ui)
         threading.Thread(target=run, daemon=True).start()
     
     def add_on_offer_item(self):

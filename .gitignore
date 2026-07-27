@@ -38,10 +38,12 @@ venv.bak/
 eve_data/
 *.xlsx
 *.xls
-# SQLite databases – track only the main db, ignore versioned backups
+# SQLite databases – not tracked (too large for GitHub; rebuilt/synced locally).
+# Portable working data travels via the launcher's Export/Import feature instead.
 *.db
+# Optional future split DB for market-only cache (keep ignored)
+eve_market_prices.db
 *.db-journal
-!eve_manufacturing.db
 fuzzwork_prices_*.csv
 fuzzwork_prices_*.json
 
@@ -51,4 +53,20 @@ Thumbs.db
 
 # Logs
 *.log
+
+# EVE SSO credentials (Client ID / Secret) - never commit
+eve_sso_credentials.json
+
+# Local backups created during merges/sync
+*.bak
+*.localpc.bak
+*.premerge.bak
+
+# Local shortcut helpers (Windows)
+create_shortcut.ps1
+create_shortcut.vbs
+
+# User-local UI / capture data
+overview_alert_captures/
+overview_alert_settings.json
 

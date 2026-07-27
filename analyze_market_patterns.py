@@ -21,12 +21,12 @@ from datetime import datetime
 
 from fetch_market_history import (
     DB_FILE as MARKET_DB_FILE,
-    THE_FORGE_REGION_ID,
     expected_buy_order_volume_for_day,
 )
 
 
 DATABASE_FILE = MARKET_DB_FILE
+REGION_ID = 10000002  # The Forge (ESI/SDE region id)
 
 # Minerals of interest
 MINERAL_TYPE_IDS = [
@@ -90,35 +90,51 @@ def get_history_rows(
 
 def group_by_weekday(rows: list[sqlite3.Row]):
     """
-    Group raw history rows by weekday.
-    Returns dict weekday_index -> list[dict].
+    Group day-over-day percentage changes by weekday.
+
+    For each day (except the very first), we compute:
+        pct_change = (average_today - average_prev) / average_prev * 100
+    and bucket that value under the weekday of *today*.
+    Returns dict weekday_index -> list[dict] with keys:
+        pct_change, volume, expected_buy_vol.
     """
     grouped = defaultdict(list)
+    prev_avg = None
+    prev_row = None
     for r in rows:
         date_str = r["date_utc"]
         try:
             dt = datetime.strptime(date_str, "%Y-%m-%d")
         except Exception:
-            # Fallback if stored with time component
             try:
                 dt = datetime.fromisoformat(date_str.split("T", 1)[0])
             except Exception:
+                prev_avg = None
+                prev_row = None
                 continue
-        wd = dt.weekday()  # 0=Mon .. 6=Sun
+        avg = r["average"]
+        if prev_avg is not None and prev_avg not in (0, 0.0) and avg is not None:
+            try:
+                pct_change = (float(avg) - float(prev_avg)) / float(prev_avg) * 100.0
+            except (TypeError, ZeroDivisionError):
+                pct_change = None
+        else:
+            pct_change = None
         lowest = r["lowest"]
         highest = r["highest"]
-        avg = r["average"]
         vol = r["volume"]
         ev = expected_buy_order_volume_for_day(lowest, highest, avg, vol)
-        grouped[wd].append(
-            {
-                "lowest": lowest or 0.0,
-                "highest": highest or 0.0,
-                "average": avg or 0.0,
-                "volume": vol or 0.0,
-                "expected_buy_vol": ev or 0.0,
-            }
-        )
+        if pct_change is not None:
+            wd = dt.weekday()  # 0=Mon .. 6=Sun
+            grouped[wd].append(
+                {
+                    "pct_change": pct_change,
+                    "volume": vol or 0.0,
+                    "expected_buy_vol": ev or 0.0,
+                }
+            )
+        prev_avg = avg
+        prev_row = r
     return grouped
 
 
@@ -131,9 +147,7 @@ def summarize_weekday_group(values: list[dict]) -> dict:
 
     return {
         "n_days": n,
-        "avg_lowest": avg("lowest"),
-        "avg_highest": avg("highest"),
-        "avg_average": avg("average"),
+        "avg_pct_change": avg("pct_change"),
         "avg_volume": avg("volume"),
         "avg_expected_buy_vol": avg("expected_buy_vol"),
     }
@@ -141,7 +155,7 @@ def summarize_weekday_group(values: list[dict]) -> dict:
 
 def print_item_weekday_summary(conn: sqlite3.Connection, type_id: int, header: str | None = None) -> None:
     name = get_item_name(conn, type_id)
-    rows = get_history_rows(conn, THE_FORGE_REGION_ID, type_id)
+    rows = get_history_rows(conn, REGION_ID, type_id)
     if not rows:
         print(f"\n=== {name} (typeID {type_id}) – no history data ===")
         return
@@ -150,22 +164,21 @@ def print_item_weekday_summary(conn: sqlite3.Connection, type_id: int, header: s
         print(f"\n=== {header}: {name} (typeID {type_id}) ===")
     else:
         print(f"\n=== {name} (typeID {type_id}) ===")
-    print("Weekday  Days  Avg Price(low/avg/high)      Avg Volume   Avg Exp. Buy Vol")
-    print("-------  ----  ---------------------------  ----------   -----------------")
+    # Use plain ASCII to avoid encoding issues in some terminals.
+    print("Weekday  Days  Avg % change vs prev day   Avg Volume   Avg Exp. Buy Vol")
+    print("-------  ----  -------------------------  ----------   -----------------")
     for wd in range(7):
         vals = summarize_weekday_group(grouped.get(wd, []))
         if not vals:
             continue
         lbl = WEEKDAY_NAMES[wd]
         n = vals["n_days"]
-        lo = vals["avg_lowest"]
-        av = vals["avg_average"]
-        hi = vals["avg_highest"]
+        pct = vals["avg_pct_change"]
         vol = vals["avg_volume"]
         ev = vals["avg_expected_buy_vol"]
         print(
             f"{lbl:>7}  {n:4d}  "
-            f"{lo:10.2f}/{av:10.2f}/{hi:10.2f}  "
+            f"{pct:9.3f}%            "
             f"{vol:10.1f}   {ev:15.1f}"
         )
 
@@ -174,7 +187,7 @@ def main():
     conn = get_conn(DATABASE_FILE)
     try:
         print("Analyzing day-of-week patterns for selected minerals and On Offer modules "
-              f"(region_id={THE_FORGE_REGION_ID})")
+              f"(region_id={REGION_ID})")
 
         print("\n### Minerals ###")
         for tid in MINERAL_TYPE_IDS:

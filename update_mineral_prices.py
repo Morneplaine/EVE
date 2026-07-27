@@ -7,6 +7,7 @@ import sqlite3
 import logging
 from eve_manufacturing_database import get_fuzzwork_market_prices, JITA_SYSTEM_ID
 from decryptors_data import get_decryptor_type_ids
+from decryptor_profitability import DATACORE_NAMES
 
 # Set up logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -51,7 +52,7 @@ def get_mineral_type_ids(conn):
     Get all typeIDs for basic minerals and additional items.
     Both minerals and additional items are identified by exact item name.
     """
-    all_items = BASIC_MINERALS + ADDITIONAL_ITEMS
+    all_items = BASIC_MINERALS + ADDITIONAL_ITEMS + list(DATACORE_NAMES)
     placeholders = ','.join(['?'] * len(all_items))
     
     query = f"""

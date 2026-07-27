@@ -128,10 +128,14 @@ def populate_blueprints(conn, sde_data):
     products = sde_data['industryActivityProducts']
     
     MANUFACTURING_ACTIVITY = 1
-    manufacturing_products = products[products['activityID'] == MANUFACTURING_ACTIVITY].copy()
+    REACTION_ACTIVITY = 11
+    # Include manufacturing (1) and reactions (11) so reaction products (composites,
+    # intermediate/biochem materials, neurolink components, etc.) can also be planned.
+    industry_products = products[products['activityID'].isin([MANUFACTURING_ACTIVITY, REACTION_ACTIVITY])].copy()
+    industry_products['is_reaction'] = (industry_products['activityID'] == REACTION_ACTIVITY).astype(int)
     
     # Merge with item names
-    blueprints = manufacturing_products.merge(
+    blueprints = industry_products.merge(
         inv_types[['typeID', 'typeName', 'groupID']],
         left_on='productTypeID',
         right_on='typeID',
@@ -153,7 +157,8 @@ def populate_blueprints(conn, sde_data):
         'typeName',  # productName
         'quantity',  # outputQuantity
         'groupID',
-        'groupName'
+        'groupName',
+        'is_reaction'
     ]].copy()
     blueprint_data.columns = [
         'blueprintTypeID',
@@ -161,11 +166,13 @@ def populate_blueprints(conn, sde_data):
         'productName',
         'outputQuantity',
         'groupID',
-        'groupName'
+        'groupName',
+        'is_reaction'
     ]
     
     blueprint_data.to_sql('blueprints', conn, if_exists='replace', index=False)
-    logger.info(f"Inserted {len(blueprint_data)} blueprints")
+    n_react = int(blueprint_data['is_reaction'].sum())
+    logger.info(f"Inserted {len(blueprint_data)} blueprints ({n_react} reactions)")
 
 def populate_manufacturing_materials(conn, sde_data):
     """Populate manufacturing materials"""
@@ -175,7 +182,8 @@ def populate_manufacturing_materials(conn, sde_data):
     materials = sde_data['industryActivityMaterials']
     
     MANUFACTURING_ACTIVITY = 1
-    manufacturing_materials = materials[materials['activityID'] == MANUFACTURING_ACTIVITY].copy()
+    REACTION_ACTIVITY = 11
+    manufacturing_materials = materials[materials['activityID'].isin([MANUFACTURING_ACTIVITY, REACTION_ACTIVITY])].copy()
     
     # Merge with material names
     materials_with_names = manufacturing_materials.merge(
@@ -235,7 +243,8 @@ def populate_manufacturing_skills(conn, sde_data):
     skills = sde_data['industryActivitySkills']
     
     MANUFACTURING_ACTIVITY = 1
-    manufacturing_skills = skills[skills['activityID'] == MANUFACTURING_ACTIVITY].copy()
+    REACTION_ACTIVITY = 11
+    manufacturing_skills = skills[skills['activityID'].isin([MANUFACTURING_ACTIVITY, REACTION_ACTIVITY])].copy()
     
     # Merge with skill names
     skills_with_names = manufacturing_skills.merge(

@@ -7,6 +7,7 @@ Given a blueprint (or product name), computes:
 - System cost: system_cost_percent × EIV (Estimated Item Value). EIV uses CCP's
   adjusted_price for the output product (from ESI /markets/prices/), not market sell
   price — e.g. Leshak EIV ~258m vs sell ~494m; Triglavian/some items have different EIV.
+- Shipping cost: 1000 ISK × output volume (m3) × output quantity produced.
 - Profit and return %
 """
 
@@ -27,6 +28,7 @@ ESI_MARKETS_PRICES = "https://esi.evetech.net/latest/markets/prices/"
 _adjusted_price_cache = {}
 
 DATABASE_FILE = "eve_manufacturing.db"
+SHIPPING_COST_PER_M3 = 1000.0
 
 
 def resolve_blueprint(conn, name):
@@ -154,6 +156,18 @@ def calculate_blueprint_profitability(
         if not materials:
             return {"error": f"No manufacturing materials found for blueprint (product: {product_name})"}
 
+        # Reactions ignore material efficiency; force ME 0 so ME5/ME10 views don't understate inputs.
+        is_reaction = False
+        try:
+            r_row = conn.execute(
+                "SELECT is_reaction FROM blueprints WHERE blueprintTypeID = ?", (blueprint_type_id,)
+            ).fetchone()
+            is_reaction = bool(r_row[0]) if r_row and r_row[0] is not None else False
+        except sqlite3.OperationalError:
+            is_reaction = False
+        if is_reaction:
+            material_efficiency = 0
+
         me_level = max(0, min(10, float(material_efficiency)))  # 0–10, each level 4% reduction
         runs = max(1, int(number_of_runs))
         me_fraction = me_level/100  # material efficiency as fraction (e.g. 40% → 0.4)
@@ -166,8 +180,20 @@ def calculate_blueprint_profitability(
         )
         price_by_type = {int(row["typeID"]): dict(row) for row in cur.fetchall()}
 
+        # Material volumes (for input transport/shipping cost).
+        cur = conn.execute(
+            f"SELECT typeID, packaged_volume, volume FROM items WHERE typeID IN ({placeholders})",
+            material_type_ids,
+        )
+        volume_by_type = {}
+        for row in cur.fetchall():
+            pkg = float(row["packaged_volume"]) if row["packaged_volume"] is not None else 0.0
+            reg = float(row["volume"]) if row["volume"] is not None else 0.0
+            volume_by_type[int(row["typeID"])] = pkg if pkg > 0 else reg
+
         input_materials_out = []
         total_input_cost = 0.0
+        total_input_volume_m3 = 0.0
         materials_priced_at_zero = []
         for m in materials:
             tid = m["materialTypeID"]
@@ -184,14 +210,21 @@ def calculate_blueprint_profitability(
                     materials_priced_at_zero.append(m["materialName"])
             total_cost = unit_price * total_qty
             total_input_cost += total_cost
+            unit_volume = volume_by_type.get(tid, 0.0)
+            total_volume = unit_volume * total_qty
+            total_input_volume_m3 += total_volume
             input_materials_out.append({
+                "materialTypeID": tid,
                 "materialName": m["materialName"],
                 "base_quantity": base_qty,
                 "quantity": total_qty,
                 "quantity_per_run": per_run,
                 "unit_price": unit_price,
                 "total_cost": total_cost,
+                "unit_volume": unit_volume,
+                "total_volume": total_volume,
             })
+        input_shipping_cost = SHIPPING_COST_PER_M3 * total_input_volume_m3
 
         cur = conn.execute("SELECT buy_max, sell_min FROM prices WHERE typeID = ?", (product_type_id,))
         out_price_row = cur.fetchone()
@@ -214,11 +247,28 @@ def calculate_blueprint_profitability(
         manufacturing_tax_total_all_runs = 0.0
         tax_details = []
 
+        # Shipping cost: charge by output volume.
+        # Prefer packaged volume when available, fallback to regular volume.
+        vol_row = conn.execute(
+            "SELECT packaged_volume, volume FROM items WHERE typeID = ?",
+            (product_type_id,),
+        ).fetchone()
+        output_volume_m3 = 0.0
+        if vol_row:
+            try:
+                packaged = float(vol_row[0] or 0.0)
+                regular = float(vol_row[1] or 0.0)
+                output_volume_m3 = packaged if packaged > 0 else regular
+            except Exception:
+                output_volume_m3 = 0.0
+
         output_unit_price = _output_price_after_costs(out_price_row, output_price_type)
         output_total_qty = output_quantity * runs
         output_revenue = output_unit_price * output_total_qty
+        output_total_volume_m3 = output_volume_m3 * output_total_qty
+        shipping_cost = SHIPPING_COST_PER_M3 * output_total_volume_m3
 
-        total_cost = total_input_cost + system_cost_isk + manufacturing_tax_total_all_runs
+        total_cost = total_input_cost + system_cost_isk + manufacturing_tax_total_all_runs + shipping_cost
         profit = output_revenue - total_cost
         return_percent = (profit / total_cost * 100.0) if total_cost > 0 else 0.0
 
@@ -231,12 +281,17 @@ def calculate_blueprint_profitability(
             "blueprintTypeID": blueprint_type_id,
             "productTypeID": product_type_id,
             "productName": product_name,
+            "is_reaction": is_reaction,
             "outputQuantity": output_quantity,
             "number_of_runs": runs,
             "material_efficiency": me_level,
             "input_materials": input_materials_out,
             "materials_priced_at_zero": materials_priced_at_zero,
             "total_input_cost": total_input_cost,
+            "total_input_volume_m3": total_input_volume_m3,
+            "input_shipping_cost": input_shipping_cost,
+            "output_buy_max": buy_max_out,
+            "output_sell_min": sell_min_out,
             "eiv": eiv,
             "adjusted_price": adjusted,
             "eiv_price_per_unit": eiv_price_per_unit,
@@ -246,6 +301,10 @@ def calculate_blueprint_profitability(
             "manufacturing_tax": 0.0,
             "manufacturing_tax_rate": 0.0,
             "tax_details": tax_details,
+            "shipping_cost_per_m3": SHIPPING_COST_PER_M3,
+            "output_volume_m3": output_volume_m3,
+            "output_total_volume_m3": output_total_volume_m3,
+            "shipping_cost": shipping_cost,
             "output_unit_price": output_unit_price,
             "output_total_quantity": output_total_qty,
             "output_revenue": output_revenue,

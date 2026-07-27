@@ -20,6 +20,8 @@ import shutil
 import time
 import sys
 import threading
+import subprocess
+import json
 import tkinter as tk
 from tkinter import ttk, filedialog
 from pathlib import Path
@@ -30,6 +32,48 @@ ALARM_WAV_NAME = "alarm.wav"
 ALARM_SOUND_PATH = APP_DIR / ALARM_WAV_NAME
 # Subfolder for screenshots and debug captures (keeps program folder tidy)
 CAPTURES_DIR = APP_DIR / "overview_alert_captures"
+SETTINGS_PATH = APP_DIR / "overview_alert_settings.json"
+
+
+def open_captures_folder() -> None:
+    """Open the screenshots / captures folder in the system file manager."""
+    CAPTURES_DIR.mkdir(parents=True, exist_ok=True)
+    p = str(CAPTURES_DIR.resolve())
+    if sys.platform == "win32":
+        os.startfile(p)
+    elif sys.platform == "darwin":
+        subprocess.run(["open", p], check=False)
+    else:
+        subprocess.run(["xdg-open", p], check=False)
+
+
+def _clamp_int(value, lo: int, hi: int, default: int) -> int:
+    try:
+        v = int(value)
+    except Exception:
+        v = default
+    return max(lo, min(hi, v))
+
+
+def load_overview_settings() -> dict:
+    """Load persisted GUI settings from JSON file. Returns empty dict when unavailable/invalid."""
+    if not SETTINGS_PATH.exists():
+        return {}
+    try:
+        with open(SETTINGS_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def save_overview_settings(settings: dict) -> None:
+    """Persist GUI settings to JSON file."""
+    try:
+        with open(SETTINGS_PATH, "w", encoding="utf-8") as f:
+            json.dump(settings, f, indent=2)
+    except Exception:
+        pass
 
 
 def _next_capture_number(prefix: str, suffix: str) -> int:
@@ -576,6 +620,12 @@ def run_gui():
     y_start_var = tk.IntVar(value=0)
     y_end_var = tk.IntVar(value=50)
     require_pixels_var = tk.IntVar(value=8)
+    color_name_vars = {
+        "teal": tk.StringVar(value="Teal"),
+        "yellow": tk.StringVar(value="Yellow"),
+        "red": tk.StringVar(value="Red"),
+        "purple": tk.StringVar(value="Purple"),
+    }
     # RGB range vars: (r_min, r_max, g_min, g_max, b_min, b_max) per color
     def _default_ranges():
         d = DEFAULT_COLOR_RANGES
@@ -586,6 +636,32 @@ def run_gui():
             "purple": (tk.IntVar(value=d["purple"][0]), tk.IntVar(value=d["purple"][1]), tk.IntVar(value=d["purple"][2]), tk.IntVar(value=d["purple"][3]), tk.IntVar(value=d["purple"][4]), tk.IntVar(value=d["purple"][5])),
         }
     rgb_vars = _default_ranges()
+
+    # Load persisted settings (if any)
+    loaded = load_overview_settings()
+    if loaded:
+        band = loaded.get("band", {})
+        x_start_var.set(_clamp_int(band.get("x_start_pct", 85), 0, 100, 85))
+        x_end_var.set(_clamp_int(band.get("x_end_pct", 98), 0, 100, 98))
+        y_start_var.set(_clamp_int(band.get("y_start_pct", 0), 0, 100, 0))
+        y_end_var.set(_clamp_int(band.get("y_end_pct", 50), 0, 100, 50))
+        detection = loaded.get("detection", {})
+        require_pixels_var.set(_clamp_int(detection.get("require_pixels", 8), 1, 100, 8))
+        if "sound_once" in detection:
+            sound_once_var.set(bool(detection.get("sound_once")))
+        color_labels = loaded.get("color_labels", {})
+        if isinstance(color_labels, dict):
+            for key in color_name_vars.keys():
+                label = color_labels.get(key)
+                if isinstance(label, str) and label.strip():
+                    color_name_vars[key].set(label.strip())
+        ranges = loaded.get("rgb_ranges", {})
+        if isinstance(ranges, dict):
+            for key, vars_tuple in rgb_vars.items():
+                vals = ranges.get(key)
+                if isinstance(vals, (list, tuple)) and len(vals) == 6:
+                    for i in range(6):
+                        vars_tuple[i].set(_clamp_int(vals[i], 0, 255, vars_tuple[i].get()))
 
     notebook = ttk.Notebook(root)
     notebook.pack(fill=tk.BOTH, expand=True, padx=6, pady=6)
@@ -655,6 +731,41 @@ def run_gui():
             v = vars_tuple
             out[name] = (v[0].get(), v[1].get(), v[2].get(), v[3].get(), v[4].get(), v[5].get())
         return out
+
+    def _collect_settings():
+        return {
+            "band": {
+                "x_start_pct": _clamp_int(x_start_var.get(), 0, 100, 85),
+                "x_end_pct": _clamp_int(x_end_var.get(), 0, 100, 98),
+                "y_start_pct": _clamp_int(y_start_var.get(), 0, 100, 0),
+                "y_end_pct": _clamp_int(y_end_var.get(), 0, 100, 50),
+            },
+            "detection": {
+                "require_pixels": _clamp_int(require_pixels_var.get(), 1, 100, 8),
+                "sound_once": bool(sound_once_var.get()),
+            },
+            "color_labels": {
+                key: (color_name_vars[key].get().strip() or key.capitalize())
+                for key in color_name_vars.keys()
+            },
+            "rgb_ranges": {
+                key: [
+                    _clamp_int(vars_tuple[0].get(), 0, 255, 0),
+                    _clamp_int(vars_tuple[1].get(), 0, 255, 255),
+                    _clamp_int(vars_tuple[2].get(), 0, 255, 0),
+                    _clamp_int(vars_tuple[3].get(), 0, 255, 255),
+                    _clamp_int(vars_tuple[4].get(), 0, 255, 0),
+                    _clamp_int(vars_tuple[5].get(), 0, 255, 255),
+                ]
+                for key, vars_tuple in rgb_vars.items()
+            },
+        }
+
+    def _save_settings_now():
+        save_overview_settings(_collect_settings())
+
+    def _autosave_callback(*_args):
+        _save_settings_now()
 
     # Capture buttons (always visible; work for both screen and window mode)
     capture_btn_frame = ttk.LabelFrame(monitor_tab, text="Save captures (to overview_alert_captures/)", padding=8)
@@ -758,7 +869,16 @@ def run_gui():
             status_var.set(f"Could not save: {e}")
 
     ttk.Button(capture_btn_row, text="Take screenshot", command=do_take_screenshot).pack(side=tk.LEFT, padx=(0, 8))
-    ttk.Button(capture_btn_row, text="Save debug capture", command=do_save_debug_capture).pack(side=tk.LEFT)
+    ttk.Button(capture_btn_row, text="Save debug capture", command=do_save_debug_capture).pack(side=tk.LEFT, padx=(0, 8))
+
+    def do_open_captures_folder():
+        try:
+            open_captures_folder()
+            status_var.set(f"Opened folder: {CAPTURES_DIR}")
+        except Exception as e:
+            status_var.set(f"Could not open captures folder: {e}")
+
+    ttk.Button(capture_btn_row, text="Open folder", command=do_open_captures_folder).pack(side=tk.LEFT)
 
     # Controls
     ctrl = ttk.Frame(monitor_tab)
@@ -916,11 +1036,27 @@ def run_gui():
     for color_name in ("teal", "yellow", "red", "purple"):
         row = ttk.Frame(rgb_frame)
         row.pack(fill=tk.X, pady=2)
-        ttk.Label(row, text=color_name.capitalize() + ":", width=8, anchor=tk.W).pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Entry(row, textvariable=color_name_vars[color_name], width=12).pack(side=tk.LEFT, padx=(0, 4))
         v = rgb_vars[color_name]
         for i, label in enumerate(("R min", "R max", "G min", "G max", "B min", "B max")):
             ttk.Label(row, text=label, font=("", 8)).pack(side=tk.LEFT, padx=(8, 2))
             ttk.Spinbox(row, from_=0, to=255, width=4, textvariable=v[i]).pack(side=tk.LEFT, padx=(0, 4))
+
+    save_row = ttk.Frame(settings_tab)
+    save_row.pack(fill=tk.X, pady=4)
+    ttk.Button(save_row, text="Save settings now", command=_save_settings_now).pack(side=tk.LEFT)
+    ttk.Label(save_row, text=f"Auto-saved to {SETTINGS_PATH.name}", font=("", 8)).pack(side=tk.LEFT, padx=(8, 0))
+
+    # Auto-save on every settings change.
+    tracked_vars = [
+        x_start_var, x_end_var, y_start_var, y_end_var, require_pixels_var, sound_once_var,
+        color_name_vars["teal"], color_name_vars["yellow"], color_name_vars["red"], color_name_vars["purple"],
+    ]
+    for v in tracked_vars:
+        v.trace_add("write", _autosave_callback)
+    for vars_tuple in rgb_vars.values():
+        for v in vars_tuple:
+            v.trace_add("write", _autosave_callback)
 
     def on_closing():
         stop_event.set()

@@ -28,6 +28,7 @@ CREATE TABLE IF NOT EXISTS blueprints (
     outputQuantity INTEGER NOT NULL,
     groupID INTEGER,
     groupName TEXT,
+    is_reaction INTEGER NOT NULL DEFAULT 0,
     FOREIGN KEY (productTypeID) REFERENCES items(typeID),
     FOREIGN KEY (blueprintTypeID) REFERENCES items(typeID)
 );

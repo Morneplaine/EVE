@@ -1,0 +1,240 @@
+{
+  "by_product": {
+    "Compact Interdiction Nullifier Blueprint\u001f": {
+      "production_runs": 180,
+      "invention_runs": 0,
+      "price_at_production": 1625370.040962,
+      "breakeven_price": 35158.29756835569
+    },
+    "CONCORD Capital Shield Booster Blueprint\u001f": {
+      "production_runs": 2,
+      "invention_runs": 0,
+      "price_at_production": 394413654.537,
+      "breakeven_price": 259668077.5273666
+    },
+    "Enduring Interdiction Nullifier Blueprint\u001f": {
+      "production_runs": 250,
+      "invention_runs": 0,
+      "price_at_production": 1598974.27515,
+      "breakeven_price": 38073.353303144686
+    },
+    "Expanded Cargohold II\u001f": {
+      "production_runs": 0,
+      "invention_runs": 0,
+      "price_at_production": 332180.5605264,
+      "breakeven_price": 273050.91559517564
+    },
+    "Gas Cloud Harvester II\u001f": {
+      "production_runs": 0,
+      "invention_runs": 15,
+      "price_at_production": 5639556.88791,
+      "breakeven_price": 5544601.733636706
+    },
+    "Heavy Assault Missile Launcher II\u001f": {
+      "production_runs": 0,
+      "invention_runs": 18,
+      "price_at_production": 1269027.2025,
+      "breakeven_price": 1069967.914748496
+    },
+    "Inferno Rage Heavy Assault Missile\u001f": {
+      "production_runs": 0,
+      "invention_runs": 0,
+      "price_at_production": 95.11612688177999,
+      "breakeven_price": 77.5995708192864
+    },
+    "Inferno Rage Torpedo\u001fParity Decryptor": {
+      "production_runs": 0,
+      "invention_runs": 0,
+      "price_at_production": 1669.024576728,
+      "breakeven_price": 1535.0851057725622
+    },
+    "Large Projectile Ambit Extension II Blueprint\u001fAugmentation Decryptor": {
+      "production_runs": 76,
+      "invention_runs": 10,
+      "price_at_production": 12720728.677860001,
+      "breakeven_price": 10067858.620464578
+    },
+    "Medium Cargohold Optimization II\u001fAugmentation Decryptor": {
+      "production_runs": 0,
+      "invention_runs": 0,
+      "price_at_production": 3944136.54537,
+      "breakeven_price": 2981436.8799468153
+    },
+    "Monitor Blueprint\u001fProcess Decryptor": {
+      "production_runs": 0,
+      "invention_runs": 0,
+      "price_at_production": 326190752.13060004,
+      "breakeven_price": 518481175.64562905
+    },
+    "Nanofiber Internal Structure II\u001f": {
+      "production_runs": 30,
+      "invention_runs": 30,
+      "price_at_production": 274820.53097340005,
+      "breakeven_price": 183552.9995669619
+    },
+    "Nova Fury Light Missile\u001f": {
+      "production_runs": 0,
+      "invention_runs": 0,
+      "price_at_production": 81.88778732292,
+      "breakeven_price": 67.411419740225
+    },
+    "Null S\u001f": {
+      "production_runs": 250,
+      "invention_runs": 0,
+      "price_at_production": 44.974324056600004,
+      "breakeven_price": 43.63399780363122
+    },
+    "Rocket Launcher II\u001f": {
+      "production_runs": 100,
+      "invention_runs": 0,
+      "price_at_production": 351875.8627092,
+      "breakeven_price": 243763.75581432256
+    },
+    "Scourge Fury Cruise Missile\u001f": {
+      "production_runs": 40,
+      "invention_runs": 8,
+      "price_at_production": 511.36720151940006,
+      "breakeven_price": 568.8524854309118
+    },
+    "Scourge Fury Light Missile\u001f": {
+      "production_runs": 30,
+      "invention_runs": 0,
+      "price_at_production": 80.0502359337,
+      "breakeven_price": 77.78361140289205
+    },
+    "Scourge Rage Rocket\u001f": {
+      "production_runs": 130,
+      "invention_runs": 0,
+      "price_at_production": 82.6390514268,
+      "breakeven_price": 36.462206903992474
+    },
+    "Scourge Rage Torpedo\u001fProcess Decryptor": {
+      "production_runs": 0,
+      "invention_runs": 8,
+      "price_at_production": 1599.989496912,
+      "breakeven_price": 1568.2862428420397
+    },
+    "Ship Scanner II\u001f": {
+      "production_runs": 80,
+      "invention_runs": 0,
+      "price_at_production": 677152.9152539999,
+      "breakeven_price": 497062.7848846878
+    },
+    "Simple Asteroid Mining Crystal Type B II\u001f": {
+      "production_runs": 200,
+      "invention_runs": 0,
+      "price_at_production": 475732.9176732,
+      "breakeven_price": 406812.97840322705
+    },
+    "Small Polycarbon Engine Housing II\u001fAugmentation Decryptor": {
+      "production_runs": 50,
+      "invention_runs": 0,
+      "price_at_production": 1217250.892638,
+      "breakeven_price": 768244.1416668736
+    },
+    "Void L\u001f": {
+      "production_runs": 0,
+      "invention_runs": 0,
+      "price_at_production": 229.3385960358,
+      "breakeven_price": 224.12550901014532
+    },
+    "Warden II\u001fParity Decryptor": {
+      "production_runs": 26,
+      "invention_runs": 0,
+      "price_at_production": 1895419.029654,
+      "breakeven_price": 1625141.9053349015
+    },
+    "Small Ionic Field Projector II Blueprint\u001f": {
+      "production_runs": 2,
+      "invention_runs": 0,
+      "price_at_production": 4670020.105199999
+    },
+    "Small Kinetic Armor Reinforcer II\u001fAugmentation Decryptor": {
+      "production_runs": 50,
+      "invention_runs": 0,
+      "price_at_production": 6079147.910856,
+      "breakeven_price": 5452097.2459139805
+    },
+    "Barrage L\u001f": {
+      "production_runs": 10,
+      "invention_runs": 0,
+      "price_at_production": 368.017888725,
+      "breakeven_price": 353.9051131811085
+    },
+    "CONCORD Capital Remote Armor Repairer Blueprint\u001f": {
+      "production_runs": 0,
+      "invention_runs": 0,
+      "price_at_production": 344160177.318
+    },
+    "CONCORD Capital Remote Shield Booster Blueprint\u001f": {
+      "production_runs": 0,
+      "invention_runs": 0,
+      "price_at_production": 401114118.1662
+    },
+    "CONCORD Rogue Analysis Beacon Blueprint\u001f": {
+      "production_runs": 5,
+      "invention_runs": 0,
+      "price_at_production": 66679765.32816
+    },
+    "Gas Cloud Scoop II\u001f": {
+      "production_runs": 150,
+      "invention_runs": 0,
+      "price_at_production": 5160372.2162460005,
+      "breakeven_price": 5100724.856052065
+    },
+    "Inferno Fury Light Missile\u001f": {
+      "production_runs": 0,
+      "invention_runs": 40,
+      "price_at_production": 65.2279982085,
+      "breakeven_price": 76.80388328756464
+    },
+    "Medium Capacitor Control Circuit II\u001fAugmentation Decryptor": {
+      "production_runs": 0,
+      "invention_runs": 0,
+      "price_at_production": 17248617.73638,
+      "breakeven_price": 15806925.969415206
+    },
+    "Mystic S\u001fAugmentation Decryptor": {
+      "production_runs": 0,
+      "invention_runs": 0,
+      "price_at_production": 1014.1050180618,
+      "breakeven_price": -1889.5121251124015
+    },
+    "Occult S\u001fAugmentation Decryptor": {
+      "production_runs": 0,
+      "invention_runs": 0,
+      "price_at_production": 1500.497764236,
+      "breakeven_price": -10462.523556248001
+    },
+    "Scourge Fury Light Missile Blueprint\u001f": {
+      "production_runs": 0,
+      "invention_runs": 0,
+      "price_at_production": 79.2380585241,
+      "breakeven_price": 74.12524684097308
+    },
+    "Scourge Javelin Heavy Assault Missile Blueprint\u001f": {
+      "production_runs": 0,
+      "invention_runs": 0,
+      "price_at_production": 91.12630535712,
+      "breakeven_price": -81.9332188712396
+    },
+    "Scourge Rage Heavy Assault Missile Blueprint\u001f": {
+      "production_runs": 0,
+      "invention_runs": 0,
+      "price_at_production": 80.74058673185999,
+      "breakeven_price": 19.712790556205015
+    },
+    "Scourge Rage Torpedo Blueprint\u001fProcess Decryptor": {
+      "production_runs": 0,
+      "invention_runs": 0,
+      "price_at_production": 1522.832643,
+      "breakeven_price": 1428.5180584843874
+    },
+    "Void S\u001f": {
+      "production_runs": 0,
+      "invention_runs": 0,
+      "price_at_production": 36.46676569104,
+      "breakeven_price": 29.914263284088516
+    }
+  }
+}

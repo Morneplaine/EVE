@@ -1,0 +1,527 @@
+{
+"33399": {
+"primary": "Charisma",
+"secondary": "Willpower",
+"name": "Infomorph Synchronizing"
+},
+"3411": {
+"primary": "Intelligence",
+"secondary": "Memory",
+"name": "Cybernetics"
+},
+"24242": {
+"primary": "Charisma",
+"secondary": "Willpower",
+"name": "Infomorph Psychology"
+},
+"33078": {
+"primary": "Intelligence",
+"secondary": "Memory",
+"name": "Armor Layering"
+},
+"3394": {
+"primary": "Intelligence",
+"secondary": "Memory",
+"name": "Hull Upgrades"
+},
+"3454": {
+"primary": "Intelligence",
+"secondary": "Perception",
+"name": "High Speed Maneuvering"
+},
+"22809": {
+"primary": "Intelligence",
+"secondary": "Memory",
+"name": "Thermal Armor Compensation"
+},
+"22808": {
+"primary": "Intelligence",
+"secondary": "Memory",
+"name": "Kinetic Armor Compensation"
+},
+"22807": {
+"primary": "Intelligence",
+"secondary": "Memory",
+"name": "Explosive Armor Compensation"
+},
+"22806": {
+"primary": "Intelligence",
+"secondary": "Memory",
+"name": "EM Armor Compensation"
+},
+"28164": {
+"primary": "Intelligence",
+"secondary": "Memory",
+"name": "Thermodynamics"
+},
+"28879": {
+"primary": "Intelligence",
+"secondary": "Memory",
+"name": "Nanite Operation"
+},
+"28880": {
+"primary": "Intelligence",
+"secondary": "Memory",
+"name": "Nanite Interfacing"
+},
+"3455": {
+"primary": "Intelligence",
+"secondary": "Perception",
+"name": "Warp Drive Operation"
+},
+"3424": {
+"primary": "Intelligence",
+"secondary": "Memory",
+"name": "Energy Grid Upgrades"
+},
+"20209": {
+"primary": "Perception",
+"secondary": "Willpower",
+"name": "Rocket Specialization"
+},
+"3423": {
+"primary": "Intelligence",
+"secondary": "Memory",
+"name": "Capacitor Emission Systems"
+},
+"12095": {
+"primary": "Willpower",
+"secondary": "Perception",
+"name": "Assault Frigates"
+},
+"12092": {
+"primary": "Willpower",
+"secondary": "Perception",
+"name": "Interceptors"
+},
+"3435": {
+"primary": "Intelligence",
+"secondary": "Memory",
+"name": "Propulsion Jamming"
+},
+"3303": {
+"primary": "Perception",
+"secondary": "Willpower",
+"name": "Small Energy Turret"
+},
+"11083": {
+"primary": "Perception",
+"secondary": "Willpower",
+"name": "Small Beam Laser Specialization"
+},
+"3319": {
+"primary": "Perception",
+"secondary": "Willpower",
+"name": "Missile Launcher Operation"
+},
+"11207": {
+"primary": "Perception",
+"secondary": "Willpower",
+"name": "Advanced Weapon Upgrades"
+},
+"22043": {
+"primary": "Perception",
+"secondary": "Willpower",
+"name": "Tactical Weapon Reconfiguration"
+},
+"20342": {
+"primary": "Perception",
+"secondary": "Willpower",
+"name": "Advanced Spaceship Command"
+},
+"47868": {
+"primary": "Perception",
+"secondary": "Willpower",
+"name": "Precursor Cruiser"
+},
+"49743": {
+"primary": "Perception",
+"secondary": "Willpower",
+"name": "Precursor Battlecruiser"
+},
+"47869": {
+"primary": "Perception",
+"secondary": "Willpower",
+"name": "Precursor Battleship"
+},
+"3300": {
+"primary": "Perception",
+"secondary": "Willpower",
+"name": "Gunnery"
+},
+"47871": {
+"primary": "Perception",
+"secondary": "Willpower",
+"name": "Medium Precursor Weapon"
+},
+"47872": {
+"primary": "Perception",
+"secondary": "Willpower",
+"name": "Large Precursor Weapon"
+},
+"3317": {
+"primary": "Perception",
+"secondary": "Willpower",
+"name": "Trajectory Analysis"
+},
+"32797": {
+"primary": "Intelligence",
+"secondary": "Memory",
+"name": "Resistance Phasing"
+},
+"3456": {
+"primary": "Intelligence",
+"secondary": "Perception",
+"name": "Jump Drive Operation"
+},
+"33856": {
+"primary": "Willpower",
+"secondary": "Perception",
+"name": "Expedition Frigates"
+},
+"3393": {
+"primary": "Intelligence",
+"secondary": "Memory",
+"name": "Repair Systems"
+},
+"16069": {
+"primary": "Intelligence",
+"secondary": "Memory",
+"name": "Remote Armor Repair Systems"
+},
+"33091": {
+"primary": "Perception",
+"secondary": "Willpower",
+"name": "Amarr Destroyer"
+},
+"3306": {
+"primary": "Perception",
+"secondary": "Willpower",
+"name": "Medium Energy Turret"
+},
+"3312": {
+"primary": "Perception",
+"secondary": "Willpower",
+"name": "Motion Prediction"
+},
+"3335": {
+"primary": "Perception",
+"secondary": "Willpower",
+"name": "Amarr Cruiser"
+},
+"3309": {
+"primary": "Perception",
+"secondary": "Willpower",
+"name": "Large Energy Turret"
+},
+"12215": {
+"primary": "Perception",
+"secondary": "Willpower",
+"name": "Large Pulse Laser Specialization"
+},
+"3449": {
+"primary": "Intelligence",
+"secondary": "Perception",
+"name": "Navigation"
+},
+"4385": {
+"primary": "Intelligence",
+"secondary": "Perception",
+"name": "Micro Jump Drive Operation"
+},
+"33095": {
+"primary": "Perception",
+"secondary": "Willpower",
+"name": "Amarr Battlecruiser"
+},
+"3339": {
+"primary": "Perception",
+"secondary": "Willpower",
+"name": "Amarr Battleship"
+},
+"3318": {
+"primary": "Perception",
+"secondary": "Memory",
+"name": "Weapon Upgrades"
+},
+"28667": {
+"primary": "Willpower",
+"secondary": "Perception",
+"name": "Marauders"
+},
+"3315": {
+"primary": "Perception",
+"secondary": "Willpower",
+"name": "Surgical Strike"
+},
+"3310": {
+"primary": "Perception",
+"secondary": "Willpower",
+"name": "Rapid Firing"
+},
+"3311": {
+"primary": "Perception",
+"secondary": "Willpower",
+"name": "Sharpshooter"
+},
+"33002": {
+"primary": "Intelligence",
+"secondary": "Memory",
+"name": "Radar Sensor Compensation"
+},
+"3336": {
+"primary": "Perception",
+"secondary": "Willpower",
+"name": "Gallente Battleship"
+},
+"12212": {
+"primary": "Perception",
+"secondary": "Willpower",
+"name": "Large Blaster Specialization"
+},
+"3436": {
+"primary": "Memory",
+"secondary": "Perception",
+"name": "Drones"
+},
+"3418": {
+"primary": "Intelligence",
+"secondary": "Memory",
+"name": "Capacitor Management"
+},
+"3426": {
+"primary": "Intelligence",
+"secondary": "Memory",
+"name": "CPU Management"
+},
+"3332": {
+"primary": "Perception",
+"secondary": "Willpower",
+"name": "Gallente Cruiser"
+},
+"12485": {
+"primary": "Memory",
+"secondary": "Perception",
+"name": "Minmatar Drone Specialization"
+},
+"12487": {
+"primary": "Memory",
+"secondary": "Perception",
+"name": "Caldari Drone Specialization"
+},
+"23566": {
+"primary": "Memory",
+"secondary": "Perception",
+"name": "Advanced Drone Avionics"
+},
+"3327": {
+"primary": "Perception",
+"secondary": "Willpower",
+"name": "Spaceship Command"
+},
+"16591": {
+"primary": "Willpower",
+"secondary": "Perception",
+"name": "Heavy Assault Cruisers"
+},
+"3441": {
+"primary": "Memory",
+"secondary": "Perception",
+"name": "Heavy Drone Operation"
+},
+"23606": {
+"primary": "Memory",
+"secondary": "Perception",
+"name": "Drone Sharpshooting"
+},
+"33699": {
+"primary": "Memory",
+"secondary": "Perception",
+"name": "Medium Drone Operation"
+},
+"23618": {
+"primary": "Memory",
+"secondary": "Perception",
+"name": "Drone Durability"
+},
+"3442": {
+"primary": "Memory",
+"secondary": "Perception",
+"name": "Drone Interfacing"
+},
+"12305": {
+"primary": "Memory",
+"secondary": "Perception",
+"name": "Drone Navigation"
+},
+"3437": {
+"primary": "Memory",
+"secondary": "Perception",
+"name": "Drone Avionics"
+},
+"3450": {
+"primary": "Intelligence",
+"secondary": "Perception",
+"name": "Afterburner"
+},
+"24241": {
+"primary": "Memory",
+"secondary": "Perception",
+"name": "Light Drone Operation"
+},
+"3432": {
+"primary": "Intelligence",
+"secondary": "Memory",
+"name": "Electronics Upgrades"
+},
+"3380": {
+"primary": "Memory",
+"secondary": "Intelligence",
+"name": "Industry"
+},
+"32918": {
+"primary": "Perception",
+"secondary": "Willpower",
+"name": "Mining Frigate"
+},
+"3386": {
+"primary": "Memory",
+"secondary": "Intelligence",
+"name": "Mining"
+},
+"25544": {
+"primary": "Memory",
+"secondary": "Intelligence",
+"name": "Gas Cloud Harvesting"
+},
+"22578": {
+"primary": "Memory",
+"secondary": "Intelligence",
+"name": "Mining Upgrades"
+},
+"3428": {
+"primary": "Intelligence",
+"secondary": "Memory",
+"name": "Long Range Targeting"
+},
+"3425": {
+"primary": "Intelligence",
+"secondary": "Memory",
+"name": "Shield Upgrades"
+},
+"3416": {
+"primary": "Intelligence",
+"secondary": "Memory",
+"name": "Shield Operation"
+},
+"12365": {
+"primary": "Intelligence",
+"secondary": "Memory",
+"name": "EM Shield Compensation"
+},
+"12367": {
+"primary": "Intelligence",
+"secondary": "Memory",
+"name": "Explosive Shield Compensation"
+},
+"12366": {
+"primary": "Intelligence",
+"secondary": "Memory",
+"name": "Kinetic Shield Compensation"
+},
+"3419": {
+"primary": "Intelligence",
+"secondary": "Memory",
+"name": "Shield Management"
+},
+"11566": {
+"primary": "Intelligence",
+"secondary": "Memory",
+"name": "Thermal Shield Compensation"
+},
+"12098": {
+"primary": "Willpower",
+"secondary": "Perception",
+"name": "Interdictors"
+},
+"25530": {
+"primary": "Intelligence",
+"secondary": "Memory",
+"name": "Neurotoxin Recovery"
+},
+"25718": {
+"primary": "Perception",
+"secondary": "Willpower",
+"name": "Heavy Assault Missile Specialization"
+},
+"20211": {
+"primary": "Perception",
+"secondary": "Willpower",
+"name": "Heavy Missile Specialization"
+},
+"12442": {
+"primary": "Perception",
+"secondary": "Willpower",
+"name": "Missile Projection"
+},
+"12211": {
+"primary": "Perception",
+"secondary": "Willpower",
+"name": "Medium Blaster Specialization"
+},
+"3328": {
+"primary": "Perception",
+"secondary": "Willpower",
+"name": "Gallente Frigate"
+},
+"33093": {
+"primary": "Perception",
+"secondary": "Willpower",
+"name": "Gallente Destroyer"
+},
+"3402": {
+"primary": "Intelligence",
+"secondary": "Memory",
+"name": "Science"
+},
+"3427": {
+"primary": "Intelligence",
+"secondary": "Memory",
+"name": "Electronic Warfare"
+},
+"33407": {
+"primary": "Charisma",
+"secondary": "Willpower",
+"name": "Advanced Infomorph Psychology"
+},
+"21611": {
+"primary": "Intelligence",
+"secondary": "Perception",
+"name": "Jump Drive Calibration"
+},
+"21610": {
+"primary": "Intelligence",
+"secondary": "Perception",
+"name": "Jump Fuel Conservation"
+},
+"3421": {
+"primary": "Intelligence",
+"secondary": "Memory",
+"name": "Energy Pulse Weapons"
+},
+"3429": {
+"primary": "Intelligence",
+"secondary": "Memory",
+"name": "Target Management"
+},
+"3430": {
+"primary": "Intelligence",
+"secondary": "Memory",
+"name": "Advanced Target Management"
+},
+"11584": {
+"primary": "Memory",
+"secondary": "Charisma",
+"name": "Anchoring"
+}
+}
