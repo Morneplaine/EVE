@@ -1,7 +1,7 @@
 [
   {
     "product_name": "Barrage L",
-    "quantity": 0,
+    "quantity": 1,
     "profit": 705638.7771945733,
     "runs_per_bpc": 10,
     "research": 0,
@@ -15,7 +15,7 @@
   },
   {
     "product_name": "Buzzard Blueprint",
-    "quantity": 0,
+    "quantity": 1,
     "profit": -1537444.7692521913,
     "runs_per_bpc": 1,
     "research": 0,
@@ -28,7 +28,7 @@
   },
   {
     "product_name": "Compact Interdiction Nullifier Blueprint",
-    "quantity": 0,
+    "quantity": 1,
     "profit": 15810947.475356443,
     "runs_per_bpc": 10,
     "research": 0,
@@ -39,7 +39,7 @@
   },
   {
     "product_name": "CONCORD Capital Shield Booster Blueprint",
-    "quantity": 0,
+    "quantity": 1,
     "profit": 141231351.1056334,
     "runs_per_bpc": 1,
     "research": 0,
@@ -50,7 +50,7 @@
   },
   {
     "product_name": "Enduring Interdiction Nullifier Blueprint",
-    "quantity": 0,
+    "quantity": 1,
     "profit": 15487382.607028555,
     "runs_per_bpc": 1,
     "research": 0,
@@ -61,7 +61,7 @@
   },
   {
     "product_name": "Expanded Cargohold II",
-    "quantity": 0,
+    "quantity": 1,
     "profit": 630699.7106782038,
     "runs_per_bpc": 10,
     "research": 0,
@@ -74,7 +74,7 @@
   },
   {
     "product_name": "Gas Cloud Harvester II",
-    "quantity": 0,
+    "quantity": 1,
     "profit": 1867341.1508279517,
     "runs_per_bpc": 10,
     "research": 0,
@@ -87,7 +87,7 @@
   },
   {
     "product_name": "Gas Cloud Scoop II",
-    "quantity": 0,
+    "quantity": 1,
     "profit": 596473.6019393515,
     "runs_per_bpc": 10,
     "research": 0,
@@ -100,7 +100,7 @@
   },
   {
     "product_name": "Hail L",
-    "quantity": 0,
+    "quantity": 1,
     "profit": 12074.767501186347,
     "runs_per_bpc": 10,
     "research": 0,
@@ -114,7 +114,7 @@
   },
   {
     "product_name": "Heavy Assault Missile Launcher II",
-    "quantity": 0,
+    "quantity": 1,
     "profit": 2289794.8533321396,
     "runs_per_bpc": 10,
     "research": 0,
@@ -127,7 +127,7 @@
   },
   {
     "product_name": "Inferno Fury Light Missile",
-    "quantity": 0,
+    "quantity": 1,
     "profit": -578794.2539532322,
     "runs_per_bpc": 10,
     "research": 0,
@@ -140,7 +140,7 @@
   },
   {
     "product_name": "Inferno Rage Heavy Assault Missile",
-    "quantity": 0,
+    "quantity": 1,
     "profit": 868958.1433828005,
     "runs_per_bpc": 10,
     "research": 0,
@@ -153,7 +153,7 @@
   },
   {
     "product_name": "Inferno Rage Torpedo",
-    "quantity": 0,
+    "quantity": 1,
     "profit": 9175837.475054316,
     "runs_per_bpc": 13,
     "research": 0,
@@ -168,7 +168,7 @@
   },
   {
     "product_name": "Large Projectile Ambit Extension II Blueprint",
-    "quantity": 0,
+    "quantity": 1,
     "profit": 41231513.603273444,
     "runs_per_bpc": 19,
     "research": 0,
@@ -183,7 +183,7 @@
   },
   {
     "product_name": "Medium Capacitor Control Circuit II",
-    "quantity": 0,
+    "quantity": 1,
     "profit": 14416917.669647925,
     "runs_per_bpc": 10,
     "research": 0,
@@ -198,7 +198,7 @@
   },
   {
     "product_name": "Medium Cargohold Optimization II",
-    "quantity": 0,
+    "quantity": 1,
     "profit": 9102582.49007466,
     "runs_per_bpc": 10,
     "research": 0,
@@ -213,7 +213,7 @@
   },
   {
     "product_name": "Medium Core Defense Field Extender II",
-    "quantity": 0,
+    "quantity": 1,
     "profit": 1032458.7319569681,
     "runs_per_bpc": 10,
     "research": 0,
@@ -228,7 +228,7 @@
   },
   {
     "product_name": "Monitor Blueprint",
-    "quantity": 0,
+    "quantity": 1,
     "profit": -141326686.40830213,
     "runs_per_bpc": 1,
     "research": 0,
@@ -244,7 +244,7 @@
   },
   {
     "product_name": "Nanofiber Internal Structure II",
-    "quantity": 0,
+    "quantity": 1,
     "profit": 906237.4193834227,
     "runs_per_bpc": 10,
     "research": 0,
@@ -257,7 +257,7 @@
   },
   {
     "product_name": "Nova Fury Light Missile",
-    "quantity": 0,
+    "quantity": 1,
     "profit": 198123.59339309868,
     "runs_per_bpc": 10,
     "research": 0,
@@ -270,7 +270,7 @@
   },
   {
     "product_name": "Null L",
-    "quantity": 0,
+    "quantity": 1,
     "profit": -267126.00761207944,
     "runs_per_bpc": 1,
     "research": 0,
@@ -283,7 +283,7 @@
   },
   {
     "product_name": "Null L",
-    "quantity": 0,
+    "quantity": 1,
     "profit": -267126.00761207944,
     "runs_per_bpc": 1,
     "research": 0,
@@ -296,7 +296,7 @@
   },
   {
     "product_name": "Null M",
-    "quantity": 0,
+    "quantity": 1,
     "profit": -422621.0859281069,
     "runs_per_bpc": 1,
     "research": 0,
@@ -309,7 +309,7 @@
   },
   {
     "product_name": "Null M",
-    "quantity": 0,
+    "quantity": 1,
     "profit": -422621.0859281069,
     "runs_per_bpc": 1,
     "research": 0,
@@ -322,7 +322,7 @@
   },
   {
     "product_name": "Null S",
-    "quantity": 0,
+    "quantity": 1,
     "profit": 757710.8137198508,
     "runs_per_bpc": 10,
     "research": 0,
@@ -335,7 +335,7 @@
   },
   {
     "product_name": "Polarized 200mm AutoCannon Blueprint",
-    "quantity": 0,
+    "quantity": 1,
     "profit": 15180165.382636515,
     "runs_per_bpc": 1,
     "research": 0,
@@ -351,7 +351,7 @@
   },
   {
     "product_name": "Polarized Heavy Assault Missile Launcher Blueprint",
-    "quantity": 0,
+    "quantity": 1,
     "profit": 27386822.57044537,
     "runs_per_bpc": 1,
     "research": 0,
@@ -367,7 +367,7 @@
   },
   {
     "product_name": "Polarized Neutron Blaster Cannon Blueprint",
-    "quantity": 0,
+    "quantity": 1,
     "profit": 108952064.05263923,
     "runs_per_bpc": 1,
     "research": 0,
@@ -383,7 +383,7 @@
   },
   {
     "product_name": "Rocket Launcher II",
-    "quantity": 0,
+    "quantity": 1,
     "profit": 1025356.7393856852,
     "runs_per_bpc": 10,
     "research": 0,
@@ -396,7 +396,7 @@
   },
   {
     "product_name": "Ship Scanner II",
-    "quantity": 0,
+    "quantity": 1,
     "profit": 1865446.7025897203,
     "runs_per_bpc": 10,
     "research": 0,
@@ -409,7 +409,7 @@
   },
   {
     "product_name": "Simple Asteroid Mining Crystal Type B II",
-    "quantity": 0,
+    "quantity": 1,
     "profit": 817195.5456540391,
     "runs_per_bpc": 10,
     "research": 0,
@@ -422,7 +422,7 @@
   },
   {
     "product_name": "Small Kinetic Armor Reinforcer II",
-    "quantity": 0,
+    "quantity": 1,
     "profit": 6270506.649420196,
     "runs_per_bpc": 10,
     "research": 0,
@@ -437,7 +437,7 @@
   },
   {
     "product_name": "Small Polycarbon Engine Housing II",
-    "quantity": 0,
+    "quantity": 1,
     "profit": 2208363.4613312967,
     "runs_per_bpc": 10,
     "research": 0,
@@ -453,7 +453,7 @@
   },
   {
     "product_name": "Small Thermal Shield Reinforcer II",
-    "quantity": 0,
+    "quantity": 1,
     "profit": 15728458.13978177,
     "runs_per_bpc": 10,
     "research": 0,
@@ -469,7 +469,7 @@
   },
   {
     "product_name": "Tetryon Exotic Plasma L Blueprint",
-    "quantity": 0,
+    "quantity": 1,
     "profit": -8780114.209781816,
     "runs_per_bpc": 5,
     "research": 0,
@@ -485,7 +485,7 @@
   },
   {
     "product_name": "Void L",
-    "quantity": 0,
+    "quantity": 1,
     "profit": 848512.8910521441,
     "runs_per_bpc": 10,
     "research": 0,
@@ -498,7 +498,7 @@
   },
   {
     "product_name": "Void S",
-    "quantity": 0,
+    "quantity": 1,
     "profit": 327625.12034757435,
     "runs_per_bpc": 10,
     "research": 0,
@@ -511,7 +511,7 @@
   },
   {
     "product_name": "Warden II",
-    "quantity": 0,
+    "quantity": 1,
     "profit": 2519500.377957534,
     "runs_per_bpc": 11,
     "research": 0,
@@ -526,7 +526,7 @@
   },
   {
     "product_name": "Small Ionic Field Projector II Blueprint",
-    "quantity": 0,
+    "quantity": 1,
     "profit": null,
     "runs_per_bpc": 1,
     "research": 0,
@@ -537,7 +537,7 @@
   },
   {
     "product_name": "Scourge Javelin Heavy Assault Missile Blueprint",
-    "quantity": 0,
+    "quantity": 1,
     "profit": 865297.6211417981,
     "runs_per_bpc": 1,
     "research": 0,
@@ -549,7 +549,7 @@
   },
   {
     "product_name": "Scourge Rage Heavy Assault Missile Blueprint",
-    "quantity": 0,
+    "quantity": 1,
     "profit": 305138.9808782749,
     "runs_per_bpc": 1,
     "research": 0,
@@ -561,7 +561,7 @@
   },
   {
     "product_name": "Scourge Rage Torpedo Blueprint",
-    "quantity": 0,
+    "quantity": 1,
     "profit": 4715729.225780623,
     "runs_per_bpc": 10,
     "research": 0,
@@ -575,7 +575,7 @@
   },
   {
     "product_name": "Scourge Fury Light Missile Blueprint",
-    "quantity": 0,
+    "quantity": 1,
     "profit": 255640.58415634604,
     "runs_per_bpc": 10,
     "research": 0,
@@ -587,7 +587,7 @@
   },
   {
     "product_name": "CONCORD Capital Remote Shield Booster Blueprint",
-    "quantity": 0,
+    "quantity": 1,
     "profit": null,
     "runs_per_bpc": 1,
     "research": 0,
@@ -598,7 +598,7 @@
   },
   {
     "product_name": "CONCORD Capital Remote Armor Repairer Blueprint",
-    "quantity": 0,
+    "quantity": 1,
     "profit": null,
     "runs_per_bpc": 1,
     "research": 0,
@@ -609,7 +609,7 @@
   },
   {
     "product_name": "CONCORD Rogue Analysis Beacon Blueprint",
-    "quantity": 0,
+    "quantity": 1,
     "profit": null,
     "runs_per_bpc": 1,
     "research": 0,
@@ -620,7 +620,7 @@
   },
   {
     "product_name": "Occult S",
-    "quantity": 0,
+    "quantity": 1,
     "profit": 59815106.60242,
     "runs_per_bpc": 1,
     "research": 0,
@@ -634,7 +634,7 @@
   },
   {
     "product_name": "Mystic S",
-    "quantity": 0,
+    "quantity": 1,
     "profit": 14518085.715871006,
     "runs_per_bpc": 1,
     "research": 0,
@@ -648,13 +648,13 @@
   },
   {
     "product_name": "Life Support Backup Unit Blueprint",
-    "quantity": 0,
+    "quantity": 1,
     "profit": null,
     "runs_per_bpc": 100,
-    "default_runs_per_bpc": 1,
-    "manual_runs_per_bpc": true,
     "research": 0,
     "runs_per_research": 0,
-    "prod": 0
+    "prod": 0,
+    "manual_runs_per_bpc": true,
+    "default_runs_per_bpc": 1
   }
 ]
